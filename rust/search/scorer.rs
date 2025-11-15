@@ -41,8 +41,12 @@ impl WARPScorer {
         );
 
         // Initialize decompressor from phase 1
-        let decompressor =
-            CentroidDecompressor::new(index.metadata.nbits, device, config.parallel)?;
+        let decompressor = CentroidDecompressor::new(
+            index.metadata.nbits,
+            index.metadata.dim,
+            device,
+            config.parallel,
+        )?;
 
         // Initialize merger
         let merger_config = MergerConfig {

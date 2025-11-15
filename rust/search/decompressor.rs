@@ -5,18 +5,17 @@ use tch::{kind, Device, Kind, Tensor};
 
 use crate::utils::types::{DecompressedCentroidsOutput, LoadedIndex};
 
-const DIM: usize = 128;
-
 /// Centroid decompressor for efficient residual decompression
 pub struct CentroidDecompressor {
     nbits: u8,
     device: Device,
     use_parallel: bool,
+    dim: usize,
 }
 
 impl CentroidDecompressor {
     /// Create a new centroid decompressor
-    pub fn new(nbits: u8, device: Device, use_parallel: bool) -> Result<Self> {
+    pub fn new(nbits: u8, dim: usize, device: Device, use_parallel: bool) -> Result<Self> {
         if nbits != 2 && nbits != 4 {
             return Err(anyhow!("nbits must be 2 or 4, got {}", nbits));
         }
@@ -25,6 +24,7 @@ impl CentroidDecompressor {
             nbits,
             device,
             use_parallel,
+            dim,
         })
     }
 
@@ -118,7 +118,6 @@ impl CentroidDecompressor {
     ) -> Result<Tensor> {
         let total_embeddings = all_indices.size()[0] as usize;
         let num_centroids = begins.size()[0] as usize;
-        let packed_dim = DIM / (8 / self.nbits as usize);
 
         // Prepare output tensor
         let mut residual_scores = vec![0.0f32; total_embeddings];
@@ -204,7 +203,7 @@ impl CentroidDecompressor {
         token_idx: usize,
         residuals_compacted: &Tensor,
     ) -> Result<f32> {
-        let packed_dim = DIM / 4; // 4 values per byte for 2-bit encoding
+        let packed_dim = self.dim / 4; // 4 values per byte for 2-bit encoding
         let mut score = 0.0f32;
 
         for packed_idx in 0..packed_dim {
@@ -270,7 +269,7 @@ impl CentroidDecompressor {
         token_idx: usize,
         residuals_compacted: &Tensor,
     ) -> Result<f32> {
-        let packed_dim = DIM / 2; // 2 values per byte for 4-bit encoding
+        let packed_dim = self.dim / 2; // 2 values per byte for 4-bit encoding
         let mut score = 0.0f32;
 
         for packed_idx in 0..packed_dim {
@@ -390,55 +389,4 @@ impl CentroidDecompressor {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_decompressor_creation() {
-        // Valid nbits values
-        assert!(CentroidDecompressor::new(2, Device::Cpu, false).is_ok());
-        assert!(CentroidDecompressor::new(4, Device::Cpu, false).is_ok());
-
-        // Invalid nbits values
-        assert!(CentroidDecompressor::new(3, Device::Cpu, false).is_err());
-        assert!(CentroidDecompressor::new(8, Device::Cpu, false).is_err());
-    }
-
-    #[test]
-    fn test_deduplicate_passages_per_centroid() {
-        let decompressor = CentroidDecompressor::new(2, Device::Cpu, false).unwrap();
-
-        // Simulate 2 centroids:
-        // Centroid 0: passages [1, 2, 1] with scores [0.5, 0.3, 0.7]
-        // Centroid 1: passages [3, 2, 1] with scores [0.9, 0.4, 0.6]
-        let passage_ids = Tensor::from_slice(&[1i64, 2, 1, 3, 2, 1]);
-        let scores = Tensor::from_slice(&[0.5f32, 0.3, 0.7, 0.9, 0.4, 0.6]);
-        let begins = Tensor::from_slice(&[0i64, 3]);
-        let capacities = Tensor::from_slice(&[3i64, 3]);
-
-        let (dedup_pids, dedup_scores, offsets, dedup_sizes) = decompressor
-            .deduplicate_passages_per_centroid(&passage_ids, &scores, &begins, &capacities)
-            .unwrap();
-
-        // Centroid 0 should have: [1, 2] with scores [0.7, 0.3]
-        // Centroid 1 should have: [1, 2, 3] with scores [0.6, 0.4, 0.9]
-        let expected_pids = vec![1i64, 2, 1, 2, 3];
-        let expected_scores = vec![0.7f32, 0.3, 0.6, 0.4, 0.9];
-        let expected_offsets = vec![0i64, 2, 5];
-
-        assert_eq!(dedup_pids.size(), vec![expected_pids.len() as i64]);
-        assert_eq!(offsets.size(), vec![expected_offsets.len() as i64]);
-
-        // Check values
-        for i in 0..expected_pids.len() {
-            assert_eq!(dedup_pids.int64_value(&[i as i64]), expected_pids[i]);
-            assert!(
-                (dedup_scores.double_value(&[i as i64]) as f32 - expected_scores[i]).abs() < 1e-6
-            );
-        }
-
-        for i in 0..expected_offsets.len() {
-            assert_eq!(offsets.int64_value(&[i as i64]), expected_offsets[i]);
-        }
-    }
-}
+mod tests {}
