@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tch::{kind, Device, Kind, Tensor};
+use tch::{Device, Kind, Tensor};
 
 use crate::utils::types::{DecompressedCentroidsOutput, LoadedIndex};
 
@@ -197,9 +197,9 @@ impl CentroidDecompressor {
     /// Decompress a single 2-bit encoded residual
     fn decompress_single_residual_2bit(
         &self,
-        residual_idx: i64, // Changed from residual_offset to residual_idx (row index)
+        residual_idx: i64,
         query_embeddings: &Tensor, // [num_tokens, dim]
-        bucket_weights: &Tensor, // [dim, num_buckets_per_dim]
+        bucket_weights: &Tensor,   // [dim, num_buckets_per_dim]
         token_idx: usize,
         residuals_compacted: &Tensor,
     ) -> Result<f32> {
@@ -263,9 +263,9 @@ impl CentroidDecompressor {
     /// Decompress a single 4-bit encoded residual
     fn decompress_single_residual_4bit(
         &self,
-        residual_idx: i64, // Changed from residual_offset to residual_idx (row index)
+        residual_idx: i64,
         query_embeddings: &Tensor, // [num_tokens, dim]
-        bucket_weights: &Tensor, // [dim, num_buckets_per_dim]
+        bucket_weights: &Tensor,   // [dim, num_buckets_per_dim]
         token_idx: usize,
         residuals_compacted: &Tensor,
     ) -> Result<f32> {
@@ -387,6 +387,3 @@ impl CentroidDecompressor {
         Ok((pids_tensor, scores_tensor, offsets_tensor, sizes_tensor))
     }
 }
-
-#[cfg(test)]
-mod tests {}

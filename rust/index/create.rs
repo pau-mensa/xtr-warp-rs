@@ -16,34 +16,6 @@ use crate::utils::residual_codec::ResidualCodec;
 use crate::utils::types::IndexConfig;
 
 /// Creates a new WARP index from a collection of document embeddings.
-///
-/// This function implements the complete WARP indexing pipeline including:
-/// - Using pre-computed k-means centroids (computed in Python with fastkmeans)
-/// - Computing residuals and quantization
-/// - Building the inverted file (IVF) structure
-/// - Saving all index components to disk
-///
-/// # XTR-WARP Implementation Reference:
-/// - Main implementation: `xtr-warp/warp/indexing/collection_indexer.py` (CollectionIndexer class)
-/// - Index setup: `CollectionIndexer.setup()` (lines 86-97) - calculates plan for collection
-/// - Training: `CollectionIndexer.train()` (lines 227-237) - trains centroids from sampled passages
-/// - Index building: `CollectionIndexer.index()` (lines 306-400) - encodes and saves all tokens
-/// - Finalization: `CollectionIndexer.finalize()` (lines 402-450) - builds metadata and mappings
-///
-/// Note: Following fast-plaid pattern, k-means centroids are computed in Python using
-/// fastkmeans library and passed to this function, rather than computing them here.
-///
-/// # Arguments
-///
-/// * `config` - Index configuration containing all necessary parameters
-/// * `document_embeddings` - Vector of tensors, each containing embeddings for one document
-/// * `centroids` - Pre-computed k-means centroids from Python (using fastkmeans)
-/// * `passage_ids` - Optional vector of passage IDs corresponding to documents
-/// * `device` - The compute device to use (CPU or CUDA)
-/// * `seed` - Optional random seed for reproducible operations
-///
-/// # Returns
-///
 /// Result containing the index metadata on success
 pub fn create_index(
     config: &IndexConfig,
@@ -204,21 +176,7 @@ pub fn create_index(
 }
 
 /// Trains the residual codec for quantization.
-///
-/// # XTR-WARP Implementation Reference:
-/// - Codec training: `xtr-warp/warp/indexing/collection_indexer.py`
-/// - Train function: `CollectionIndexer.train()` (lines 227-237)
-/// - Uses sampled embeddings to compute bucket cutoffs and weights
-///
-/// # Arguments
-///
-/// * `sample_embeddings` - Sampled embeddings for training
-/// * `centroids` - K-means centroids
-/// * `nbits` - Number of bits for quantization
-/// * `device` - Compute device
-///
 /// # Returns
-///
 /// Trained residual codec
 fn train_residual_codec(
     sample_embeddings: &Tensor,
@@ -365,20 +323,6 @@ pub fn compress_into_residuals(
 
             let mut res_batch = &emb_batch - &recon_centroids;
 
-            // Handle per-dimension bucket cutoffs
-            // Make bucket_cutoffs contiguous to avoid searchsorted warning
-            // TODO this still needs to be fixed
-            // Step 3: Creating index with document embeddings...
-            // (This includes K-means clustering for centroid computation)
-            // [W1108 12:22:43.449862000 BucketizationUtils.h:34] Warning: torch.searchsorted(): input value tensor is non-contiguous, this will lower the performance due to extra data copy when converting non-contiguous tensor to contiguous, please use contiguous input value tensor if possible. This message will only appear once per program. (function operator())
-            // Compacting index at '.indexes/test_index'
-            // Saved sizes.compacted.pt with shape [2048]
-            // Saved residuals.compacted.pt with shape [30000, 64]
-            // Saved codes.compacted.pt with shape [30000]
-            // Saved offsets.compacted.pt with shape [2049]
-            // Index compaction complete. Total embeddings: 30000
-            // Index created successfully!
-            //
             let bucket_cutoffs = codec.bucket_cutoffs.as_ref().unwrap().contiguous();
 
             if bucket_cutoffs.dim() == 2 {
@@ -519,20 +463,7 @@ pub fn optimize_ivf(
 }
 
 /// Builds the inverted file (IVF) structure from codes.
-///
-/// # XTR-WARP Implementation Reference:
-/// - Implementation: `xtr-warp/warp/indexing/utils.py`
-/// - Function: `optimize_ivf()` (similar to fast-plaid implementation)
-/// - Fast-PLAID reference: `fast-plaid/rust/index/create.rs` - `optimize_ivf()`
-///
-/// # Arguments
-///
-/// * `codes` - Centroid codes for all embeddings
-/// * `num_centroids` - Total number of centroids
-/// * `device` - Compute device
-///
 /// # Returns
-///
 /// Tuple of (ivf_data, ivf_lengths)
 fn build_ivf(
     chk_emb_offsets: &Vec<usize>,
@@ -542,7 +473,6 @@ fn build_ivf(
     index_path: &str,
     device: Device,
 ) -> Result<()> {
-    // TODO: Implement IVF building
     // Steps from XTR-WARP/fast-plaid:
     // 1. Sort codes by centroid ID
     // 2. Count embeddings per centroid using bincount

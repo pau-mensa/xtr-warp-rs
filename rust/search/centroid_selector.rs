@@ -1,5 +1,5 @@
 use anyhow::Result;
-use tch::{no_grad, Device, IndexOp, Kind, Tensor};
+use tch::{no_grad, Device, Kind, Tensor};
 
 use crate::utils::types::{SearchConfig, SelectedCentroids, TPrimePolicy};
 
@@ -201,35 +201,3 @@ impl CentroidSelector {
         })
     }
 }
-
-// Implement ordering for heap-based selection
-//
-// Based on sort_fn lambda in warp_select_centroids.cpp:47-52
-// Sorts by score descending, breaks ties by centroid_id ascending
-/*impl Ord for ScoredCentroid {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // TODO: Implement comparison for max-heap
-        // - Compare by score (reverse for max-heap like C++ sort_fn)
-        // - Break ties by centroid_id for stability (line 50-51 in C++)
-        todo!("Implement ordering for scored centroids")
-    }
-}
-
-impl PartialOrd for ScoredCentroid {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Eq for ScoredCentroid {}
-
-impl PartialEq for ScoredCentroid {
-    fn eq(&self, other: &Self) -> bool {
-        self.centroid_id == other.centroid_id
-    }
-}*/
-
-/*#[cfg(test)]
-mod tests {
-
-}*/

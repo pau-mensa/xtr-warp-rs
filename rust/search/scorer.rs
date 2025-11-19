@@ -135,10 +135,3 @@ impl WARPScorer {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Tests will be added in a later phase
-}
