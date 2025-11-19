@@ -89,7 +89,6 @@ impl WARPScorer {
                 let centroid_scores = all_centroid_scores.narrow(0, b as i64, 1).squeeze_dim(0);
                 // Create query mask
                 let query_mask = query_embeddings.ne(0).any_dim(1, false);
-                println!("Query Mask is {}", query_mask);
 
                 // Select centroids for this query using pre-computed scores
                 let selected = self.centroid_selector.select_centroids(

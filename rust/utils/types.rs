@@ -265,7 +265,7 @@ impl TPrimePolicy {
     }
 }
 
-/// Parses a string identifier into a `tch::Device` for Rust-only usage.
+/// Parses a string identifier into a `tch::Device`.
 ///
 /// Supports simple device strings like "cpu", "cuda", and indexed CUDA devices
 /// such as "cuda:0".
