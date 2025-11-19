@@ -327,7 +327,6 @@ pub fn compress_into_residuals(
 
             if bucket_cutoffs.dim() == 2 {
                 // Per-dimension bucketize
-                let batch_size = res_batch.size()[0];
                 let dim = res_batch.size()[1];
 
                 let mut bucketized_dims = Vec::new();
@@ -552,11 +551,11 @@ pub fn compact_index(
 
     // Create storage for compacted data
     let residual_dim = (embedding_dim * nbits) / 8;
-    let mut compacted_residuals = Tensor::zeros(
+    let compacted_residuals = Tensor::zeros(
         &[total_embeddings, residual_dim as i64],
         (Kind::Uint8, device),
     );
-    let mut compacted_codes = Tensor::zeros(&[total_embeddings], (Kind::Int, device));
+    let compacted_codes = Tensor::zeros(&[total_embeddings], (Kind::Int, device));
 
     // Track current write position for each centroid
     let mut centroid_positions = offsets[0..num_centroids].to_vec();

@@ -389,7 +389,6 @@ impl ResultMerger {
             let num_candidates = candidate_pids.size()[0] as usize;
 
             // Convert tensors to vectors for creating stride views
-            let capacities_vec: Vec<i64> = capacities.to_kind(Kind::Int64).try_into()?;
             let sizes_vec: Vec<i32> = candidate_sizes.to_kind(Kind::Int).try_into()?;
             let pids_vec: Vec<PassageId> = candidate_pids.to_kind(Kind::Int64).try_into()?;
             let scores_vec: Vec<Score> = candidate_scores.to_kind(Kind::Float).try_into()?;
@@ -401,7 +400,6 @@ impl ResultMerger {
             let mut views = Vec::new();
             let mut offset = 0;
             for i in 0..num_cells {
-                let capacity = capacities_vec[i] as usize;
                 let size = sizes_vec[i] as usize;
 
                 // Use size instead of capacity since the data is deduplicated and compacted

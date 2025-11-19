@@ -8,9 +8,9 @@ from typing import Any
 
 import torch
 import torch.multiprocessing as mp
-from xtr_warp import xtr_warp_rust
 from fastkmeans import FastKMeans
 from joblib import Parallel, delayed
+from xtr_warp import xtr_warp_rust
 
 # from ..filtering import create, delete, update
 
@@ -126,6 +126,7 @@ def search_on_device(  # noqa: PLR0913
     """Perform a search on a single specified device."""
     search_config = xtr_warp_rust.SearchConfig(
         k=top_k,
+        device=device,
         ncells=ncells,
         t_prime=t_prime,
         bound=bound,
@@ -138,7 +139,6 @@ def search_on_device(  # noqa: PLR0913
     scores = xtr_warp_rust.load_and_search(
         index=index,
         torch_path=torch_path,
-        device=device,
         queries_embeddings=queries_embeddings,
         search_config=search_config,
     )

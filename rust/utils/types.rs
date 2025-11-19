@@ -70,6 +70,10 @@ pub struct SearchConfig {
     #[pyo3(get, set)]
     pub k: usize,
 
+    /// Device to perform the search on
+    #[pyo3(get, set)]
+    pub device: String,
+
     /// Number of centroids to probe during search
     #[pyo3(get, set)]
     pub nprobe: u32,
@@ -104,9 +108,10 @@ impl SearchConfig {
     /// Creates a new SearchConfig instance from Python
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (k, nprobe=None, t_prime=None, bound=None, parallel=None, num_threads=None, centroid_score_threshold=None, max_codes_per_centroid=None))]
+    #[pyo3(signature = (k, device, nprobe=None, t_prime=None, bound=None, parallel=None, num_threads=None, centroid_score_threshold=None, max_codes_per_centroid=None))]
     fn new(
         k: usize,
+        device: String,
         nprobe: Option<u32>,
         t_prime: Option<usize>,
         bound: Option<usize>,
@@ -117,6 +122,7 @@ impl SearchConfig {
     ) -> Self {
         Self {
             k,
+            device,
             nprobe: nprobe.unwrap_or(32),
             t_prime,
             bound: bound.unwrap_or(128),
@@ -132,6 +138,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             k: 100,
+            device: "cpu".to_string(),
             nprobe: 32,
             t_prime: None,
             bound: 128,
@@ -255,5 +262,30 @@ impl TPrimePolicy {
                 }
             },
         }
+    }
+}
+
+/// Parses a string identifier into a `tch::Device` for Rust-only usage.
+///
+/// Supports simple device strings like "cpu", "cuda", and indexed CUDA devices
+/// such as "cuda:0".
+pub fn parse_device(device: &str) -> anyhow::Result<Device> {
+    match device.to_lowercase().as_str() {
+        "cpu" => Ok(Device::Cpu),
+        "cuda" => Ok(Device::Cuda(0)), // Default to the first CUDA device.
+        s if s.starts_with("cuda:") => {
+            let parts: Vec<&str> = s.split(':').collect();
+            if parts.len() == 2 {
+                parts[1]
+                    .parse::<usize>()
+                    .map(Device::Cuda)
+                    .map_err(|_| anyhow::anyhow!("Invalid CUDA device index: '{}'", parts[1]))
+            } else {
+                Err(anyhow::anyhow!(
+                    "Invalid CUDA device format. Expected 'cuda:N'."
+                ))
+            }
+        },
+        _ => Err(anyhow::anyhow!("Unsupported device string: '{}'", device)),
     }
 }

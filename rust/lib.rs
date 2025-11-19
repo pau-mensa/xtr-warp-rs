@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 use pyo3_tch::PyTensor;
 use std::ffi::CString;
 use std::path::Path;
-use tch::{Device, Kind};
+use tch::Device;
 
 // Module declarations
 pub mod index;
@@ -196,7 +196,6 @@ fn load_and_search(
     _py: Python<'_>,
     index: String,
     torch_path: String,
-    device: String,
     queries_embeddings: PyTensor,
     search_config: SearchConfig,
 ) -> PyResult<Vec<SearchResult>> {
@@ -215,7 +214,7 @@ fn load_and_search(
         )));
     }
 
-    let device = get_device(&device)?;
+    let device = get_device(&search_config.device)?;
     let index = IndexLoader::new(index, device, false)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index loader: {}", e)))?;
     let loaded_index = index
@@ -253,9 +252,4 @@ fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create, m)?)?;
     m.add_function(wrap_pyfunction!(load_and_search, m)?)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 }

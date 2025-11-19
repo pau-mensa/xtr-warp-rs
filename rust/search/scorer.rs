@@ -1,6 +1,5 @@
 use anyhow::Result;
 use std::sync::Arc;
-use tch::Device;
 
 use crate::search::centroid_selector::CentroidSelector;
 use crate::search::decompressor::CentroidDecompressor;
@@ -25,20 +24,18 @@ pub struct WARPScorer {
 
     /// Configuration
     config: SearchConfig,
-
-    /// Device for tensor operations
-    device: Device,
 }
 
 impl WARPScorer {
-    pub fn new(index: Arc<LoadedIndex>, config: SearchConfig, device: Device) -> Result<Self> {
+    pub fn new(index: Arc<LoadedIndex>, config: SearchConfig) -> Result<Self> {
         // Initialize centroid selector from phase 1
         let centroid_selector = CentroidSelector::new(
             &config,
             index.metadata.num_embeddings,
             index.metadata.num_centroids,
-            device,
         );
+
+        let device = crate::utils::types::parse_device(&config.device)?;
 
         // Initialize decompressor from phase 1
         let decompressor = CentroidDecompressor::new(
@@ -64,7 +61,6 @@ impl WARPScorer {
             decompressor,
             merger,
             config,
-            device,
         })
     }
 
@@ -93,9 +89,10 @@ impl WARPScorer {
                 let centroid_scores = all_centroid_scores.narrow(0, b as i64, 1).squeeze_dim(0);
                 // Create query mask
                 let query_mask = query_embeddings.ne(0).any_dim(1, false);
+                println!("Query Mask is {}", query_mask);
 
                 // Select centroids for this query using pre-computed scores
-                let selected = self.centroid_selector.select_centroids_with_scores(
+                let selected = self.centroid_selector.select_centroids(
                     &query_mask,
                     &centroid_scores,
                     &self.index.sizes_compacted,

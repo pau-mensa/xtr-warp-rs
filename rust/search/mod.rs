@@ -45,9 +45,8 @@ impl Searcher {
     /// Create a new searcher with loaded index
     pub fn new(index: LoadedIndex, config: &SearchConfig) -> Result<Self> {
         // Initialize the WARP scorer which integrates all phase 1 components
-        let device = config.device;
         let index_arc = std::sync::Arc::new(index);
-        let scorer = WARPScorer::new(index_arc.clone(), config.clone(), device)?;
+        let scorer = WARPScorer::new(index_arc.clone(), config.clone())?;
 
         Ok(Self {
             index: index_arc,
