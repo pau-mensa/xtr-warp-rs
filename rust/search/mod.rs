@@ -36,9 +36,7 @@ use crate::utils::types::{LoadedIndex, Query, SearchConfig, SearchResult};
 
 /// Main search interface combining all components
 pub struct Searcher {
-    index: std::sync::Arc<LoadedIndex>,
     scorer: WARPScorer,
-    config: SearchConfig,
 }
 
 impl Searcher {
@@ -48,18 +46,12 @@ impl Searcher {
         let index_arc = std::sync::Arc::new(index);
         let scorer = WARPScorer::new(index_arc.clone(), config.clone())?;
 
-        Ok(Self {
-            index: index_arc,
-            scorer,
-            config: config.clone(),
-        })
+        Ok(Self { scorer })
     }
 
     /// Search for top-k passages given a query
-    pub fn search(&self, query: Query, k: Option<usize>) -> Result<Vec<SearchResult>> {
-        let k = k.unwrap_or(self.config.k);
-
+    pub fn search(&self, query: Query) -> Result<Vec<SearchResult>> {
         // Use the WARPScorer which handles the entire batch
-        self.scorer.rank(&query, k)
+        self.scorer.rank(&query)
     }
 }

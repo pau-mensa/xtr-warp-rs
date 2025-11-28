@@ -223,7 +223,7 @@ fn train_residual_codec(
     let weight_quantiles = &quantiles_base + (0.5 / n_options as f64);
 
     // Compute quantiles - returns shape [num_quantiles, 1, dim] with keepdim=true
-    let b_cutoffs = heldout_res_raw
+    /*let b_cutoffs = heldout_res_raw
         .quantile(&cutoff_quantiles, Some(0), true, "linear")
         .squeeze_dim(1) // Remove the middle dimension -> [num_quantiles, dim]
         .transpose(0, 1); // Transpose to [dim, num_quantiles]
@@ -232,6 +232,11 @@ fn train_residual_codec(
         .quantile(&weight_quantiles, Some(0), true, "linear")
         .squeeze_dim(1) // Remove the middle dimension -> [num_quantiles, dim]
         .transpose(0, 1); // Transpose to [dim, num_quantiles]
+    */
+    let heldout_res_flat = heldout_res_raw.flatten(0, -1); // Flatten all residuals
+    let b_cutoffs = heldout_res_flat.quantile(&cutoff_quantiles, None, false, "linear"); // Results in [num_quantiles]
+
+    let b_weights = heldout_res_flat.quantile(&weight_quantiles, None, false, "linear"); // Results in [num_quantiles]
 
     let final_codec = ResidualCodec::load(
         nbits,
@@ -242,23 +247,23 @@ fn train_residual_codec(
         device,
     )?;
 
-    let centroids_fpath = Path::new(&index_path).join("centroids.pt");
+    let centroids_fpath = Path::new(&index_path).join("centroids.npy");
     final_codec
         .centroids
         .to_device(Device::Cpu)
-        .save(&centroids_fpath)?;
+        .write_npy(&centroids_fpath)?;
 
-    let cutoffs_fpath = Path::new(&index_path).join("bucket_cutoffs.pt");
-    b_cutoffs.to_device(Device::Cpu).save(&cutoffs_fpath)?;
+    let cutoffs_fpath = Path::new(&index_path).join("bucket_cutoffs.npy");
+    b_cutoffs.to_device(Device::Cpu).write_npy(&cutoffs_fpath)?;
 
-    let weights_fpath = Path::new(&index_path).join("bucket_weights.pt");
-    b_weights.to_device(Device::Cpu).save(&weights_fpath)?;
+    let weights_fpath = Path::new(&index_path).join("bucket_weights.npy");
+    b_weights.to_device(Device::Cpu).write_npy(&weights_fpath)?;
 
-    let avg_res_fpath = Path::new(&index_path).join("avg_residual.pt");
+    let avg_res_fpath = Path::new(&index_path).join("avg_residual.npy");
     final_codec
         .avg_residual
         .to_device(Device::Cpu)
-        .save(&avg_res_fpath)?;
+        .write_npy(&avg_res_fpath)?;
 
     Ok(final_codec)
 }
@@ -361,11 +366,15 @@ pub fn compress_into_residuals(
         let chk_codes = Tensor::cat(&chk_codes_list, 0);
         let chk_residuals = Tensor::cat(&chk_res_list, 0);
 
-        let chk_codes_fpath = Path::new(&index_path).join(&format!("{}.codes.pt", chk_idx));
-        chk_codes.to_device(Device::Cpu).save(&chk_codes_fpath)?;
+        let chk_codes_fpath = Path::new(&index_path).join(&format!("{}.codes.npy", chk_idx));
+        chk_codes
+            .to_device(Device::Cpu)
+            .write_npy(&chk_codes_fpath)?;
 
-        let chk_res_fpath = Path::new(&index_path).join(&format!("{}.residuals.pt", chk_idx));
-        chk_residuals.to_device(Device::Cpu).save(&chk_res_fpath)?;
+        let chk_res_fpath = Path::new(&index_path).join(&format!("{}.residuals.npy", chk_idx));
+        chk_residuals
+            .to_device(Device::Cpu)
+            .write_npy(&chk_res_fpath)?;
 
         let chk_doclens_fpath = Path::new(&index_path).join(format!("doclens.{}.json", chk_idx));
         let dl_file = File::create(chk_doclens_fpath)?;
@@ -481,8 +490,8 @@ fn build_ivf(
 
     for chk_idx in 0..n_chunks {
         let chk_offset_global = chk_emb_offsets[chk_idx];
-        let codes_fpath_for_global = Path::new(index_path).join(format!("{}.codes.pt", chk_idx));
-        let codes_from_file = Tensor::load(&codes_fpath_for_global)?.to_device(device);
+        let codes_fpath_for_global = Path::new(index_path).join(format!("{}.codes.npy", chk_idx));
+        let codes_from_file = Tensor::read_npy(&codes_fpath_for_global)?.to_device(device);
         let codes_in_chk_count = codes_from_file.size()[0];
         all_codes
             .narrow(0, chk_offset_global as i64, codes_in_chk_count)
@@ -494,20 +503,20 @@ fn build_ivf(
     let (opt_ivf, opt_ivf_lens) = optimize_ivf(&sorted_indices, &code_counts, index_path, device)
         .context("Failed to optimize IVF")?;
 
-    let opt_ivf_fpath = Path::new(index_path).join("ivf.pt");
+    let opt_ivf_fpath = Path::new(index_path).join("ivf.npy");
     opt_ivf
         .to_device(Device::Cpu)
         .to_kind(Kind::Int64)
-        .save(&opt_ivf_fpath)?;
-    let opt_ivf_lens_fpath = Path::new(index_path).join("ivf_lengths.pt");
+        .write_npy(&opt_ivf_fpath)?;
+    let opt_ivf_lens_fpath = Path::new(index_path).join("ivf_lengths.npy");
     opt_ivf_lens
         .to_device(Device::Cpu)
-        .save(&opt_ivf_lens_fpath)?;
+        .write_npy(&opt_ivf_lens_fpath)?;
     Ok(())
 }
 
 /// Compacts the index by reorganizing embeddings to be contiguous per centroid
-/// Creates sizes_compacted.pt and codes_compacted.pt files
+/// Creates sizes_compacted.npy and codes_compacted.npy files
 pub fn compact_index(
     index_path: &Path,
     num_chunks: usize,
@@ -516,15 +525,13 @@ pub fn compact_index(
     nbits: usize,
     device: Device,
 ) -> Result<()> {
-    println!("Compacting index at '{}'", index_path.display());
-
     // First pass: count embeddings per centroid
     let mut centroid_sizes = vec![0i64; num_centroids];
     let mut total_embeddings = 0i64;
 
     for chunk_idx in 0..num_chunks {
-        let codes_path = index_path.join(format!("{}.codes.pt", chunk_idx));
-        let codes = Tensor::load(&codes_path)?;
+        let codes_path = index_path.join(format!("{}.codes.npy", chunk_idx));
+        let codes = Tensor::read_npy(&codes_path)?;
 
         // Count embeddings per centroid
         for i in 0..codes.size()[0] {
@@ -536,12 +543,10 @@ pub fn compact_index(
 
     // Create sizes_compacted tensor
     let sizes_compacted = Tensor::from_slice(&centroid_sizes).to_device(device);
-    let sizes_path = index_path.join("sizes.compacted.pt");
-    sizes_compacted.save(&sizes_path)?;
-    println!(
-        "Saved sizes.compacted.pt with shape {:?}",
-        sizes_compacted.size()
-    );
+    let sizes_path = index_path.join("sizes.compacted.npy");
+    sizes_compacted
+        .to_device(Device::Cpu)
+        .write_npy(&sizes_path)?;
 
     // Calculate offsets for each centroid
     let mut offsets = vec![0i64; num_centroids + 1];
@@ -565,12 +570,12 @@ pub fn compact_index(
 
     for chunk_idx in 0..num_chunks {
         // Load chunk data
-        let codes_path = index_path.join(format!("{}.codes.pt", chunk_idx));
-        let residuals_path = index_path.join(format!("{}.residuals.pt", chunk_idx));
+        let codes_path = index_path.join(format!("{}.codes.npy", chunk_idx));
+        let residuals_path = index_path.join(format!("{}.residuals.npy", chunk_idx));
         let doclens_path = index_path.join(format!("doclens.{}.json", chunk_idx));
 
-        let codes = Tensor::load(&codes_path)?;
-        let residuals = Tensor::load(&residuals_path)?;
+        let codes = Tensor::read_npy(&codes_path)?;
+        let residuals = Tensor::read_npy(&residuals_path)?;
 
         // Load document lengths
         let doclens_file = File::open(&doclens_path)?;
@@ -605,33 +610,22 @@ pub fn compact_index(
     }
 
     // Save compacted data
-    let residuals_compacted_path = index_path.join("residuals.compacted.pt");
-    compacted_residuals.save(&residuals_compacted_path)?;
-    println!(
-        "Saved residuals.compacted.pt with shape {:?}",
-        compacted_residuals.size()
-    );
+    let residuals_compacted_path = index_path.join("residuals.compacted.npy");
+    compacted_residuals
+        .to_device(Device::Cpu)
+        .write_npy(&residuals_compacted_path)?;
 
-    let codes_compacted_path = index_path.join("codes.compacted.pt");
-    compacted_codes.save(&codes_compacted_path)?;
-    println!(
-        "Saved codes.compacted.pt with shape {:?}",
-        compacted_codes.size()
-    );
+    let codes_compacted_path = index_path.join("codes.compacted.npy");
+    compacted_codes
+        .to_device(Device::Cpu)
+        .write_npy(&codes_compacted_path)?;
 
     // Also save the offsets for quick access during search
     let offsets_tensor = Tensor::from_slice(&offsets).to_device(device);
-    let offsets_path = index_path.join("offsets.compacted.pt");
-    offsets_tensor.save(&offsets_path)?;
-    println!(
-        "Saved offsets.compacted.pt with shape {:?}",
-        offsets_tensor.size()
-    );
-
-    println!(
-        "Index compaction complete. Total embeddings: {}",
-        total_embeddings
-    );
+    let offsets_path = index_path.join("offsets.compacted.npy");
+    offsets_tensor
+        .to_device(Device::Cpu)
+        .write_npy(&offsets_path)?;
 
     Ok(())
 }

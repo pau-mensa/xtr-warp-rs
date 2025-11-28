@@ -39,27 +39,22 @@ impl IndexLoader {
         let index_path = self.index_path.as_path();
 
         // Load bucket weights (for scoring)
-        println!("#> Loading bucket weights...");
-        let bucket_weights = self.load_torch_tensor(index_path.join("bucket_weights.pt"))?;
+        let bucket_weights = self.load_torch_tensor(index_path.join("bucket_weights.npy"))?;
 
         // Load centroids
-        println!("#> Loading centroids...");
-        let centroids = self.load_torch_tensor(index_path.join("centroids.pt"))?;
+        let centroids = self.load_torch_tensor(index_path.join("centroids.npy"))?;
 
         // Load compacted sizes per centroid
-        println!("#> Loading sizes...");
-        let sizes_compacted = self.load_torch_tensor(index_path.join("sizes.compacted.pt"))?;
+        let sizes_compacted = self.load_torch_tensor(index_path.join("sizes.compacted.npy"))?;
 
         // Load compacted codes
-        println!("#> Loading codes...");
-        let codes_compacted = self.load_torch_tensor(index_path.join("codes.compacted.pt"))?;
+        let codes_compacted = self.load_torch_tensor(index_path.join("codes.compacted.npy"))?;
 
         // Load residuals - use repacked version if available for better memory access
-        println!("#> Loading residuals...");
-        let residuals_path = if index_path.join("residuals.repacked.compacted.pt").exists() {
-            index_path.join("residuals.repacked.compacted.pt")
+        let residuals_path = if index_path.join("residuals.repacked.compacted.npy").exists() {
+            index_path.join("residuals.repacked.compacted.npy")
         } else {
-            index_path.join("residuals.compacted.pt")
+            index_path.join("residuals.compacted.npy")
         };
         let residuals_compacted = self.load_torch_tensor(residuals_path)?;
 
@@ -107,11 +102,6 @@ impl IndexLoader {
 
         let metadata = self.load_metadata(index_path, metadata_fallback)?;
 
-        println!("#> Index loaded successfully!");
-        println!("#> - {} centroids", num_centroids);
-        println!("#> - {} embeddings", num_embeddings);
-        println!("#> - kdummy_centroid: {}", kdummy_centroid);
-
         Ok(LoadedIndex {
             centroids,
             bucket_weights,
@@ -148,8 +138,8 @@ impl IndexLoader {
     ///
     /// Uses native PyTorch format for efficiency
     fn load_torch_tensor(&self, path: PathBuf) -> Result<Tensor> {
-        let tensor =
-            Tensor::load(&path).map_err(|e| anyhow!("Failed to load tensor {:?}: {}", path, e))?;
+        let tensor = Tensor::read_npy(&path)
+            .map_err(|e| anyhow!("Failed to load tensor {:?}: {}", path, e))?;
 
         Ok(tensor.to_device(self.device))
     }

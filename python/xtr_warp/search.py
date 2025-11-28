@@ -120,8 +120,10 @@ def search_on_device(  # noqa: PLR0913
     nprobe: int,
     index: str,
     torch_path: str,
-    t_prime: int = 10_000,
-    bound: int = 2,
+    t_prime: int,
+    bound: int,
+    max_candidates: int,
+    centroid_score_threshold: float | None = None,
 ) -> list[list[tuple[int, float]]]:
     """Perform a search on a single specified device."""
     # Ensure queries_embeddings is 3D [batch, num_tokens, dim]
@@ -134,19 +136,20 @@ def search_on_device(  # noqa: PLR0913
 
     search_config = xtr_warp_rust.SearchConfig(
         k=top_k,
+        device=device,
         nprobe=nprobe,
         t_prime=t_prime,
         bound=bound,
         parallel=False,
         num_threads=1,
-        centroid_score_threshold=None,
+        centroid_score_threshold=centroid_score_threshold,
         max_codes_per_centroid=None,
+        max_candidates=max_candidates,
     )
 
     scores = xtr_warp_rust.load_and_search(
         index=index,
         torch_path=torch_path,
-        device=device,
         queries_embeddings=queries_embeddings,
         search_config=search_config,
     )
@@ -225,7 +228,7 @@ class XTRWarp:
         max_points_per_centroid: int = 256,
         nbits: int = 4,
         nprobe: int = 8,
-        t_prime: int = 10_000,
+        t_prime: int | None = None,
         n_samples_kmeans: int | None = None,
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
@@ -309,6 +312,12 @@ class XTRWarp:
                     os.remove(npy_file)
                 except OSError:
                     pass
+
+            for pt_file in glob.glob(os.path.join(index_path, "*.pt")):
+                try:
+                    os.remove(pt_file)
+                except OSError:
+                    pass
         elif not os.path.exists(index_path):
             try:
                 os.makedirs(index_path)
@@ -318,12 +327,12 @@ class XTRWarp:
     def search(  # noqa: PLR0913, C901
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
-        top_k: int = 10,
-        batch_size: int = 1 << 18,
-        n_full_scores: int = 4096,
-        bound: int = 8,
-        nprobe: int = 8,
-        t_prime: int = 10000,
+        top_k: int,
+        t_prime: int,
+        bound: int,
+        nprobe: int | None = None,
+        max_candidates: int | None = None,
+        centroid_score_threshold: float | None = None,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
 
@@ -333,20 +342,40 @@ class XTRWarp:
             Embeddings of the queries to search for.
         top_k:
             Number of top results to return.
-        batch_size:
-            Internal batch size for the search.
-        n_full_scores:
-            Number of full scores to compute for re-ranking.
+        bound:
+            The number of centroids to consider per query.
         nprobe:
             Number of inverted file probes to use.
-        show_progress:
-            Whether to show progress during the search.
-        subset:
-            An optional list of lists of integers. If provided, the search
-            for each query will be restricted to the document IDs in the
-            corresponding inner list.
+        t_prime:
+            Value to use for the t_prime policy.
+        max_candidates:
+            Maximum number of candidates to consider before the final sort.
+        centroid_score_threshold:
+            Threshold for centroid scores.
 
         """
+        if top_k <= 10:
+            if nprobe is None:
+                nprobe = 1
+            if max_candidates is None:
+                max_candidates = 256
+            if centroid_score_threshold is None:
+                centroid_score_threshold = 0.5
+        elif top_k <= 100:
+            if nprobe is None:
+                nprobe = 2
+            if max_candidates is None:
+                max_candidates = 1024
+            if centroid_score_threshold is None:
+                centroid_score_threshold = 0.45
+        else:
+            if nprobe is None:
+                nprobe = 4
+            if max_candidates is None:
+                max_candidates = max(top_k * 4, 4096)
+            if centroid_score_threshold is None:
+                centroid_score_threshold = 0.4
+
         if isinstance(queries_embeddings, list):
             queries_embeddings = torch.nn.utils.rnn.pad_sequence(
                 sequences=[
@@ -366,10 +395,6 @@ class XTRWarp:
                 split_size_or_sections=split_size,
             )
 
-            subset_splits: list[list[list[int]] | None] = [None] * len(
-                queries_embeddings_splits
-            )
-
             tasks = [
                 delayed(function=search_on_device)(
                     device=device,
@@ -380,10 +405,10 @@ class XTRWarp:
                     index=self.index,
                     t_prime=t_prime,
                     torch_path=self.torch_path,
+                    centroid_score_threshold=centroid_score_threshold,
+                    max_candidates=max_candidates,
                 )
-                for step, (device, dev_queries, dev_subset) in enumerate(
-                    zip(self.devices, queries_embeddings_splits, subset_splits)
-                )
+                for device, dev_queries in zip(self.devices, queries_embeddings_splits)
             ]
 
             scores_per_device = Parallel(n_jobs=len(self.devices))(tasks)
@@ -404,6 +429,8 @@ class XTRWarp:
                 index=self.index,
                 t_prime=t_prime,
                 torch_path=self.torch_path,
+                centroid_score_threshold=centroid_score_threshold,
+                max_candidates=max_candidates,
             )
 
         split_size = (num_queries // len(self.devices)) + 1
@@ -420,11 +447,12 @@ class XTRWarp:
                 bound,
                 nprobe,
                 self.index,
+                t_prime,
                 self.torch_path,
+                centroid_score_threshold,
+                max_candidates,
             )
-            for step, (device, dev_queries, dev_subset) in enumerate(
-                zip(self.devices, queries_embeddings_splits, subset_splits)
-            )
+            for device, dev_queries in zip(self.devices, queries_embeddings_splits)
         ]
 
         scores_devices = []

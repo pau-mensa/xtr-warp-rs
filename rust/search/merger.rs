@@ -1,6 +1,7 @@
 use anyhow::Result;
 use ndarray::Array1;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tch::{no_grad, Device, Kind, Tensor};
 
@@ -288,13 +289,6 @@ impl ResultMerger {
             num_iterations += 1;
         }
 
-        // If odd number of iterations, swap back so result is in original buffer
-        if num_iterations % 2 != 0 {
-            for i in 0..nprobe {
-                Self::copy_candidate_stride(&buf2[begin + i], &mut buf1[begin + i]);
-            }
-        }
-
         num_iterations
     }
 
@@ -386,6 +380,7 @@ impl ResultMerger {
     ) -> Result<(Vec<PassageId>, Vec<Score>)> {
         no_grad(|| {
             let num_cells = capacities.size()[0] as usize;
+            //println!("Number of cells: {}", num_cells);
             let num_candidates = candidate_pids.size()[0] as usize;
 
             // Convert tensors to vectors for creating stride views
@@ -394,32 +389,54 @@ impl ResultMerger {
             let scores_vec: Vec<Score> = candidate_scores.to_kind(Kind::Float).try_into()?;
             let mse_vec: Vec<f32> = mse_estimates.to_kind(Kind::Float).try_into()?;
 
-            let total_size: i32 = sizes_vec.iter().sum();
-
             // Create strided views into the data (each view represents one centroid's candidates)
             let mut views = Vec::new();
             let mut offset = 0;
+            let mut total_dedup_size = 0usize;
             for i in 0..num_cells {
                 let size = sizes_vec[i] as usize;
 
                 // Use size instead of capacity since the data is deduplicated and compacted
                 let end = (offset + size).min(num_candidates);
-                let pids_slice = pids_vec[offset..end].to_vec();
-                let scores_slice = scores_vec[offset..end].to_vec();
+                let mut pid_score_map: BTreeMap<PassageId, Score> = BTreeMap::new();
+
+                for idx in offset..end {
+                    let pid = pids_vec[idx];
+                    let score = scores_vec[idx];
+                    pid_score_map
+                        .entry(pid)
+                        .and_modify(|existing| {
+                            if score > *existing {
+                                *existing = score;
+                            }
+                        })
+                        .or_insert(score);
+                }
+
+                let dedup_size = pid_score_map.len();
+                total_dedup_size += dedup_size;
+
+                let mut dedup_pids = Vec::with_capacity(dedup_size);
+                let mut dedup_scores = Vec::with_capacity(dedup_size);
+                for (pid, score) in pid_score_map {
+                    dedup_pids.push(pid);
+                    dedup_scores.push(score);
+                }
 
                 views.push(AnnotatedStrideView::from_data(
-                    pids_slice,
-                    scores_slice,
-                    size,
+                    dedup_pids,
+                    dedup_scores,
+                    dedup_size,
                 ));
                 offset += size;
             }
+            //println!("Views shape {:?}", views.len());
 
             // Create buffer views for merging
             // We need to create views that can handle the worst-case merge scenario
             // When merging in a tree-like fashion, the maximum size at any level
             // is the sum of all individual sizes
-            let max_merged_size = total_size as usize;
+            let max_merged_size = total_dedup_size.max(1);
             let mut views_buffer = Vec::new();
             for _ in 0..num_cells {
                 // Each buffer view needs enough capacity to hold the fully merged result
@@ -448,15 +465,16 @@ impl ResultMerger {
             Self::merge_candidates_tokens(&mut views, &mut views_buffer, nprobe, &mse_vec);
 
             // Get top-k results from the first stride (which contains the final merged results)
-            let num_results = views[0].size.min(k);
-            let pid_idx = Self::partial_sort_results(&views[0], num_results);
+            let budget = self.config.max_candidates.min(views[0].size).max(k);
+            let top_idx = Self::partial_sort_results(&views[0], budget);
 
             // Extract the top-k PIDs and scores
-            let mut result_pids = vec![0i64; num_results];
-            let mut result_scores = vec![0.0f32; num_results];
+            let mut result_pids = vec![0i64; budget];
+            let mut result_scores = vec![0.0f32; budget];
 
-            for i in 0..num_results {
-                let idx = pid_idx[i];
+            for i in 0..budget {
+                let idx = top_idx[i];
+                // let k_idx = &top_idx[..k.min(top_idx.len())];
                 result_pids[i] = views[0].pids[idx];
                 result_scores[i] = views[0].scores[idx];
             }
@@ -464,6 +482,9 @@ impl ResultMerger {
             // Convert back to tensors TODO might not be necessary
             //let candidate_pids = Tensor::from_slice(&result_pids).to_device(self.config.device);
             //let candidate_scores = Tensor::from_slice(&result_scores).to_device(self.config.device);
+            //println!("Views size {:?}", views[0].size);
+            //println!("Result PIDs {:?}", views[0].pids);
+            //println!("Result Scores {:?}", views[0].scores);
 
             Ok((result_pids, result_scores))
         })

@@ -225,12 +225,9 @@ fn load_and_search(
 
     // Process batch
     let results = searcher
-        .search(
-            Query {
-                embeddings: query_tensor,
-            },
-            Some(search_config.k),
-        )
+        .search(Query {
+            embeddings: query_tensor,
+        })
         .map_err(|e| PyRuntimeError::new_err(format!("Search failed: {}", e)))?;
 
     Ok(results)

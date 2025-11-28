@@ -101,6 +101,10 @@ pub struct SearchConfig {
     /// Maximum codes per centroid
     #[pyo3(get, set)]
     pub max_codes_per_centroid: Option<u32>,
+
+    /// The number of candidates to consider before the sorting
+    #[pyo3(get, set)]
+    pub max_candidates: Option<usize>,
 }
 
 #[pymethods]
@@ -108,7 +112,7 @@ impl SearchConfig {
     /// Creates a new SearchConfig instance from Python
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (k, device, nprobe=None, t_prime=None, bound=None, parallel=None, num_threads=None, centroid_score_threshold=None, max_codes_per_centroid=None))]
+    #[pyo3(signature = (k, device, nprobe=None, t_prime=None, bound=None, parallel=None, num_threads=None, centroid_score_threshold=None, max_codes_per_centroid=None, max_candidates=None))]
     fn new(
         k: usize,
         device: String,
@@ -119,6 +123,7 @@ impl SearchConfig {
         num_threads: Option<usize>,
         centroid_score_threshold: Option<f32>,
         max_codes_per_centroid: Option<u32>,
+        max_candidates: Option<usize>,
     ) -> Self {
         Self {
             k,
@@ -130,6 +135,7 @@ impl SearchConfig {
             num_threads,
             centroid_score_threshold,
             max_codes_per_centroid,
+            max_candidates,
         }
     }
 }
@@ -142,10 +148,11 @@ impl Default for SearchConfig {
             nprobe: 32,
             t_prime: None,
             bound: 128,
-            parallel: true,
+            parallel: false,
             num_threads: None,
             centroid_score_threshold: None,
             max_codes_per_centroid: None,
+            max_candidates: None,
         }
     }
 }

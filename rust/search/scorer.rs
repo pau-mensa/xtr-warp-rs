@@ -46,8 +46,9 @@ impl WARPScorer {
         )?;
 
         // Initialize merger
+        let max_candidates = config.max_candidates.unwrap_or(256);
         let merger_config = MergerConfig {
-            max_candidates: 10000,
+            max_candidates: max_candidates,
             use_parallel: config.parallel,
             num_threads: config.num_threads.unwrap_or(1),
             combination_strategy: ScoreCombination::Sum,
@@ -68,9 +69,10 @@ impl WARPScorer {
     pub fn rank(
         &self,
         query: &Query, // [batch, num_tokens, dim]
-        k: usize,
     ) -> Result<Vec<SearchResult>> {
         use tch::no_grad;
+
+        let k = self.config.k;
 
         no_grad(|| {
             let batch_size = query.embeddings.size()[0] as usize;
@@ -109,6 +111,8 @@ impl WARPScorer {
                 )?;
 
                 // Merge candidate scores
+                //println!("Scores PRE {:?}", decompressed.scores.i(0));
+                //println!("Scores sizes {:?}", decompressed.scores.size());
                 let (pids, scores) = self.merger.merge_candidate_scores(
                     &decompressed.capacities,
                     &decompressed.sizes,
@@ -118,11 +122,18 @@ impl WARPScorer {
                     self.config.nprobe as usize,
                     k,
                 )?;
+                //println!("Scores POST {:?}", scores[0]);
+                //println!("Scores POST Size {:?}", scores.len());
 
                 // Build result for this query
-                results.push(SearchResult {
+                /*results.push(SearchResult {
                     passage_ids: pids,
                     scores: scores,
+                    query_id: (b + 1) as usize,
+                });*/
+                results.push(SearchResult {
+                    passage_ids: pids[..k.min(pids.len())].to_vec(),
+                    scores: scores[..k.min(scores.len())].to_vec(),
                     query_id: (b + 1) as usize,
                 });
             }

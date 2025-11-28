@@ -5,6 +5,7 @@ a ColBERT-style late interaction retrieval system.
 """
 
 from .search import XTRWarp
+from .evaluation import evaluate, load_beir
 
 # Import the Rust extension module
 try:
@@ -23,4 +24,4 @@ except ImportError:
         xtr_warp_rust = None
 
 __version__ = "0.0.1"
-__all__ = ["XTRWarp", "xtr_warp_rust"]
+__all__ = ["XTRWarp", "xtr_warp_rust", "evaluate", "load_beir"]

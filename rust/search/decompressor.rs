@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
 use std::sync::Arc;
-use tch::{Device, Kind, Tensor};
+use tch::{Device, IndexOp, Kind, Tensor};
 
 use crate::utils::types::{DecompressedCentroidsOutput, LoadedIndex};
 
@@ -11,6 +10,7 @@ pub struct CentroidDecompressor {
     device: Device,
     use_parallel: bool,
     dim: usize,
+    reversed_bit_map: [u8; 256],
 }
 
 impl CentroidDecompressor {
@@ -20,12 +20,40 @@ impl CentroidDecompressor {
             return Err(anyhow!("nbits must be 2 or 4, got {}", nbits));
         }
 
+        let reversed_bit_map = Self::build_reversed_bit_map(nbits);
+
         Ok(Self {
             nbits,
             device,
             use_parallel,
             dim,
+            reversed_bit_map,
         })
+    }
+
+    fn build_reversed_bit_map(nbits: u8) -> [u8; 256] {
+        let mut reversed = [0u8; 256];
+        let nbits_mask = (1 << nbits) - 1;
+        for byte_val in 0..256u32 {
+            let mut reversed_bits = 0u32;
+            let mut bit_pos = 8;
+            while bit_pos >= nbits {
+                let segment = (byte_val >> (bit_pos - nbits)) & nbits_mask;
+                let mut reversed_segment = 0u32;
+                for k in 0..nbits {
+                    if (segment & (1 << k)) != 0 {
+                        reversed_segment |= 1 << (nbits - 1 - k);
+                    }
+                }
+                reversed_bits |= reversed_segment;
+                if bit_pos > nbits {
+                    reversed_bits <<= nbits;
+                }
+                bit_pos -= nbits;
+            }
+            reversed[byte_val as usize] = (reversed_bits & 0xFF) as u8;
+        }
+        reversed
     }
 
     /// Decompress multiple centroids for a query
@@ -38,352 +66,233 @@ impl CentroidDecompressor {
         nprobe: usize,
     ) -> Result<DecompressedCentroidsOutput> {
         let centroid_ids = centroid_ids.to_kind(Kind::Int64);
-        let num_centroids = centroid_ids.size()[0] as i64;
+        let num_cells = centroid_ids.size()[0] as usize;
 
         let num_total_centroids = index.offsets_compacted.size()[0] - 1;
         let max_centroid_id = centroid_ids.max().int64_value(&[]);
 
         if max_centroid_id >= num_total_centroids {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow!(
                 "Centroid ID {} is out of bounds (max valid ID is {})",
                 max_centroid_id,
                 num_total_centroids - 1
             ));
         }
 
-        // Get offsets for all centroids - these are i64 tensors
+        // Gather begin/end offsets and capacities for every requested centroid
         let begins = index.offsets_compacted.index_select(0, &centroid_ids);
         let ends = index.offsets_compacted.index_select(0, &(centroid_ids + 1));
-        let capacities = &ends - &begins; // Number of embeddings per centroid (before deduplication)
+        let capacities = &ends - &begins;
 
-        // Build indices for all embeddings across all centroids
-        let mut all_indices_vec = Vec::new();
-        for i in 0..num_centroids {
-            let begin = begins.int64_value(&[i]);
-            let end = ends.int64_value(&[i]);
-            let capacity = end - begin;
-
-            if capacity > 0 {
-                // Create range [begin, begin+1, ..., end-1]
-                let range = Tensor::arange(capacity, (Kind::Int64, self.device)) + begin;
-                all_indices_vec.push(range);
-            }
+        // Early exit when there is nothing to process
+        if num_cells == 0 {
+            let empty = Tensor::zeros(&[0], (Kind::Int, self.device));
+            return Ok(DecompressedCentroidsOutput {
+                capacities,
+                sizes: empty.to_kind(Kind::Int),
+                passage_ids: Tensor::zeros(&[0], (Kind::Int64, self.device)),
+                scores: Tensor::zeros(&[0], (Kind::Float, self.device)),
+                offsets: Tensor::zeros(&[1], (Kind::Int64, self.device)),
+            });
         }
 
-        // Concatenate all indices into a single tensor
-        let all_indices = Tensor::cat(&all_indices_vec, 0);
+        anyhow::ensure!(nprobe > 0, "nprobe must be greater than zero");
 
-        // Get passage IDs for all embeddings
-        let all_codes = index.codes_compacted.index_select(0, &all_indices);
+        let query_embeddings = query_embeddings.to_kind(Kind::Float);
+        anyhow::ensure!(
+            query_embeddings.size()[1] == self.dim as i64,
+            "Query embedding dim ({}) does not match index dim ({})",
+            query_embeddings.size()[1],
+            self.dim
+        );
 
-        // Decompress all residuals in batch
-        let all_residuals = self.decompress_residuals_batch(
-            &all_indices,
-            query_embeddings,
-            &index.bucket_weights,
-            &begins,
-            &capacities,
-            nprobe,
-            &index,
-        )?;
+        let num_tokens = query_embeddings.size()[0] as usize;
+        anyhow::ensure!(
+            num_tokens > 0,
+            "Expected at least one query token for decompression"
+        );
 
-        // Compute final scores
-        let all_scores =
-            self.compute_final_scores(&centroid_scores, &all_residuals, &begins, &capacities)?;
+        let bucket_weights = index.bucket_weights.to_kind(Kind::Float);
+        let vt_bucket_scores =
+            (query_embeddings.unsqueeze(2) * &bucket_weights.unsqueeze(0)).contiguous();
 
-        // Deduplicate passages within each centroid
-        let dedup_result =
-            self.deduplicate_passages_per_centroid(&all_codes, &all_scores, &begins, &capacities)?;
+        let bucket_scores_flat: Vec<f32> = vt_bucket_scores.flatten(0, -1).try_into()?;
+        let centroid_scores_vec: Vec<f32> = centroid_scores.flatten(0, -1).try_into()?;
 
-        Ok(DecompressedCentroidsOutput {
-            capacities,
-            sizes: dedup_result.3, // Actual sizes after deduplication
-            passage_ids: dedup_result.0,
-            scores: dedup_result.1,
-            offsets: dedup_result.2,
-        })
-    }
+        anyhow::ensure!(
+            centroid_scores_vec.len() == num_cells,
+            "Centroid score count ({}) does not match number of cells ({})",
+            centroid_scores_vec.len(),
+            num_cells
+        );
 
-    /// Decompress residuals for all centroids in batch
-    /// Returns a tensor of residual scores aligned with all_indices
-    fn decompress_residuals_batch(
-        &self,
-        all_indices: &Tensor, // [total_embeddings] - global indices into residuals
-        query_embeddings: &Tensor, // [num_tokens, dim] - query embeddings
-        bucket_weights: &Tensor, // [dim, num_buckets_per_dim] - bucket weights
-        begins: &Tensor,      // [num_centroids] - start indices
-        capacities: &Tensor, // [num_centroids] - number of embeddings per centroid (before deduplication)
-        nprobe: usize,
-        index: &LoadedIndex,
-    ) -> Result<Tensor> {
-        let total_embeddings = all_indices.size()[0] as usize;
-        let num_centroids = begins.size()[0] as usize;
+        let total_capacity = capacities.sum(Kind::Int64).int64_value(&[]).max(0) as usize;
 
-        // Prepare output tensor
-        let mut residual_scores = vec![0.0f32; total_embeddings];
+        let mut candidate_sizes = vec![0i32; num_cells];
+        let mut candidate_pids = Vec::with_capacity(total_capacity);
+        let mut candidate_scores = Vec::with_capacity(total_capacity);
+        let mut offsets = Vec::with_capacity(num_cells + 1);
+        offsets.push(0i64);
 
-        let mut global_idx = 0;
-        for centroid_idx in 0..num_centroids {
-            let capacity = capacities.int64_value(&[centroid_idx as i64]) as usize;
-            if capacity == 0 {
-                continue;
-            }
+        let num_buckets = 1usize << (self.nbits as usize);
+        let bucket_dim_shift = self.nbits as usize;
+        let bucket_score_stride = self.dim * num_buckets;
+        let packed_vals_per_byte = 8usize / self.nbits as usize;
+        let residual_bytes_per_embedding = self.dim / packed_vals_per_byte;
 
-            let begin = begins.int64_value(&[centroid_idx as i64]);
-            let token_idx = centroid_idx / nprobe; // Which query token this centroid belongs to
-
-            // Process each embedding in this centroid
-            for local_idx in 0..capacity {
-                let residual_idx = begin + local_idx as i64;
-
-                let score = if self.nbits == 2 {
-                    self.decompress_single_residual_2bit(
-                        residual_idx, // Pass the row index directly
-                        query_embeddings,
-                        bucket_weights,
-                        token_idx,
-                        &index.residuals_compacted,
-                    )?
-                } else {
-                    self.decompress_single_residual_4bit(
-                        residual_idx, // Pass the row index directly
-                        query_embeddings,
-                        bucket_weights,
-                        token_idx,
-                        &index.residuals_compacted,
-                    )?
-                };
-
-                residual_scores[global_idx] = score;
-                global_idx += 1;
-            }
-        }
-
-        Ok(Tensor::from_slice(&residual_scores).to_device(self.device))
-    }
-
-    /// Compute final scores by adding centroid scores to residuals
-    fn compute_final_scores(
-        &self,
-        centroid_scores: &Tensor,
-        residual_scores: &Tensor,
-        begins: &Tensor,
-        capacities: &Tensor,
-    ) -> Result<Tensor> {
-        let total_embeddings = residual_scores.size()[0] as usize;
-        let num_centroids = begins.size()[0] as usize;
-
-        let mut final_scores = vec![0.0f32; total_embeddings];
-
-        let mut global_idx = 0;
-        for centroid_idx in 0..num_centroids {
-            let capacity = capacities.int64_value(&[centroid_idx as i64]) as usize;
-            if capacity == 0 {
-                continue;
-            }
-
-            let centroid_score = centroid_scores.double_value(&[centroid_idx as i64]) as f32;
-
-            for _ in 0..capacity {
-                let residual = residual_scores.double_value(&[global_idx as i64]) as f32;
-                final_scores[global_idx] = centroid_score + residual;
-                global_idx += 1;
-            }
-        }
-
-        Ok(Tensor::from_slice(&final_scores).to_device(self.device))
-    }
-
-    /// Decompress a single 2-bit encoded residual
-    fn decompress_single_residual_2bit(
-        &self,
-        residual_idx: i64,
-        query_embeddings: &Tensor, // [num_tokens, dim]
-        bucket_weights: &Tensor,   // [dim, num_buckets_per_dim]
-        token_idx: usize,
-        residuals_compacted: &Tensor,
-    ) -> Result<f32> {
-        let packed_dim = self.dim / 4; // 4 values per byte for 2-bit encoding
-        let mut score = 0.0f32;
-
-        for packed_idx in 0..packed_dim {
-            // Get the packed byte - residuals are stored as uint8 in a 2D tensor [N, packed_dim]
-            let col_idx = packed_idx as i64;
-            let packed_val = if residual_idx < residuals_compacted.size()[0]
-                && col_idx < residuals_compacted.size()[1]
-            {
-                // Access the 2D tensor properly: [residual_idx, col_idx]
-                let val_i64 = residuals_compacted.int64_value(&[residual_idx, col_idx]);
-                (val_i64 & 0xFF) as u8
-            } else {
-                0u8 // Padding for out-of-bounds access
-            };
-
-            // Unpack 4 2-bit values
-            let unpacked_0 = (packed_val & 0xC0) >> 6;
-            let unpacked_1 = (packed_val & 0x30) >> 4;
-            let unpacked_2 = (packed_val & 0x0C) >> 2;
-            let unpacked_3 = packed_val & 0x03;
-
-            let unpacked_idx_0 = packed_idx * 4;
-            let unpacked_idx_1 = unpacked_idx_0 + 1;
-            let unpacked_idx_2 = unpacked_idx_0 + 2;
-            let unpacked_idx_3 = unpacked_idx_0 + 3;
-
-            // Get query values for these dimensions
-            let q0 =
-                query_embeddings.double_value(&[token_idx as i64, unpacked_idx_0 as i64]) as f32;
-            let q1 =
-                query_embeddings.double_value(&[token_idx as i64, unpacked_idx_1 as i64]) as f32;
-            let q2 =
-                query_embeddings.double_value(&[token_idx as i64, unpacked_idx_2 as i64]) as f32;
-            let q3 =
-                query_embeddings.double_value(&[token_idx as i64, unpacked_idx_3 as i64]) as f32;
-
-            // Get bucket weights for each dimension and bucket value
-            let w0 =
-                bucket_weights.double_value(&[unpacked_idx_0 as i64, unpacked_0 as i64]) as f32;
-            let w1 =
-                bucket_weights.double_value(&[unpacked_idx_1 as i64, unpacked_1 as i64]) as f32;
-            let w2 =
-                bucket_weights.double_value(&[unpacked_idx_2 as i64, unpacked_2 as i64]) as f32;
-            let w3 =
-                bucket_weights.double_value(&[unpacked_idx_3 as i64, unpacked_3 as i64]) as f32;
-
-            // Accumulate scores
-            score += q0 * w0;
-            score += q1 * w1;
-            score += q2 * w2;
-            score += q3 * w3;
-        }
-
-        Ok(score)
-    }
-
-    /// Decompress a single 4-bit encoded residual
-    fn decompress_single_residual_4bit(
-        &self,
-        residual_idx: i64,
-        query_embeddings: &Tensor, // [num_tokens, dim]
-        bucket_weights: &Tensor,   // [dim, num_buckets_per_dim]
-        token_idx: usize,
-        residuals_compacted: &Tensor,
-    ) -> Result<f32> {
-        let packed_dim = self.dim / 2; // 2 values per byte for 4-bit encoding
-        let mut score = 0.0f32;
-
-        for packed_idx in 0..packed_dim {
-            // Get the packed byte from the 2D tensor
-            let col_idx = packed_idx as i64;
-            let packed_val = if residual_idx < residuals_compacted.size()[0]
-                && col_idx < residuals_compacted.size()[1]
-            {
-                // Access the 2D tensor properly: [residual_idx, col_idx]
-                let val_i64 = residuals_compacted.int64_value(&[residual_idx, col_idx]);
-                (val_i64 & 0xFF) as u8
-            } else {
-                0u8
-            };
-
-            // Unpack 2 4-bit values
-            let unpacked_0 = (packed_val & 0xF0) >> 4;
-            let unpacked_1 = packed_val & 0x0F;
-
-            let unpacked_idx_0 = packed_idx * 2;
-            let unpacked_idx_1 = unpacked_idx_0 + 1;
-
-            // Get query values for these dimensions
-            let q0 =
-                query_embeddings.double_value(&[token_idx as i64, unpacked_idx_0 as i64]) as f32;
-            let q1 =
-                query_embeddings.double_value(&[token_idx as i64, unpacked_idx_1 as i64]) as f32;
-
-            // Get bucket weights for each dimension and bucket value
-            let w0 =
-                bucket_weights.double_value(&[unpacked_idx_0 as i64, unpacked_0 as i64]) as f32;
-            let w1 =
-                bucket_weights.double_value(&[unpacked_idx_1 as i64, unpacked_1 as i64]) as f32;
-
-            // Accumulate scores
-            score += q0 * w0;
-            score += q1 * w1;
-        }
-
-        Ok(score)
-    }
-
-    /// Deduplicate passages within each centroid, keeping maximum scores
-    /// Returns (passage_ids, scores, offsets) where offsets allow slicing per centroid
-    fn deduplicate_passages_per_centroid(
-        &self,
-        passage_ids: &Tensor,
-        scores: &Tensor,
-        begins: &Tensor,
-        capacities: &Tensor,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
-        let num_centroids = begins.size()[0] as usize;
-
-        // Collect deduplicated results per centroid
-        let mut all_pids = Vec::new();
-        let mut all_scores = Vec::new();
-        let mut offsets = vec![0i64];
-        let mut deduplicated_sizes = Vec::new();
-
-        let mut global_idx = 0i64;
-
-        for centroid_idx in 0..num_centroids {
-            let capacity = capacities.int64_value(&[centroid_idx as i64]);
-
+        for cell_idx in 0..num_cells {
+            let capacity = capacities.int64_value(&[cell_idx as i64]) as usize;
             if capacity == 0 {
                 offsets.push(*offsets.last().unwrap());
-                deduplicated_sizes.push(0i32);
                 continue;
             }
 
-            // Use HashMap for deduplication within this centroid
-            let mut max_scores: HashMap<i64, f32> = HashMap::new();
+            let begin = begins.int64_value(&[cell_idx as i64]);
+            let centroid_score = centroid_scores_vec[cell_idx];
 
-            for _ in 0..capacity {
-                let pid = passage_ids.int64_value(&[global_idx]);
-                let score = scores.double_value(&[global_idx]) as f32;
+            let token_idx = (cell_idx / nprobe).min(num_tokens - 1);
+            let bucket_scores_offset = token_idx * bucket_score_stride;
+            let token_bucket_scores = &bucket_scores_flat
+                [bucket_scores_offset..bucket_scores_offset + bucket_score_stride];
 
-                max_scores
-                    .entry(pid)
-                    .and_modify(|s| *s = s.max(score))
-                    .or_insert(score);
+            let mut size = 0i32;
+            let mut prev_pid: Option<i64> = None;
 
-                global_idx += 1;
+            for inner_idx in 0..capacity {
+                let residual_idx = begin + inner_idx as i64;
+                let pid = index.codes_compacted.int64_value(&[residual_idx]);
+
+                let residual_tensor = index
+                    .residuals_compacted
+                    .i(residual_idx)
+                    .to_kind(Kind::Uint8)
+                    .contiguous();
+                let residual_bytes: Vec<u8> = residual_tensor.view([-1]).try_into()?;
+
+                anyhow::ensure!(
+                    residual_bytes.len() == residual_bytes_per_embedding,
+                    "Residual byte count ({}) does not match expected ({})",
+                    residual_bytes.len(),
+                    residual_bytes_per_embedding
+                );
+
+                let residual_score = if self.nbits == 2 {
+                    Self::decompress_residual_2bit(
+                        &residual_bytes,
+                        &self.reversed_bit_map,
+                        token_bucket_scores,
+                        bucket_dim_shift,
+                    )
+                } else {
+                    Self::decompress_residual_4bit(
+                        &residual_bytes,
+                        &self.reversed_bit_map,
+                        token_bucket_scores,
+                        bucket_dim_shift,
+                    )
+                };
+
+                let total_score = centroid_score + residual_score;
+
+                match prev_pid {
+                    Some(prev) if prev == pid => {
+                        let last_idx = candidate_scores.len() - 1;
+                        if total_score > candidate_scores[last_idx] {
+                            candidate_scores[last_idx] = total_score;
+                        }
+                    },
+                    _ => {
+                        candidate_pids.push(pid);
+                        candidate_scores.push(total_score);
+                        size += 1;
+                        prev_pid = Some(pid);
+                    },
+                }
             }
 
-            // Sort by passage ID for deterministic output
-            let mut centroid_results: Vec<(i64, f32)> = max_scores.into_iter().collect();
-            centroid_results.sort_by_key(|&(pid, _)| pid);
-
-            // Add to global results
-            let centroid_dedup_size = centroid_results.len() as i32;
-            for (pid, score) in centroid_results {
-                all_pids.push(pid);
-                all_scores.push(score);
+            // Ensure size reflects whether any entry was written
+            if size > 0 || prev_pid.is_some() {
+                candidate_sizes[cell_idx] = size;
             }
 
-            deduplicated_sizes.push(centroid_dedup_size);
-            offsets.push(all_pids.len() as i64);
+            let next_offset = offsets.last().copied().unwrap_or(0) + size as i64;
+            offsets.push(next_offset);
         }
 
-        // Convert to tensors
-        let pids_tensor = Tensor::from_slice(&all_pids)
+        let sizes_tensor = Tensor::from_slice(&candidate_sizes)
+            .to_device(self.device)
+            .to_kind(Kind::Int);
+        let pids_tensor = Tensor::from_slice(&candidate_pids)
             .to_device(self.device)
             .to_kind(Kind::Int64);
-        let scores_tensor = Tensor::from_slice(&all_scores)
+        let scores_tensor = Tensor::from_slice(&candidate_scores)
             .to_device(self.device)
             .to_kind(Kind::Float);
         let offsets_tensor = Tensor::from_slice(&offsets)
             .to_device(self.device)
             .to_kind(Kind::Int64);
-        let sizes_tensor = Tensor::from_slice(&deduplicated_sizes)
-            .to_device(self.device)
-            .to_kind(Kind::Int);
 
-        Ok((pids_tensor, scores_tensor, offsets_tensor, sizes_tensor))
+        Ok(DecompressedCentroidsOutput {
+            capacities,
+            sizes: sizes_tensor,
+            passage_ids: pids_tensor,
+            scores: scores_tensor,
+            offsets: offsets_tensor,
+        })
+    }
+
+    fn decompress_residual_2bit(
+        residual: &[u8],
+        reversed_bit_map: &[u8; 256],
+        bucket_scores: &[f32],
+        bucket_dim_shift: usize,
+    ) -> f32 {
+        let mut score = 0.0f32;
+        for (packed_idx, &packed_val) in residual.iter().enumerate() {
+            let packed_val = reversed_bit_map[packed_val as usize];
+            let unpacked_idx_0 = packed_idx << 2;
+            let unpacked_idx_1 = unpacked_idx_0 + 1;
+            let unpacked_idx_2 = unpacked_idx_0 + 2;
+            let unpacked_idx_3 = unpacked_idx_0 + 3;
+
+            let unpacked_0 = (packed_val >> 6) as usize;
+            let unpacked_1 = ((packed_val >> 4) & 0x03) as usize;
+            let unpacked_2 = ((packed_val >> 2) & 0x03) as usize;
+            let unpacked_3 = (packed_val & 0x03) as usize;
+
+            let idx0 = (unpacked_idx_0 << bucket_dim_shift) | unpacked_0;
+            let idx1 = (unpacked_idx_1 << bucket_dim_shift) | unpacked_1;
+            let idx2 = (unpacked_idx_2 << bucket_dim_shift) | unpacked_2;
+            let idx3 = (unpacked_idx_3 << bucket_dim_shift) | unpacked_3;
+
+            score += bucket_scores[idx0]
+                + bucket_scores[idx1]
+                + bucket_scores[idx2]
+                + bucket_scores[idx3];
+        }
+        score
+    }
+
+    fn decompress_residual_4bit(
+        residual: &[u8],
+        reversed_bit_map: &[u8; 256],
+        bucket_scores: &[f32],
+        bucket_dim_shift: usize,
+    ) -> f32 {
+        let mut score = 0.0f32;
+        for (packed_idx, &packed_val) in residual.iter().enumerate() {
+            let packed_val = reversed_bit_map[packed_val as usize];
+            let unpacked_idx_0 = packed_idx << 1;
+            let unpacked_idx_1 = unpacked_idx_0 + 1;
+
+            let unpacked_0 = (packed_val >> 4) as usize;
+            let unpacked_1 = (packed_val & 0x0F) as usize;
+
+            let idx0 = (unpacked_idx_0 << bucket_dim_shift) | unpacked_0;
+            let idx1 = (unpacked_idx_1 << bucket_dim_shift) | unpacked_1;
+
+            score += bucket_scores[idx0] + bucket_scores[idx1];
+        }
+        score
     }
 }
