@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import glob
+import logging
 import math
 import os
 import random
-from typing import Any
+from typing import Literal
 
 import torch
 import torch.multiprocessing as mp
@@ -13,6 +14,9 @@ from fastkmeans import FastKMeans
 from joblib import Parallel, delayed
 
 # from ..filtering import create, delete, update
+#
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
 
 
 class TorchWithCudaNotFoundError(Exception):
@@ -115,12 +119,13 @@ def compute_kmeans(  # noqa: PLR0913
 
 def search_on_device(  # noqa: PLR0913
     device: str,
+    dtype: Literal["float64", "float32", "float16", "bfloat16"],
     queries_embeddings: torch.Tensor,
     top_k: int,
     nprobe: int,
     index: str,
     torch_path: str,
-    t_prime: int,
+    t_prime: int | None,
     bound: int,
     max_candidates: int,
     centroid_score_threshold: float | None = None,
@@ -137,6 +142,7 @@ def search_on_device(  # noqa: PLR0913
     search_config = xtr_warp_rust.SearchConfig(
         k=top_k,
         device=device,
+        dtype=dtype,
         nprobe=nprobe,
         t_prime=t_prime,
         bound=bound,
@@ -328,11 +334,12 @@ class XTRWarp:
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int,
-        t_prime: int,
-        bound: int,
+        bound: int = 128,  # Could be set dynamically using the index size
+        t_prime: int | None = None,
         nprobe: int | None = None,
         max_candidates: int | None = None,
         centroid_score_threshold: float | None = None,
+        dtype: torch.dtype | None = None,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
 
@@ -343,15 +350,17 @@ class XTRWarp:
         top_k:
             Number of top results to return.
         bound:
-            The number of centroids to consider per query.
+            The number of centroids to consider per query. Defaults to 128.
         nprobe:
             Number of inverted file probes to use.
         t_prime:
-            Value to use for the t_prime policy.
+            Value to use for the t_prime policy. Defaults to None.
         max_candidates:
             Maximum number of candidates to consider before the final sort.
         centroid_score_threshold:
             Threshold for centroid scores.
+        dtype:
+            Data type to use for the search.
 
         """
         if top_k <= 10:
@@ -387,6 +396,15 @@ class XTRWarp:
             )
 
         num_queries = queries_embeddings.shape[0]
+        dtype = dtype or torch.float32
+
+        if dtype != queries_embeddings.dtype:
+            logger.warning(
+                f"Query embeddings and dtype selection mismatch ({dtype} != {queries_embeddings.dtype}). Casting embeddings to avoid errors."
+            )
+            queries_embeddings = queries_embeddings.to(dtype=dtype)
+
+        dtype_str: str = str(dtype).split(".")[1]
 
         if not self.multiple_gpus and len(self.devices) > 1:
             split_size = (num_queries // len(self.devices)) + 1
@@ -398,6 +416,7 @@ class XTRWarp:
             tasks = [
                 delayed(function=search_on_device)(
                     device=device,
+                    dtype=dtype_str,
                     queries_embeddings=dev_queries,
                     top_k=top_k,
                     bound=bound,
@@ -422,6 +441,7 @@ class XTRWarp:
         if not self.multiple_gpus:
             return search_on_device(
                 device=self.devices[0],
+                dtype=dtype_str,
                 queries_embeddings=queries_embeddings,
                 top_k=top_k,
                 bound=bound,
@@ -442,6 +462,7 @@ class XTRWarp:
         args_for_starmap = [
             (
                 device,
+                dtype_str,
                 dev_queries,
                 top_k,
                 bound,

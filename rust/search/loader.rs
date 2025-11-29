@@ -12,11 +12,17 @@ pub struct IndexLoader {
     index_path: PathBuf,
     load_with_mmap: bool,
     device: Device,
+    dtype: Kind,
 }
 
 impl IndexLoader {
     /// Create a new index loader
-    pub fn new(index_path: impl AsRef<Path>, device: Device, load_with_mmap: bool) -> Result<Self> {
+    pub fn new(
+        index_path: impl AsRef<Path>,
+        device: Device,
+        dtype: Kind,
+        load_with_mmap: bool,
+    ) -> Result<Self> {
         let path = index_path.as_ref();
 
         if !path.exists() {
@@ -31,6 +37,7 @@ impl IndexLoader {
             index_path: path.to_path_buf(),
             load_with_mmap,
             device,
+            dtype,
         })
     }
 
@@ -141,7 +148,9 @@ impl IndexLoader {
         let tensor = Tensor::read_npy(&path)
             .map_err(|e| anyhow!("Failed to load tensor {:?}: {}", path, e))?;
 
-        Ok(tensor.to_device(self.device))
+        Ok(tensor
+            .to_device(self.device)
+            .to_dtype(self.dtype, false, false))
     }
 
     /// Compute offsets from sizes for efficient indexing

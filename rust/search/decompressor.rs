@@ -8,6 +8,7 @@ use crate::utils::types::{DecompressedCentroidsOutput, LoadedIndex};
 pub struct CentroidDecompressor {
     nbits: u8,
     device: Device,
+    dtype: Kind,
     use_parallel: bool,
     dim: usize,
     reversed_bit_map: [u8; 256],
@@ -15,7 +16,13 @@ pub struct CentroidDecompressor {
 
 impl CentroidDecompressor {
     /// Create a new centroid decompressor
-    pub fn new(nbits: u8, dim: usize, device: Device, use_parallel: bool) -> Result<Self> {
+    pub fn new(
+        nbits: u8,
+        dim: usize,
+        device: Device,
+        dtype: Kind,
+        use_parallel: bool,
+    ) -> Result<Self> {
         if nbits != 2 && nbits != 4 {
             return Err(anyhow!("nbits must be 2 or 4, got {}", nbits));
         }
@@ -25,6 +32,7 @@ impl CentroidDecompressor {
         Ok(Self {
             nbits,
             device,
+            dtype,
             use_parallel,
             dim,
             reversed_bit_map,
@@ -91,14 +99,14 @@ impl CentroidDecompressor {
                 capacities,
                 sizes: empty.to_kind(Kind::Int),
                 passage_ids: Tensor::zeros(&[0], (Kind::Int64, self.device)),
-                scores: Tensor::zeros(&[0], (Kind::Float, self.device)),
+                scores: Tensor::zeros(&[0], (self.dtype, self.device)),
                 offsets: Tensor::zeros(&[1], (Kind::Int64, self.device)),
             });
         }
 
         anyhow::ensure!(nprobe > 0, "nprobe must be greater than zero");
 
-        let query_embeddings = query_embeddings.to_kind(Kind::Float);
+        let query_embeddings = query_embeddings.to_kind(self.dtype);
         anyhow::ensure!(
             query_embeddings.size()[1] == self.dim as i64,
             "Query embedding dim ({}) does not match index dim ({})",
@@ -112,7 +120,7 @@ impl CentroidDecompressor {
             "Expected at least one query token for decompression"
         );
 
-        let bucket_weights = index.bucket_weights.to_kind(Kind::Float);
+        let bucket_weights = index.bucket_weights.to_kind(self.dtype);
         let vt_bucket_scores =
             (query_embeddings.unsqueeze(2) * &bucket_weights.unsqueeze(0)).contiguous();
 
@@ -227,7 +235,7 @@ impl CentroidDecompressor {
             .to_kind(Kind::Int64);
         let scores_tensor = Tensor::from_slice(&candidate_scores)
             .to_device(self.device)
-            .to_kind(Kind::Float);
+            .to_kind(self.dtype);
         let offsets_tensor = Tensor::from_slice(&offsets)
             .to_device(self.device)
             .to_kind(Kind::Int64);

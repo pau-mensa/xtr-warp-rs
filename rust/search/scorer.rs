@@ -4,7 +4,9 @@ use std::sync::Arc;
 use crate::search::centroid_selector::CentroidSelector;
 use crate::search::decompressor::CentroidDecompressor;
 use crate::search::merger::{MergerConfig, ResultMerger, ScoreCombination};
-use crate::utils::types::{LoadedIndex, Query, SearchConfig, SearchResult};
+use crate::utils::types::{
+    parse_device, parse_dtype, LoadedIndex, Query, SearchConfig, SearchResult,
+};
 
 /// Main scorer struct that handles WARP scoring operations
 /// This integrates the phase 1 components (CentroidSelector, CentroidDecompressor)
@@ -35,13 +37,15 @@ impl WARPScorer {
             index.metadata.num_centroids,
         );
 
-        let device = crate::utils::types::parse_device(&config.device)?;
+        let device = parse_device(&config.device)?;
+        let dtype = parse_dtype(&config.dtype)?;
 
         // Initialize decompressor from phase 1
         let decompressor = CentroidDecompressor::new(
             index.metadata.nbits,
             index.metadata.dim,
             device,
+            dtype,
             config.parallel,
         )?;
 

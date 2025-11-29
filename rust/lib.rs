@@ -7,6 +7,7 @@ use pyo3_tch::PyTensor;
 use std::ffi::CString;
 use std::path::Path;
 use tch::Device;
+use tch::Kind;
 
 // Module declarations
 pub mod index;
@@ -93,6 +94,22 @@ fn get_device(device: &str) -> Result<Device, PyErr> {
         _ => Err(PyValueError::new_err(format!(
             "Unsupported device string: '{}'",
             device
+        ))),
+    }
+}
+
+/// Parses a string identifier into a `tch::Kind`.
+///
+/// Supports simple strings like "float32", "float16"
+fn get_dtype(dtype: &str) -> Result<Kind, PyErr> {
+    match dtype.to_lowercase().as_str() {
+        "float32" => Ok(Kind::Float),
+        "float16" => Ok(Kind::Half),
+        "float64" => Ok(Kind::Double),
+        "bfloat16" => Ok(Kind::BFloat16),
+        _ => Err(PyValueError::new_err(format!(
+            "Unsupported dtype string: '{}', should be 'float32', 'float16', 'float64', or 'bfloat16'",
+            dtype
         ))),
     }
 }
@@ -215,7 +232,8 @@ fn load_and_search(
     }
 
     let device = get_device(&search_config.device)?;
-    let index = IndexLoader::new(index, device, false)
+    let dtype = get_dtype(&search_config.dtype)?;
+    let index = IndexLoader::new(index, device, dtype, false)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index loader: {}", e)))?;
     let loaded_index = index
         .load()
