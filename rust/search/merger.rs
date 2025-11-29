@@ -380,14 +380,14 @@ impl ResultMerger {
     ) -> Result<(Vec<PassageId>, Vec<Score>)> {
         no_grad(|| {
             let num_cells = capacities.size()[0] as usize;
-            //println!("Number of cells: {}", num_cells);
             let num_candidates = candidate_pids.size()[0] as usize;
 
-            // Convert tensors to vectors for creating stride views
-            let sizes_vec: Vec<i32> = candidate_sizes.to_kind(Kind::Int).try_into()?;
-            let pids_vec: Vec<PassageId> = candidate_pids.to_kind(Kind::Int64).try_into()?;
-            let scores_vec: Vec<Score> = candidate_scores.to_kind(Kind::Float).try_into()?;
-            let mse_vec: Vec<f32> = mse_estimates.to_kind(Kind::Float).try_into()?;
+            // convert tensors to vectors for creating stride views
+            // we used to have .to_kind conversions here, bring them back if needed
+            let sizes_vec: Vec<i32> = candidate_sizes.try_into()?;
+            let pids_vec: Vec<PassageId> = candidate_pids.try_into()?;
+            let scores_vec: Vec<Score> = candidate_scores.try_into()?;
+            let mse_vec: Vec<f32> = mse_estimates.try_into()?;
 
             // Create strided views into the data (each view represents one centroid's candidates)
             let mut views = Vec::new();
