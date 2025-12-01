@@ -471,8 +471,12 @@ impl ResultMerger {
             // Extract the top-k PIDs and scores
             let mut result_pids = vec![0i64; budget];
             let mut result_scores = vec![0.0f32; budget];
+            let limit = top_idx.len();
 
             for i in 0..budget {
+                if i >= limit {
+                    break;
+                }
                 let idx = top_idx[i];
                 // let k_idx = &top_idx[..k.min(top_idx.len())];
                 result_pids[i] = views[0].pids[idx];

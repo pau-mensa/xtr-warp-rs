@@ -115,8 +115,6 @@ impl WARPScorer {
                 )?;
 
                 // Merge candidate scores
-                //println!("Scores PRE {:?}", decompressed.scores.i(0));
-                //println!("Scores sizes {:?}", decompressed.scores.size());
                 let (pids, scores) = self.merger.merge_candidate_scores(
                     &decompressed.capacities,
                     &decompressed.sizes,
@@ -126,15 +124,8 @@ impl WARPScorer {
                     self.config.nprobe as usize,
                     k,
                 )?;
-                //println!("Scores POST {:?}", scores[0]);
-                //println!("Scores POST Size {:?}", scores.len());
 
                 // Build result for this query
-                /*results.push(SearchResult {
-                    passage_ids: pids,
-                    scores: scores,
-                    query_id: (b + 1) as usize,
-                });*/
                 results.push(SearchResult {
                     passage_ids: pids[..k.min(pids.len())].to_vec(),
                     scores: scores[..k.min(scores.len())].to_vec(),
