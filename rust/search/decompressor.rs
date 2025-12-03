@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
-use tch::{Device, IndexOp, Kind, Tensor};
+use tch::{Device, Kind, Tensor};
 
 use crate::utils::types::{DecompressedCentroidsOutput, LoadedIndex};
 
@@ -148,14 +148,54 @@ impl CentroidDecompressor {
         let packed_vals_per_byte = 8usize / self.nbits as usize;
         let residual_bytes_per_embedding = self.dim / packed_vals_per_byte;
 
+        // we need to prefetch all data to cpu, to avoid costly gpu -> cpu transfers
+        let capacities_vec: Vec<i64> = capacities.shallow_clone().try_into()?;
+        let begins_vec: Vec<i64> = begins.try_into()?;
+
+        // collect all indices
+        let mut all_indices = Vec::new();
+        let mut cell_ranges = Vec::new();
+
         for cell_idx in 0..num_cells {
-            let capacity = capacities.int64_value(&[cell_idx as i64]) as usize;
+            let capacity = capacities_vec[cell_idx] as usize;
+            if capacity == 0 {
+                cell_ranges.push((0, 0));
+                continue;
+            }
+
+            let begin = begins_vec[cell_idx];
+            let start_idx = all_indices.len();
+            for inner_idx in 0..capacity {
+                all_indices.push(begin + inner_idx as i64);
+            }
+            let end_idx = all_indices.len();
+            cell_ranges.push((start_idx, end_idx));
+        }
+
+        let (all_pids_vec, all_residuals_data) = if !all_indices.is_empty() {
+            let indices_tensor =
+                Tensor::from_slice(&all_indices).to_device(index.codes_compacted.device());
+            let batch_pids = index.codes_compacted.index_select(0, &indices_tensor);
+            let batch_residuals = index.residuals_compacted.index_select(0, &indices_tensor);
+
+            // transfer to cpu
+            let pids_vec: Vec<i64> = batch_pids.try_into()?;
+            let residuals_flat: Vec<u8> = batch_residuals
+                .to_kind(Kind::Uint8)
+                .contiguous()
+                .view([-1])
+                .try_into()?;
+            (pids_vec, residuals_flat)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        for cell_idx in 0..num_cells {
+            let capacity = capacities_vec[cell_idx] as usize;
             if capacity == 0 {
                 offsets.push(*offsets.last().unwrap());
                 continue;
             }
-
-            let begin = begins.int64_value(&[cell_idx as i64]);
             let centroid_score = centroid_scores_vec[cell_idx];
 
             let token_idx = (cell_idx / nprobe).min(num_tokens - 1);
@@ -166,23 +206,16 @@ impl CentroidDecompressor {
             let mut size = 0i32;
             let mut prev_pid: Option<i64> = None;
 
-            for inner_idx in 0..capacity {
-                let residual_idx = begin + inner_idx as i64;
-                let pid = index.codes_compacted.int64_value(&[residual_idx]);
+            let (start_idx, end_idx) = cell_ranges[cell_idx];
 
-                let residual_tensor = index
-                    .residuals_compacted
-                    .i(residual_idx)
-                    .to_kind(Kind::Uint8)
-                    .contiguous();
-                let residual_bytes: Vec<u8> = residual_tensor.view([-1]).try_into()?;
+            for local_idx in 0..(end_idx - start_idx) {
+                let global_idx = start_idx + local_idx;
+                let pid = all_pids_vec[global_idx];
 
-                anyhow::ensure!(
-                    residual_bytes.len() == residual_bytes_per_embedding,
-                    "Residual byte count ({}) does not match expected ({})",
-                    residual_bytes.len(),
-                    residual_bytes_per_embedding
-                );
+                // extract residual bytes for the embedding
+                let residual_start = global_idx * residual_bytes_per_embedding;
+                let residual_end = residual_start + residual_bytes_per_embedding;
+                let residual_bytes = &all_residuals_data[residual_start..residual_end];
 
                 let residual_score = if self.nbits == 2 {
                     Self::decompress_residual_2bit(
