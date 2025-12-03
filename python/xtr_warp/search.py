@@ -233,8 +233,6 @@ class XTRWarp:
         kmeans_niters: int = 4,
         max_points_per_centroid: int = 256,
         nbits: int = 4,
-        nprobe: int = 8,
-        t_prime: int | None = None,
         n_samples_kmeans: int | None = None,
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
@@ -259,8 +257,6 @@ class XTRWarp:
         use_triton_kmeans:
             Whether to use the Triton-based K-means implementation. If None, it will be
             set to True if the device is not "cpu".
-        metadata:
-            Optional list of dictionaries containing metadata for each document.
 
         """
         if isinstance(documents_embeddings, torch.Tensor):
@@ -293,10 +289,8 @@ class XTRWarp:
             torch_path=self.torch_path,
             device=self.devices[0],
             nbits=nbits,
-            nprobe=nprobe,
             embeddings=documents_embeddings,
             centroids=centroids,
-            t_prime=t_prime,
             embedding_dim=dim,
             seed=seed,
         )

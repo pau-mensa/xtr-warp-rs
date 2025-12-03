@@ -26,7 +26,7 @@ pub mod scorer;
 // Re-export main types for convenience
 pub use centroid_selector::CentroidSelector;
 pub use decompressor::CentroidDecompressor;
-pub use loader::{IndexLoader, IndexStats};
+pub use loader::IndexLoader;
 pub use merger::{ResultMerger, ScoreCombination};
 pub use scorer::WARPScorer;
 

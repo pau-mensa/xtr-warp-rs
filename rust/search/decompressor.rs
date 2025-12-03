@@ -9,7 +9,7 @@ pub struct CentroidDecompressor {
     nbits: u8,
     device: Device,
     dtype: Kind,
-    use_parallel: bool,
+    // use_parallel: bool,
     dim: usize,
     reversed_bit_map: [u8; 256],
 }
@@ -21,7 +21,7 @@ impl CentroidDecompressor {
         dim: usize,
         device: Device,
         dtype: Kind,
-        use_parallel: bool,
+        // use_parallel: bool,
     ) -> Result<Self> {
         if nbits != 2 && nbits != 4 {
             return Err(anyhow!("nbits must be 2 or 4, got {}", nbits));
@@ -33,7 +33,7 @@ impl CentroidDecompressor {
             nbits,
             device,
             dtype,
-            use_parallel,
+            // use_parallel,
             dim,
             reversed_bit_map,
         })

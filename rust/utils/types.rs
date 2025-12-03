@@ -33,19 +33,13 @@ pub struct IndexConfig {
     pub device: Device,
 
     /// Whether to load index with memory mapping
-    pub load_with_mmap: bool,
+    // pub load_with_mmap: bool,
 
     /// Number of bits for residual compression (2 or 4)
     pub nbits: i64,
 
-    /// Number of probes for search
-    pub nprobe: u32,
-
     /// Embedding dimension
     pub embedding_dim: u32,
-
-    /// Optional t_prime parameter for search
-    pub t_prime: u32,
 }
 
 impl Default for IndexConfig {
@@ -53,10 +47,8 @@ impl Default for IndexConfig {
         Self {
             index_path: PathBuf::from("./index"),
             device: Device::Cpu,
-            load_with_mmap: false,
-            nbits: 2,
-            nprobe: 32,
-            t_prime: 10000,
+            // load_with_mmap: false,
+            nbits: 4,
             embedding_dim: 128,
         }
     }

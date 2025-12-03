@@ -3,7 +3,7 @@ use ndarray::Array1;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tch::{no_grad, Device, Kind, Tensor};
+use tch::{no_grad, Device, Tensor};
 
 use crate::utils::types::{PassageId, Score};
 
@@ -51,13 +51,10 @@ pub struct MergerConfig {
     pub max_candidates: usize,
 
     /// Whether to use parallel merging
-    pub use_parallel: bool,
+    // pub use_parallel: bool,
 
     /// Number of threads for parallel operations
     pub num_threads: usize,
-
-    /// Strategy for combining scores
-    pub combination_strategy: ScoreCombination,
 
     /// Device to use
     pub device: Device,
@@ -122,20 +119,6 @@ impl AnnotatedStrideView {
 /// Combiner for max-reduction of token-level scores from different clusters
 struct ReduceMaxCombiner;
 
-impl ReduceMaxCombiner {
-    fn combine(&self, lhs: f32, rhs: f32) -> f32 {
-        lhs.max(rhs)
-    }
-
-    fn lhs(&self, lhs: f32) -> f32 {
-        lhs
-    }
-
-    fn rhs(&self, rhs: f32) -> f32 {
-        rhs
-    }
-}
-
 /// Combiner for sum-reduction with MSE correction
 struct ReduceSumMseCombiner {
     lhs_mse: f32,
@@ -145,18 +128,6 @@ struct ReduceSumMseCombiner {
 impl ReduceSumMseCombiner {
     fn new(lhs_mse: f32, rhs_mse: f32) -> Self {
         ReduceSumMseCombiner { lhs_mse, rhs_mse }
-    }
-
-    fn combine(&self, lhs: f32, rhs: f32) -> f32 {
-        lhs + rhs
-    }
-
-    fn lhs(&self, lhs: f32) -> f32 {
-        lhs + self.rhs_mse
-    }
-
-    fn rhs(&self, rhs: f32) -> f32 {
-        self.lhs_mse + rhs
     }
 }
 
@@ -430,7 +401,6 @@ impl ResultMerger {
                 ));
                 offset += size;
             }
-            //println!("Views shape {:?}", views.len());
 
             // Create buffer views for merging
             // We need to create views that can handle the worst-case merge scenario
@@ -483,112 +453,7 @@ impl ResultMerger {
                 result_scores[i] = views[0].scores[idx];
             }
 
-            // Convert back to tensors TODO might not be necessary
-            //let candidate_pids = Tensor::from_slice(&result_pids).to_device(self.config.device);
-            //let candidate_scores = Tensor::from_slice(&result_scores).to_device(self.config.device);
-            //println!("Views size {:?}", views[0].size);
-            //println!("Result PIDs {:?}", views[0].pids);
-            //println!("Result Scores {:?}", views[0].scores);
-
             Ok((result_pids, result_scores))
-        })
-    }
-
-    /// Merges two sorted candidate strides
-    /// Implementation reference: xtr-warp/warp/engine/search/merge_candidate_scores.cpp::merge_candidate_strides
-    pub fn merge_candidate_strides(
-        &self,
-        stride1: &CandidateStride,
-        stride2: &CandidateStride,
-        mse1: Option<Score>,
-        mse2: Option<Score>,
-    ) -> Result<CandidateStride> {
-        // Convert CandidateStride to AnnotatedStrideView
-        let view1 = AnnotatedStrideView::from_data(
-            stride1.pids.to_vec(),
-            stride1.scores.to_vec(),
-            stride1.size,
-        );
-
-        let view2 = AnnotatedStrideView::from_data(
-            stride2.pids.to_vec(),
-            stride2.scores.to_vec(),
-            stride2.size,
-        );
-
-        // Create result view with capacity for worst case (sum of both sizes)
-        let capacity = stride1.size + stride2.size;
-        let mut result_view = AnnotatedStrideView::with_capacity(capacity);
-
-        // Apply MSE if provided and use appropriate combiner
-        match (mse1, mse2) {
-            (Some(mse1_val), Some(mse2_val)) => {
-                let combiner = ReduceSumMseCombiner::new(mse1_val, mse2_val);
-                Self::merge_candidate_strides_with_combiner(
-                    &view1,
-                    &view2,
-                    &mut result_view,
-                    &combiner,
-                );
-            },
-            _ => {
-                // Use the configured combination strategy
-                match &self.config.combination_strategy {
-                    ScoreCombination::Max => {
-                        let combiner = ReduceMaxCombiner;
-                        Self::merge_candidate_strides_with_combiner(
-                            &view1,
-                            &view2,
-                            &mut result_view,
-                            &combiner,
-                        );
-                    },
-                    ScoreCombination::Sum => {
-                        let combiner = SimpleCombiner::new(|lhs, rhs| lhs + rhs);
-                        Self::merge_candidate_strides_with_combiner(
-                            &view1,
-                            &view2,
-                            &mut result_view,
-                            &combiner,
-                        );
-                    },
-                    ScoreCombination::Average => {
-                        let combiner = SimpleCombiner::new(|lhs, rhs| (lhs + rhs) / 2.0);
-                        Self::merge_candidate_strides_with_combiner(
-                            &view1,
-                            &view2,
-                            &mut result_view,
-                            &combiner,
-                        );
-                    },
-                    ScoreCombination::Custom(f) => {
-                        let f_clone = f.clone();
-                        let combiner = SimpleCombiner::new(move |lhs, rhs| f_clone(&[lhs, rhs]));
-                        Self::merge_candidate_strides_with_combiner(
-                            &view1,
-                            &view2,
-                            &mut result_view,
-                            &combiner,
-                        );
-                    },
-                }
-            },
-        }
-
-        // Convert result back to CandidateStride
-        let result_pids = Array1::from_vec(
-            result_view.pids[..result_view.size]
-                .iter()
-                .map(|&p| p as PassageId)
-                .collect(),
-        );
-        let result_scores = Array1::from_vec(result_view.scores[..result_view.size].to_vec());
-
-        Ok(CandidateStride {
-            pids: result_pids,
-            scores: result_scores,
-            size: result_view.size,
-            capacity,
         })
     }
 }
@@ -625,36 +490,5 @@ impl Combiner for ReduceSumMseCombiner {
 
     fn rhs(&self, rhs: f32) -> f32 {
         self.lhs_mse + rhs
-    }
-}
-
-/// Simple combiner that just passes through single values
-struct SimpleCombiner<F> {
-    combine_fn: F,
-}
-
-impl<F> SimpleCombiner<F>
-where
-    F: Fn(f32, f32) -> f32,
-{
-    fn new(combine_fn: F) -> Self {
-        SimpleCombiner { combine_fn }
-    }
-}
-
-impl<F> Combiner for SimpleCombiner<F>
-where
-    F: Fn(f32, f32) -> f32,
-{
-    fn combine(&self, lhs: f32, rhs: f32) -> f32 {
-        (self.combine_fn)(lhs, rhs)
-    }
-
-    fn lhs(&self, lhs: f32) -> f32 {
-        lhs
-    }
-
-    fn rhs(&self, rhs: f32) -> f32 {
-        rhs
     }
 }

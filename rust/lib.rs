@@ -19,15 +19,6 @@ use crate::index::create::create_index;
 use search::{IndexLoader, Searcher};
 use utils::types::{IndexConfig, Query, SearchConfig, SearchResult};
 
-/// Convert Rust Result to Python Result
-fn result_to_pyresult<T>(result: Result<T>) -> PyResult<T> {
-    result.map_err(|e| PyValueError::new_err(e.to_string()))
-}
-
-fn anyhow_to_pyerr(err: anyhow::Error) -> PyErr {
-    PyValueError::new_err(err.to_string())
-}
-
 /// Dynamically loads the native Torch shared library (e.g., `libtorch.so` or `torch.dll`).
 ///
 /// This is a workaround to ensure Torch's symbols are available in memory,
@@ -139,12 +130,12 @@ fn initialize_torch(_py: Python<'_>, torch_path: String) -> PyResult<()> {
 ///     index (str): The directory path where the new index will be saved.
 ///     torch_path (str): Path to the Torch shared library (e.g., `libtorch.so`).
 ///     device (str): The compute device to use for index creation (e.g., "cpu", "cuda:0").
-///     embedding_dim (int): The dimensionality of the embeddings.
 ///     nbits (int): The number of bits to use for residual quantization.
 ///     embeddings (list[torch.Tensor]): A list of 2D tensors, where each tensor
 ///         is a batch of document embeddings.
 ///     centroids (torch.Tensor): A 2D tensor of shape `[num_centroids, embedding_dim]`
 ///         used for vector quantization.
+///     embedding_dim (int): The dimensionality of the embeddings.
 ///     seed (int, optional): Optional seed for the random number generator.
 #[pyfunction]
 fn create(
@@ -153,10 +144,8 @@ fn create(
     torch_path: String,
     device: String,
     nbits: i64,
-    nprobe: u32,
     embeddings: Vec<PyTensor>,
     centroids: PyTensor,
-    t_prime: Option<u32>,
     embedding_dim: Option<u32>,
     seed: Option<u64>,
 ) -> PyResult<()> {
@@ -175,10 +164,8 @@ fn create(
         &IndexConfig {
             index_path: Path::new(&index).to_path_buf(),
             device,
-            load_with_mmap: false,
+            // load_with_mmap: false,
             nbits,
-            nprobe,
-            t_prime: t_prime.unwrap_or(10000),
             embedding_dim: embedding_dim.unwrap_or(128),
         },
         embeddings,
@@ -233,7 +220,7 @@ fn load_and_search(
 
     let device = get_device(&search_config.device)?;
     let dtype = get_dtype(&search_config.dtype)?;
-    let index = IndexLoader::new(index, device, dtype, false)
+    let index = IndexLoader::new(index, device, dtype)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index loader: {}", e)))?;
     let loaded_index = index
         .load()

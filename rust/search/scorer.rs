@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::search::centroid_selector::CentroidSelector;
 use crate::search::decompressor::CentroidDecompressor;
-use crate::search::merger::{MergerConfig, ResultMerger, ScoreCombination};
+use crate::search::merger::{MergerConfig, ResultMerger};
 use crate::utils::types::{
     parse_device, parse_dtype, LoadedIndex, Query, SearchConfig, SearchResult,
 };
@@ -46,16 +46,15 @@ impl WARPScorer {
             index.metadata.dim,
             device,
             dtype,
-            config.parallel,
+            // config.parallel,
         )?;
 
         // Initialize merger
         let max_candidates = config.max_candidates.unwrap_or(256);
         let merger_config = MergerConfig {
             max_candidates: max_candidates,
-            use_parallel: config.parallel,
+            // use_parallel: config.parallel,
             num_threads: config.num_threads.unwrap_or(1),
-            combination_strategy: ScoreCombination::Sum,
             device: device,
         };
         let merger = ResultMerger::new(merger_config);

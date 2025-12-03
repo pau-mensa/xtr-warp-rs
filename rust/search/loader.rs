@@ -10,7 +10,7 @@ use crate::utils::types::{CentroidId, IndexMetadata, LoadedIndex};
 /// Index loader responsible for loading WARP index components from disk
 pub struct IndexLoader {
     index_path: PathBuf,
-    load_with_mmap: bool,
+    // load_with_mmap: bool,
     device: Device,
     dtype: Kind,
 }
@@ -21,7 +21,7 @@ impl IndexLoader {
         index_path: impl AsRef<Path>,
         device: Device,
         dtype: Kind,
-        load_with_mmap: bool,
+        //load_with_mmap: bool,
     ) -> Result<Self> {
         let path = index_path.as_ref();
 
@@ -35,7 +35,7 @@ impl IndexLoader {
 
         Ok(Self {
             index_path: path.to_path_buf(),
-            load_with_mmap,
+            // load_with_mmap,
             device,
             dtype,
         })
@@ -121,26 +121,6 @@ impl IndexLoader {
         })
     }
 
-    /// Memory-map a large tensor file for efficient loading
-    ///
-    /// XTR-WARP: ResidualEmbeddings.load_chunks supports mmap (residual_embeddings.py:25-37)
-    /// Fast-PLAID: Does not explicitly use mmap for tensors, but could benefit from it
-    fn mmap_tensor_file(&self, path: PathBuf) -> Result<Tensor> {
-        use memmap2::Mmap;
-        use std::fs::File;
-
-        if self.load_with_mmap {
-            let file =
-                File::open(&path).map_err(|e| anyhow!("Failed to open file for mmap: {}", e))?;
-            let _mmap =
-                unsafe { Mmap::map(&file) }.map_err(|e| anyhow!("Failed to mmap file: {}", e))?;
-
-            // TODO: Support mmap-backed tensors. For now fall back to regular loading.
-        }
-
-        self.load_torch_tensor(path)
-    }
-
     /// Load a PyTorch tensor file
     ///
     /// Uses native PyTorch format for efficiency
@@ -154,8 +134,6 @@ impl IndexLoader {
     }
 
     /// Compute offsets from sizes for efficient indexing
-    ///
-    /// XTR-WARP: IndexLoaderWARP._load_codec lines 66-68
     /// Creates offsets for indexing into compacted arrays
     fn compute_offsets(&self, sizes: &Tensor) -> Result<Tensor> {
         use tch::{Kind, Tensor};
@@ -174,8 +152,6 @@ impl IndexLoader {
     }
 
     /// Find the centroid with minimum size (dummy centroid)
-    ///
-    /// XTR-WARP: IndexLoaderWARP._load_codec line 70
     /// Used to assign masked/invalid query tokens to a minimal centroid
     fn find_kdummy_centroid(&self, sizes: &Tensor) -> Result<CentroidId> {
         // Find the index of the minimum value
@@ -221,16 +197,4 @@ impl IndexLoader {
                 .unwrap_or_else(|| fallback.index_version.clone()),
         })
     }
-}
-
-/// Statistics about the loaded index
-#[derive(Debug)]
-pub struct IndexStats {
-    pub num_centroids: usize,
-    pub num_embeddings: usize,
-    pub num_passages: usize,
-    pub avg_embeddings_per_centroid: f32,
-    pub median_embeddings_per_centroid: f32,
-    pub memory_usage_bytes: usize,
-    pub compression_ratio: f32,
 }
