@@ -222,17 +222,6 @@ fn train_residual_codec(
     let cutoff_quantiles = quantiles_base.narrow(0, 1, n_options as i64 - 1);
     let weight_quantiles = &quantiles_base + (0.5 / n_options as f64);
 
-    // Compute quantiles - returns shape [num_quantiles, 1, dim] with keepdim=true
-    /*let b_cutoffs = heldout_res_raw
-        .quantile(&cutoff_quantiles, Some(0), true, "linear")
-        .squeeze_dim(1) // Remove the middle dimension -> [num_quantiles, dim]
-        .transpose(0, 1); // Transpose to [dim, num_quantiles]
-
-    let b_weights = heldout_res_raw
-        .quantile(&weight_quantiles, Some(0), true, "linear")
-        .squeeze_dim(1) // Remove the middle dimension -> [num_quantiles, dim]
-        .transpose(0, 1); // Transpose to [dim, num_quantiles]
-    */
     let heldout_res_flat = heldout_res_raw.flatten(0, -1); // Flatten all residuals
     let b_cutoffs = heldout_res_flat.quantile(&cutoff_quantiles, None, false, "linear"); // Results in [num_quantiles]
 
@@ -284,8 +273,12 @@ pub fn packbits(res: &Tensor) -> Tensor {
     let bits_mat = res.reshape(&[-1, 8]);
     let weights = Tensor::from_slice(&BIT_WEIGHTS)
         .to_device(res.device())
-        .to_kind(bits_mat.kind());
-    let packed = bits_mat.matmul(&weights).to_kind(Kind::Uint8);
+        .to_kind(Kind::Float);
+    let packed = bits_mat
+        .to_kind(Kind::Float)
+        //.to_device(res.device())
+        .matmul(&weights)
+        .to_kind(Kind::Uint8);
     packed
 }
 

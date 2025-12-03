@@ -206,7 +206,8 @@ fn load_and_search(
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
-    let query_tensor = queries_embeddings.to_device(Device::Cpu);
+    let device = get_device(&search_config.device)?;
+    let query_tensor = queries_embeddings.to_device(device);
 
     // Always expect 3D tensor [batch, num_tokens, dim]
     let shape = query_tensor.size();
@@ -218,7 +219,6 @@ fn load_and_search(
         )));
     }
 
-    let device = get_device(&search_config.device)?;
     let dtype = get_dtype(&search_config.dtype)?;
     let index = IndexLoader::new(index, device, dtype)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index loader: {}", e)))?;

@@ -9,9 +9,10 @@ from typing import Literal
 
 import torch
 import torch.multiprocessing as mp
-import xtr_warp_rust
 from fastkmeans import FastKMeans
 from joblib import Parallel, delayed
+
+from . import xtr_warp_rust
 
 # from ..filtering import create, delete, update
 #
@@ -361,14 +362,14 @@ class XTRWarp:
             if nprobe is None:
                 nprobe = 1
             if max_candidates is None:
-                max_candidates = 256
+                max_candidates = 1024
             if centroid_score_threshold is None:
                 centroid_score_threshold = 0.5
         elif top_k <= 100:
             if nprobe is None:
                 nprobe = 2
             if max_candidates is None:
-                max_candidates = 1024
+                max_candidates = 2048
             if centroid_score_threshold is None:
                 centroid_score_threshold = 0.45
         else:

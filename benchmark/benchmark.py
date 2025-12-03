@@ -1,9 +1,8 @@
 # /// script
 # dependencies = [
-#    "numpy>=2.0.0",
-#    "torch>=2.8.0",
 #    "pylate>=1.3.3",
 #    "beir>=2.2.0",
+#    "fast_plaid",
 #    "ranx",
 #    "psutil"
 # ]
@@ -13,8 +12,18 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import threading
 import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PY_PKG = REPO_ROOT / "python"
+
+for entry in (REPO_ROOT, PY_PKG):
+    entry_str = str(entry)
+    if entry_str not in sys.path:
+        sys.path.insert(0, entry_str)
 
 import numpy as np
 import psutil
@@ -26,7 +35,7 @@ from xtr_warp.evaluation import evaluate, load_beir
 # from xtr_warp_rust import evaluation, search
 from xtr_warp.search import XTRWarp
 
-DEVICE = "mps"
+DEVICE = "cuda"
 TEST_BOUND = 128
 # Use a modest t_prime that the reduced test index can satisfy; the default
 # heuristic (>=1000) assumes production-scale indexes and undervalues missing
@@ -221,7 +230,7 @@ print("-" * 150)
 num_queries = len(queries)
 print(f"📊 Processing {len(documents)} documents and {num_queries} queries")
 
-if False:
+if True:
     print(f"🧠 Encoding documents for {dataset_name}...")
     documents_embeddings = model.encode(
         [document["text"] for document in documents],
@@ -238,14 +247,14 @@ if False:
     documents_embeddings = [torch.tensor(doc_emb) for doc_emb in documents_embeddings]
     queries_embeddings = torch.cat(tensors=[queries_embeddings], dim=0)
 
-    torch.save(documents_embeddings, "documents_embeddings.pt")
-    torch.save(queries_embeddings, "queries_embeddings.pt")
+    torch.save(documents_embeddings, f"documents_embeddings_{dataset_name}.pt")
+    torch.save(queries_embeddings, f"queries_embeddings_{dataset_name}.pt")
 else:
-    documents_embeddings = torch.load("documents_embeddings.pt")
-    queries_embeddings = torch.load("queries_embeddings.pt")
+    documents_embeddings = torch.load(f"documents_embeddings_{dataset_name}.pt")
+    queries_embeddings = torch.load(f"queries_embeddings_{dataset_name}.pt")
 
 # FastPlaid
-if False:
+if True:
     print(f"\n=== 🚀 FastPlaid Evaluation ===")
 
     # Get baseline memory before creating index
@@ -253,7 +262,7 @@ if False:
     print(f"🧠 Memory before FastPlaid index: {pre_index_memory:.2f} MB")
 
     index = search.FastPlaid(
-        index=os.path.join("benchmark", dataset_name), device="cpu"
+        index=os.path.join("benchmark", dataset_name), device=DEVICE
     )
     print(f"🏗️  Building index for {dataset_name}...")
     start_index = time.time()
@@ -271,7 +280,12 @@ if False:
     memory_monitor = PeakMemoryMonitor(pre_operation_baseline=pre_index_memory)
     memory_monitor.start_monitoring()
     start_search = time.time()
-    scores = index.search(queries_embeddings=queries_embeddings, top_k=20)
+    scores = index.search(
+        queries_embeddings=queries_embeddings,
+        top_k=10,
+        n_ivf_probe=8,
+        n_full_scores=4096,
+    )
     end_search = time.time()
     search_time = end_search - start_search
     peak_memory, total_increase = memory_monitor.stop_monitoring()
@@ -285,7 +299,12 @@ if False:
 
     print(f"🔍 50_000 queries on {dataset_name}...")
     start_search = time.time()
-    _ = index.search(queries_embeddings=large_queries_embeddings)
+    _ = index.search(
+        queries_embeddings=large_queries_embeddings,
+        top_k=10,
+        n_ivf_probe=8,
+        n_full_scores=4096,
+    )
     end_search = time.time()
     heavy_search_time = end_search - start_search
     queries_per_second = large_queries_embeddings.shape[0] / heavy_search_time
@@ -369,11 +388,14 @@ print(f"🔍 Searching on {dataset_name}...")
 # Monitor peak memory during search
 memory_monitor = PeakMemoryMonitor(pre_operation_baseline=pre_index_memory)
 memory_monitor.start_monitoring()
+# queries_embeddings = queries_embeddings.to(torch.float16)
 start_search = time.time()
 scores = index.search(
     queries_embeddings=queries_embeddings,
-    top_k=100,
-    # nprobe=1,  # The higher this is the lower the score. It is possible we have an error in the decompression or the merging of the scores
+    top_k=10,
+    nprobe=8,
+    centroid_score_threshold=0.5,
+    max_candidates=4096,
     # t_prime=TEST_T_PRIME,
     # bound=128,
     # dtype=torch.float16,
@@ -387,16 +409,19 @@ print(
 
 large_queries_embeddings = torch.cat(
     ([queries_embeddings] * ((1000 // queries_embeddings.shape[0]) + 1))[:1000]
-)
+)  # .to(torch.float16)
 
 print(f"🔍 50_000 queries on {dataset_name} - {large_queries_embeddings.shape}...")
 start_search = time.time()
 _ = index.search(
     queries_embeddings=large_queries_embeddings,
-    top_k=20,
-    # nprobe=1,
+    top_k=10,
+    nprobe=8,
+    centroid_score_threshold=0.5,
+    max_candidates=4096,
     # t_prime=TEST_T_PRIME,
     # bound=TEST_BOUND,
+    # dtype=torch.float16,
 )
 end_search = time.time()
 heavy_search_time = end_search - start_search
@@ -469,6 +494,7 @@ if False:
         index_name=f"{dataset_name}_pylate",
         embedding_size=96,
         nbits=4,
+        device=DEVICE,
     )
 
     retriever = retrieve.ColBERT(index=index)
