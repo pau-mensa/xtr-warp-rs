@@ -5,9 +5,10 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3_tch::PyTensor;
 use std::ffi::CString;
+use std::ops::Deref;
 use std::path::Path;
-use tch::Device;
-use tch::Kind;
+use std::sync::Arc;
+use tch::{Device, Kind};
 
 // Module declarations
 pub mod index;
@@ -17,7 +18,7 @@ pub mod utils;
 // Re-exports for convenience
 use crate::index::create::create_index;
 use search::{IndexLoader, Searcher};
-use utils::types::{IndexConfig, Query, SearchConfig, SearchResult};
+use utils::types::{IndexConfig, LoadedIndex, Query, SearchConfig, SearchResult};
 
 /// Dynamically loads the native Torch shared library (e.g., `libtorch.so` or `torch.dll`).
 ///
@@ -102,6 +103,82 @@ fn get_dtype(dtype: &str) -> Result<Kind, PyErr> {
             "Unsupported dtype string: '{}', should be 'float32', 'float16', 'float64', or 'bfloat16'",
             dtype
         ))),
+    }
+}
+
+/// Represents a loaded index
+#[pyclass(unsendable)]
+struct LoadedSearcher {
+    loaded_index: Option<Arc<LoadedIndex>>,
+    index_path: String,
+    device: Device,
+    dtype: Kind,
+}
+
+#[pymethods]
+impl LoadedSearcher {
+    #[new]
+    fn new(index_path: String, device: String, dtype: String) -> PyResult<Self> {
+        let device = get_device(&device)?;
+        let dtype = get_dtype(&dtype)?;
+
+        Ok(Self {
+            loaded_index: None,
+            index_path,
+            device,
+            dtype,
+        })
+    }
+
+    /// Load the index in memory
+    fn load(&mut self) -> PyResult<()> {
+        let index_loader = IndexLoader::new(&self.index_path, self.device, self.dtype)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create loader: {}", e)))?;
+        let loaded_index = Arc::new(
+            index_loader
+                .load()
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to load index: {}", e)))?,
+        );
+        self.loaded_index = Some(loaded_index);
+        Ok(())
+    }
+
+    /// Main search entrypoint
+    fn search(
+        &self,
+        torch_path: String,
+        queries_embeddings: PyTensor,
+        search_config: SearchConfig,
+    ) -> PyResult<Vec<SearchResult>> {
+        call_torch(torch_path)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
+
+        // Always expect 3D tensor
+        let shape = queries_embeddings.size();
+        if shape.len() != 3 {
+            return Err(PyRuntimeError::new_err(format!(
+                "Expected 3D tensor, got {}D tensor with shape {:?}",
+                shape.len(),
+                shape
+            )));
+        }
+
+        let searcher = Searcher::new(self.loaded_index.as_ref().unwrap(), &search_config)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create searcher: {}", e)))?;
+
+        // process batch
+        let results = searcher
+            .search(Query {
+                embeddings: queries_embeddings.deref().shallow_clone(),
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("Search failed: {}", e)))?;
+
+        Ok(results)
+    }
+
+    /// Free the loaded index
+    fn free(&mut self) {
+        self.loaded_index = None;
     }
 }
 
@@ -195,7 +272,7 @@ fn create(
 /// Returns:
 ///     list[QueryResult]: A list of result objects, each containing the
 ///     `doc_id` and `score` for a retrieved document.
-#[pyfunction]
+/*#[pyfunction]
 fn load_and_search(
     _py: Python<'_>,
     index: String,
@@ -236,7 +313,7 @@ fn load_and_search(
         .map_err(|e| PyRuntimeError::new_err(format!("Search failed: {}", e)))?;
 
     Ok(results)
-}
+}*/
 
 /// A high-performance document retrieval toolkit using a ColBERT-style late
 /// interaction model, implemented in Rust with Python bindings.
@@ -249,9 +326,10 @@ fn load_and_search(
 fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SearchConfig>()?;
     m.add_class::<SearchResult>()?;
+    m.add_class::<LoadedSearcher>()?;
 
     m.add_function(wrap_pyfunction!(initialize_torch, m)?)?;
     m.add_function(wrap_pyfunction!(create, m)?)?;
-    m.add_function(wrap_pyfunction!(load_and_search, m)?)?;
+    //m.add_function(wrap_pyfunction!(load_and_search, m)?)?;
     Ok(())
 }

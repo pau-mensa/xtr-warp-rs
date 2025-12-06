@@ -230,16 +230,20 @@ print("-" * 150)
 num_queries = len(queries)
 print(f"📊 Processing {len(documents)} documents and {num_queries} queries")
 
-if True:
+if False:
     print(f"🧠 Encoding documents for {dataset_name}...")
     documents_embeddings = model.encode(
         [document["text"] for document in documents],
+        batch_size=256,
+        show_progress_bar=True,
         is_query=False,
     )
 
     print(f"🧠 Encoding queries for {dataset_name}...")
     queries_embeddings = model.encode(
         list(queries.values()),
+        batch_size=256,
+        show_progress_bar=True,
         is_query=True,
     )
 
@@ -254,7 +258,7 @@ else:
     queries_embeddings = torch.load(f"queries_embeddings_{dataset_name}.pt")
 
 # FastPlaid
-if True:
+if False:
     print(f"\n=== 🚀 FastPlaid Evaluation ===")
 
     # Get baseline memory before creating index
@@ -282,8 +286,8 @@ if True:
     start_search = time.time()
     scores = index.search(
         queries_embeddings=queries_embeddings,
-        top_k=10,
-        n_ivf_probe=8,
+        top_k=500,
+        n_ivf_probe=32,
         n_full_scores=4096,
     )
     end_search = time.time()
@@ -301,8 +305,8 @@ if True:
     start_search = time.time()
     _ = index.search(
         queries_embeddings=large_queries_embeddings,
-        top_k=10,
-        n_ivf_probe=8,
+        top_k=500,
+        n_ivf_probe=32,
         n_full_scores=4096,
     )
     end_search = time.time()
@@ -365,7 +369,7 @@ print(f"\n=== 🚀 XTR-Warp Evaluation ===")
 pre_index_memory = get_memory_baseline()
 print(f"🧠 Memory before XTR-Warp index: {pre_index_memory:.2f} MB")
 
-index = XTRWarp(index=os.path.join(".indexes", dataset_name), device=DEVICE)
+index = XTRWarp(index=os.path.join(".indexes", dataset_name))
 print(f"🏗️  Building index for {dataset_name}...")
 print(f"Document shape: {documents_embeddings[0].shape}")
 start_index = time.time()
@@ -375,6 +379,7 @@ index.create(
     max_points_per_centroid=256,
     nbits=4,
     seed=42,
+    device="cuda",
 )
 end_index = time.time()
 indexing_time = end_index - start_index
@@ -388,14 +393,16 @@ print(f"🔍 Searching on {dataset_name}...")
 # Monitor peak memory during search
 memory_monitor = PeakMemoryMonitor(pre_operation_baseline=pre_index_memory)
 memory_monitor.start_monitoring()
-# queries_embeddings = queries_embeddings.to(torch.float16)
+index.load("cpu")
+# queries_embeddings = queries_embeddings.to("cuda")
 start_search = time.time()
 scores = index.search(
     queries_embeddings=queries_embeddings,
-    top_k=10,
-    nprobe=8,
+    top_k=500,
+    nprobe=32,
     centroid_score_threshold=0.5,
     max_candidates=4096,
+    num_threads=64,
     # t_prime=TEST_T_PRIME,
     # bound=128,
     # dtype=torch.float16,
@@ -415,10 +422,11 @@ print(f"🔍 50_000 queries on {dataset_name} - {large_queries_embeddings.shape}
 start_search = time.time()
 _ = index.search(
     queries_embeddings=large_queries_embeddings,
-    top_k=10,
-    nprobe=8,
+    top_k=500,
+    nprobe=32,
     centroid_score_threshold=0.5,
     max_candidates=4096,
+    num_threads=64,
     # t_prime=TEST_T_PRIME,
     # bound=TEST_BOUND,
     # dtype=torch.float16,

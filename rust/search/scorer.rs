@@ -29,7 +29,7 @@ pub struct WARPScorer {
 }
 
 impl WARPScorer {
-    pub fn new(index: Arc<LoadedIndex>, config: SearchConfig) -> Result<Self> {
+    pub fn new(index: &Arc<LoadedIndex>, config: SearchConfig) -> Result<Self> {
         // Initialize centroid selector from phase 1
         let centroid_selector = CentroidSelector::new(
             &config,
@@ -46,21 +46,20 @@ impl WARPScorer {
             index.metadata.dim,
             device,
             dtype,
-            // config.parallel,
+            config.num_threads.unwrap_or(1usize),
         )?;
 
         // Initialize merger
         let max_candidates = config.max_candidates.unwrap_or(256);
         let merger_config = MergerConfig {
             max_candidates: max_candidates,
-            // use_parallel: config.parallel,
             num_threads: config.num_threads.unwrap_or(1),
             device: device,
         };
         let merger = ResultMerger::new(merger_config);
 
         Ok(Self {
-            index,
+            index: Arc::clone(index),
             centroid_selector,
             decompressor,
             merger,

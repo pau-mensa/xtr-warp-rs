@@ -118,44 +118,14 @@ def compute_kmeans(  # noqa: PLR0913
     )
 
 
-def search_on_device(  # noqa: PLR0913
-    device: str,
-    dtype: Literal["float64", "float32", "float16", "bfloat16"],
+def search_on_device(
+    search_config,
     queries_embeddings: torch.Tensor,
-    top_k: int,
-    nprobe: int,
-    index: str,
+    loaded_index,
     torch_path: str,
-    t_prime: int | None,
-    bound: int,
-    max_candidates: int,
-    centroid_score_threshold: float | None = None,
 ) -> list[list[tuple[int, float]]]:
-    """Perform a search on a single specified device."""
-    # Ensure queries_embeddings is 3D [batch, num_tokens, dim]
-    if queries_embeddings.dim() == 2:
-        queries_embeddings = queries_embeddings.unsqueeze(0)  # [1, tokens, dim]
-    elif queries_embeddings.dim() != 3:
-        raise ValueError(
-            f"Expected 2D or 3D tensor, got {queries_embeddings.dim()}D tensor"
-        )
-
-    search_config = xtr_warp_rust.SearchConfig(
-        k=top_k,
-        device=device,
-        dtype=dtype,
-        nprobe=nprobe,
-        t_prime=t_prime,
-        bound=bound,
-        parallel=False,
-        num_threads=1,
-        centroid_score_threshold=centroid_score_threshold,
-        max_codes_per_centroid=None,
-        max_candidates=max_candidates,
-    )
-
-    scores = xtr_warp_rust.load_and_search(
-        index=index,
+    """Perform a search on a loaded index."""
+    scores = loaded_index.search(
         torch_path=torch_path,
         queries_embeddings=queries_embeddings,
         search_config=search_config,
@@ -177,60 +147,42 @@ class XTRWarp:
     ----
     index:
         Path to the directory where the index is stored or will be stored.
-    device:
-        The device(s) to use for computation (e.g., "cuda", ["cuda:0", "cuda:1"]).
-        If None, defaults to ["cuda"].
-
     """
 
     def __init__(
         self,
         index: str,
-        device: str | list[str] | None = None,
     ) -> None:
-        self.multiple_gpus = False
-        if (
-            isinstance(device, list)
-            and len(device) > 1
-            and torch.cuda.device_count() > 1
-        ):
-            self.multiple_gpus = True
-            if mp.get_start_method(allow_none=True) != "spawn":
-                mp.set_start_method(method="spawn", force=True)
+        self._loaded_searchers: list | None = None
+        self.index: str = index
+        self.devices: list | None = None
+        self.dtype: str | None = None
+        self._torch_initialized = {}
 
-        if device is None and torch.cuda.is_available():
-            self.devices = ["cuda"]
-        elif not torch.cuda.is_available():
-            cpu_count = os.cpu_count()
-            if cpu_count is None:
-                error = """
-                No CPU cores available. Please check your system configuration.
-                >>> import os; print(os.cpu_count())
-                Returns None.
-                """
-                raise RuntimeError(error)
-            self.devices = ["cpu"] * cpu_count
-        elif isinstance(device, str):
-            self.devices = [device]
-        elif isinstance(device, list):
-            self.devices = device
-        else:
-            error = "Device must be a string, a list of strings, or None."
-            raise ValueError(error)
+    def _ensure_torch_initialized(self, device: str) -> str:
+        """Initialize torch once per device type."""
+        device_type = device.split(":")[0]  # 'cuda:0' -> 'cuda'
+        if device_type not in self._torch_initialized:
+            torch_path = _load_torch_path(device=device_type)
+            xtr_warp_rust.initialize_torch(torch_path)
+            self._torch_initialized[device_type] = torch_path
+        return self._torch_initialized[device_type]
 
-        self.torch_path = _load_torch_path(device=self.devices[0])
-        self.index = index
+    def free(self) -> None:
+        """Free the loaded index from memory."""
+        if self._loaded_searchers is not None:
+            for searcher in self._loaded_searchers:
+                searcher.free()
+            self._loaded_searchers = None
 
-        if self.multiple_gpus:
-            return
-
-        xtr_warp_rust.initialize_torch(
-            torch_path=self.torch_path,
-        )
+    def __del__(self):
+        """Destructor."""
+        self.free()
 
     def create(  # noqa: PLR0913
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
+        device: str,
         kmeans_niters: int = 4,
         max_points_per_centroid: int = 256,
         nbits: int = 4,
@@ -244,6 +196,8 @@ class XTRWarp:
         ----
         documents_embeddings:
             A list of document embedding tensors to be indexed.
+        device:
+            The device to use for the indexing
         kmeans_niters:
             Number of iterations for the K-means algorithm.
         max_points_per_centroid:
@@ -260,6 +214,7 @@ class XTRWarp:
             set to True if the device is not "cpu".
 
         """
+        torch_path = self._ensure_torch_initialized(device)
         if isinstance(documents_embeddings, torch.Tensor):
             documents_embeddings = [
                 documents_embeddings[i] for i in range(documents_embeddings.shape[0])
@@ -278,7 +233,7 @@ class XTRWarp:
             documents_embeddings=documents_embeddings,
             dim=dim,
             kmeans_niters=kmeans_niters,
-            device=self.devices[0],
+            device=device,
             max_points_per_centroid=max_points_per_centroid,
             n_samples_kmeans=n_samples_kmeans,
             seed=seed,
@@ -287,8 +242,8 @@ class XTRWarp:
 
         xtr_warp_rust.create(
             index=self.index,
-            torch_path=self.torch_path,
-            device=self.devices[0],
+            torch_path=torch_path,
+            device=device,
             nbits=nbits,
             embeddings=documents_embeddings,
             centroids=centroids,
@@ -325,16 +280,49 @@ class XTRWarp:
             except OSError as e:
                 raise e
 
-    def search(  # noqa: PLR0913, C901
+    def load(
+        self, device: str | list[str] = "cpu", dtype: torch.dtype = torch.float32
+    ) -> "XTRWarp":
+        """Load an index to a specific device with the specified precision.
+
+        Args:
+        ----
+        device:
+            'cpu', 'cuda', 'mps', or a list of cuda devices (eg. ['cuda:0', 'cuda:1']
+        dtype:
+            valid torch dtype
+
+        """
+        if self._loaded_searchers is not None:
+            logger.warning(
+                "Index is already loaded, use free() before calling load() again."
+            )
+            return self
+
+        devices = [device] if isinstance(device, str) else device
+        self.devices = devices
+        dtype_str = str(dtype).split(".")[1]
+        self.dtype = dtype_str
+
+        _ = self._ensure_torch_initialized(devices[0])
+
+        self._loaded_searchers = []
+        for d in devices:
+            searcher = xtr_warp_rust.LoadedSearcher(self.index, d, dtype_str)
+            searcher.load()
+            self._loaded_searchers.append(searcher)
+        return self
+
+    def search(
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int,
-        bound: int = 128,  # Could be set dynamically using the index size
+        num_threads: int = 1,
+        bound: int = 128,
         t_prime: int | None = None,
         nprobe: int | None = None,
         max_candidates: int | None = None,
         centroid_score_threshold: float | None = None,
-        dtype: torch.dtype | None = None,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
 
@@ -344,6 +332,9 @@ class XTRWarp:
             Embeddings of the queries to search for.
         top_k:
             Number of top results to return.
+        num_threads:
+            Number of threads to use for the search.
+            Used only if index is loaded in cpu. Defaults to 1.
         bound:
             The number of centroids to consider per query. Defaults to 128.
         nprobe:
@@ -358,6 +349,10 @@ class XTRWarp:
             Data type to use for the search.
 
         """
+        if self._loaded_searchers is None or self.devices is None:
+            error = "Index not loaded, call load() first"
+            raise RuntimeError(error)
+
         if top_k <= 10:
             if nprobe is None:
                 nprobe = 1
@@ -390,98 +385,55 @@ class XTRWarp:
                 padding_value=0.0,
             )
 
-        num_queries = queries_embeddings.shape[0]
-        dtype = dtype or torch.float32
+        if queries_embeddings.dim() == 2:
+            queries_embeddings = queries_embeddings.unsqueeze(0)
+        elif queries_embeddings.dim() != 3:
+            error = f"Expected 2D or 3D tensor, got {queries_embeddings.dim()}D tensor"
+            raise ValueError(error)
 
-        if dtype != queries_embeddings.dtype:
-            logger.warning(
-                f"Query embeddings and dtype selection mismatch ({dtype} != {queries_embeddings.dtype}). Casting embeddings to avoid errors."
+        search_config = xtr_warp_rust.SearchConfig(
+            k=top_k,
+            device=self.devices[0],
+            dtype=self.dtype,
+            nprobe=nprobe,
+            t_prime=t_prime,
+            bound=bound,
+            num_threads=num_threads,
+            centroid_score_threshold=centroid_score_threshold,
+            max_codes_per_centroid=None,
+            max_candidates=max_candidates,
+        )
+        torch_path = self._ensure_torch_initialized(self.devices[0])
+        if len(self.devices) == 1:
+            scores = search_on_device(
+                torch_path=torch_path,
+                queries_embeddings=queries_embeddings,
+                search_config=search_config,
+                loaded_index=self._loaded_searchers[0],
             )
-            queries_embeddings = queries_embeddings.to(dtype=dtype)
-
-        dtype_str: str = str(dtype).split(".")[1]
-
-        if not self.multiple_gpus and len(self.devices) > 1:
+        else:
+            num_queries = queries_embeddings.shape[0]
             split_size = (num_queries // len(self.devices)) + 1
             queries_embeddings_splits = torch.split(
-                tensor=queries_embeddings,
-                split_size_or_sections=split_size,
+                tensor=queries_embeddings, split_size_or_sections=split_size
             )
 
-            tasks = [
-                delayed(function=search_on_device)(
-                    device=device,
-                    dtype=dtype_str,
-                    queries_embeddings=dev_queries,
-                    top_k=top_k,
-                    bound=bound,
-                    nprobe=nprobe,
-                    index=self.index,
-                    t_prime=t_prime,
-                    torch_path=self.torch_path,
-                    centroid_score_threshold=centroid_score_threshold,
-                    max_candidates=max_candidates,
+            args_for_starmap = [
+                (search_config, dev_queries, loaded_index, torch_path)
+                for loaded_index, dev_queries in zip(
+                    self._loaded_searchers, queries_embeddings_splits
                 )
-                for device, dev_queries in zip(self.devices, queries_embeddings_splits)
             ]
 
-            scores_per_device = Parallel(n_jobs=len(self.devices))(tasks)
+            scores_devices = []
 
+            context = mp.get_context()
+            with context.Pool(processes=len(args_for_starmap)) as pool:
+                scores_devices = pool.starmap(
+                    func=search_on_device, iterable=args_for_starmap
+                )
             scores = []
-            for device_scores in scores_per_device:
-                scores.extend(device_scores)
-
-            return scores
-
-        if not self.multiple_gpus:
-            return search_on_device(
-                device=self.devices[0],
-                dtype=dtype_str,
-                queries_embeddings=queries_embeddings,
-                top_k=top_k,
-                bound=bound,
-                nprobe=nprobe,
-                index=self.index,
-                t_prime=t_prime,
-                torch_path=self.torch_path,
-                centroid_score_threshold=centroid_score_threshold,
-                max_candidates=max_candidates,
-            )
-
-        split_size = (num_queries // len(self.devices)) + 1
-        queries_embeddings_splits = torch.split(
-            tensor=queries_embeddings,
-            split_size_or_sections=split_size,
-        )
-
-        args_for_starmap = [
-            (
-                device,
-                dtype_str,
-                dev_queries,
-                top_k,
-                bound,
-                nprobe,
-                self.index,
-                t_prime,
-                self.torch_path,
-                centroid_score_threshold,
-                max_candidates,
-            )
-            for device, dev_queries in zip(self.devices, queries_embeddings_splits)
-        ]
-
-        scores_devices = []
-
-        context = mp.get_context()
-        with context.Pool(processes=len(args_for_starmap)) as pool:
-            scores_devices = pool.starmap(
-                func=search_on_device,
-                iterable=args_for_starmap,
-            )
-
-        scores = []
-        for scores_device in scores_devices:
-            scores.extend(scores_device)
+            for scores_device in scores_devices:
+                scores.extend(scores_device)
 
         return scores

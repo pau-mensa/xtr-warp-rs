@@ -82,10 +82,6 @@ pub struct SearchConfig {
     #[pyo3(get, set)]
     pub bound: usize,
 
-    /// Whether to enable parallel search
-    #[pyo3(get, set)]
-    pub parallel: bool,
-
     /// Optional number of threads for parallel search
     #[pyo3(get, set)]
     pub num_threads: Option<usize>,
@@ -108,7 +104,7 @@ impl SearchConfig {
     /// Creates a new SearchConfig instance from Python
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (k, device, dtype=None, nprobe=None, t_prime=None, bound=None, parallel=None, num_threads=None, centroid_score_threshold=None, max_codes_per_centroid=None, max_candidates=None))]
+    #[pyo3(signature = (k, device, dtype=None, nprobe=None, t_prime=None, bound=None, num_threads=None, centroid_score_threshold=None, max_codes_per_centroid=None, max_candidates=None))]
     fn new(
         k: usize,
         device: String,
@@ -116,7 +112,6 @@ impl SearchConfig {
         nprobe: Option<u32>,
         t_prime: Option<usize>,
         bound: Option<usize>,
-        parallel: Option<bool>,
         num_threads: Option<usize>,
         centroid_score_threshold: Option<f32>,
         max_codes_per_centroid: Option<u32>,
@@ -129,7 +124,6 @@ impl SearchConfig {
             nprobe: nprobe.unwrap_or(32),
             t_prime,
             bound: bound.unwrap_or(128),
-            parallel: parallel.unwrap_or(true),
             num_threads,
             centroid_score_threshold,
             max_codes_per_centroid,
@@ -147,8 +141,7 @@ impl Default for SearchConfig {
             nprobe: 32,
             t_prime: None,
             bound: 128,
-            parallel: false,
-            num_threads: None,
+            num_threads: Some(1usize),
             centroid_score_threshold: None,
             max_codes_per_centroid: None,
             max_candidates: None,
