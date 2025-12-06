@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import logging
 import math
 import os
@@ -158,6 +159,7 @@ class XTRWarp:
         self.devices: list | None = None
         self.dtype: str | None = None
         self._torch_initialized = {}
+        self._metadata: dict | None = None
 
     def _ensure_torch_initialized(self, device: str) -> str:
         """Initialize torch once per device type."""
@@ -280,6 +282,26 @@ class XTRWarp:
             except OSError as e:
                 raise e
 
+    def _load_metadata(self) -> dict | None:
+        """Load index metadata from disk if available."""
+        if self._metadata is not None:
+            return self._metadata
+
+        metadata_path = os.path.join(self.index, "metadata.json")
+        try:
+            with open(metadata_path, "r") as f:
+                self._metadata = json.load(f)
+        except FileNotFoundError:
+            logger.warning(
+                "metadata.json not found in %s; using heuristic defaults", self.index
+            )
+            self._metadata = None
+        except OSError as exc:
+            logger.warning("Failed to load metadata from %s: %s", metadata_path, exc)
+            self._metadata = None
+
+        return self._metadata
+
     def load(
         self, device: str | list[str] = "cpu", dtype: torch.dtype = torch.float32
     ) -> "XTRWarp":
@@ -304,6 +326,7 @@ class XTRWarp:
         dtype_str = str(dtype).split(".")[1]
         self.dtype = dtype_str
 
+        _ = self._load_metadata()
         _ = self._ensure_torch_initialized(devices[0])
 
         self._loaded_searchers = []
@@ -313,12 +336,51 @@ class XTRWarp:
             self._loaded_searchers.append(searcher)
         return self
 
+    def optimize_hyperparams(
+        self, top_k: int, queries_embeddings: torch.Tensor
+    ) -> tuple[int, int, float, int] | None:
+        """Optimize the search hyperparams based on search config and index density."""
+        if self._metadata is None:
+            return None
+
+        density = self._metadata.get("num_embeddings", 0) / max(
+            1, self._metadata.get("num_partitions", 1)
+        )
+        num_tokens = queries_embeddings.size(1)
+        num_partitions = self._metadata.get("num_partitions", 128)
+
+        def _clamp(v: float, low: int, high: int) -> int:
+            return max(low, min(int(v), high))
+
+        if top_k <= 20:
+            nprobe = _clamp(1 + density / 2000, 1, 4)
+        elif top_k <= 100:
+            nprobe = _clamp(2 + density / 2000, 2, 8)
+        else:
+            nprobe = _clamp(4 + density / 1500, 4, 16)
+
+        bound = max(nprobe * 4, min(256, int(0.02 * num_partitions)))
+
+        centroid_score_threshold = 0.5
+        if density > 1500 or top_k >= 50:
+            centroid_score_threshold -= 0.05
+        if density > 2500 or top_k >= 200:
+            centroid_score_threshold -= 0.05
+
+        avg_emb_per_centroid = self._metadata["num_embeddings"] / max(
+            1, self._metadata.get("num_partitions", 1)
+        )
+        max_candidates = int(avg_emb_per_centroid * max(1, nprobe) * max(1, num_tokens))
+        max_candidates = max(max_candidates, top_k * 10)
+
+        return bound, nprobe, centroid_score_threshold, max_candidates
+
     def search(
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int,
         num_threads: int = 1,
-        bound: int = 128,
+        bound: int | None = None,
         t_prime: int | None = None,
         nprobe: int | None = None,
         max_candidates: int | None = None,
@@ -336,7 +398,7 @@ class XTRWarp:
             Number of threads to use for the search.
             Used only if index is loaded in cpu. Defaults to 1.
         bound:
-            The number of centroids to consider per query. Defaults to 128.
+            The number of centroids to consider per query. Defaults to None.
         nprobe:
             Number of inverted file probes to use.
         t_prime:
@@ -345,35 +407,11 @@ class XTRWarp:
             Maximum number of candidates to consider before the final sort.
         centroid_score_threshold:
             Threshold for centroid scores.
-        dtype:
-            Data type to use for the search.
 
         """
         if self._loaded_searchers is None or self.devices is None:
             error = "Index not loaded, call load() first"
             raise RuntimeError(error)
-
-        if top_k <= 10:
-            if nprobe is None:
-                nprobe = 1
-            if max_candidates is None:
-                max_candidates = 1024
-            if centroid_score_threshold is None:
-                centroid_score_threshold = 0.5
-        elif top_k <= 100:
-            if nprobe is None:
-                nprobe = 2
-            if max_candidates is None:
-                max_candidates = 2048
-            if centroid_score_threshold is None:
-                centroid_score_threshold = 0.45
-        else:
-            if nprobe is None:
-                nprobe = 4
-            if max_candidates is None:
-                max_candidates = max(top_k * 4, 4096)
-            if centroid_score_threshold is None:
-                centroid_score_threshold = 0.4
 
         if isinstance(queries_embeddings, list):
             queries_embeddings = torch.nn.utils.rnn.pad_sequence(
@@ -390,6 +428,25 @@ class XTRWarp:
         elif queries_embeddings.dim() != 3:
             error = f"Expected 2D or 3D tensor, got {queries_embeddings.dim()}D tensor"
             raise ValueError(error)
+
+        optimized = self.optimize_hyperparams(top_k, queries_embeddings)
+
+        if optimized is None:
+            err = "Index metadata could not be accessed"
+            raise RuntimeError(err)
+
+        print(
+            f"Bound: {optimized[0]}, nprobe: {optimized[1]}, centroid score threshold: {optimized[2]}, max candidates: {optimized[3]}"
+        )
+
+        if bound is None:
+            bound = optimized[0]
+        if nprobe is None:
+            nprobe = optimized[1]
+        if centroid_score_threshold is None:
+            centroid_score_threshold = optimized[2]
+        if max_candidates is None:
+            max_candidates = optimized[3]
 
         search_config = xtr_warp_rust.SearchConfig(
             k=top_k,
