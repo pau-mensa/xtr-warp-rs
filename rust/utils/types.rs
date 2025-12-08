@@ -66,6 +66,18 @@ pub struct SearchConfig {
     #[pyo3(get, set)]
     pub device: String,
 
+    /// Overall device mode: cpu | cuda | mps | hybrid
+    #[pyo3(get, set)]
+    pub device_mode: String,
+
+    /// Device to run centroid selection/matmul on
+    #[pyo3(get, set)]
+    pub selector_device: String,
+
+    /// Device to run decompression/merge on
+    #[pyo3(get, set)]
+    pub decompress_device: String,
+
     /// Dtype to use for the search
     #[pyo3(get, set)]
     pub dtype: String,
@@ -97,6 +109,14 @@ pub struct SearchConfig {
     /// The number of candidates to consider before the sorting
     #[pyo3(get, set)]
     pub max_candidates: Option<usize>,
+
+    /// Enable inner parallelism in decompression/merge (currently off by default)
+    #[pyo3(get, set)]
+    pub enable_inner_parallelism: Option<bool>,
+
+    /// Enable per-query batch parallelism on CPU/hybrid
+    #[pyo3(get, set)]
+    pub enable_batch_parallelism: Option<bool>,
 }
 
 #[pymethods]
@@ -104,7 +124,23 @@ impl SearchConfig {
     /// Creates a new SearchConfig instance from Python
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (k, device, dtype=None, nprobe=None, t_prime=None, bound=None, num_threads=None, centroid_score_threshold=None, max_codes_per_centroid=None, max_candidates=None))]
+    #[pyo3(signature = (
+        k,
+        device,
+        dtype=None,
+        nprobe=None,
+        t_prime=None,
+        bound=None,
+        num_threads=None,
+        centroid_score_threshold=None,
+        max_codes_per_centroid=None,
+        max_candidates=None,
+        device_mode=None,
+        selector_device=None,
+        decompress_device=None,
+        enable_inner_parallelism=None,
+        enable_batch_parallelism=None,
+    ))]
     fn new(
         k: usize,
         device: String,
@@ -116,10 +152,28 @@ impl SearchConfig {
         centroid_score_threshold: Option<f32>,
         max_codes_per_centroid: Option<u32>,
         max_candidates: Option<usize>,
+        device_mode: Option<String>,
+        selector_device: Option<String>,
+        decompress_device: Option<String>,
+        enable_inner_parallelism: Option<bool>,
+        enable_batch_parallelism: Option<bool>,
     ) -> Self {
+        let mode = device_mode.unwrap_or_else(|| "cpu".to_string());
+        let selector = selector_device.unwrap_or_else(|| device.clone());
+        // If hybrid, default decompression to CPU; otherwise match the selector
+        let decompress = decompress_device.unwrap_or_else(|| {
+            if mode.to_lowercase() == "hybrid" {
+                "cpu".to_string()
+            } else {
+                device.clone()
+            }
+        });
         Self {
             k,
             device,
+            device_mode: mode,
+            selector_device: selector,
+            decompress_device: decompress,
             dtype: dtype.unwrap_or("float32".to_string()),
             nprobe: nprobe.unwrap_or(32),
             t_prime,
@@ -128,6 +182,8 @@ impl SearchConfig {
             centroid_score_threshold,
             max_codes_per_centroid,
             max_candidates,
+            enable_inner_parallelism,
+            enable_batch_parallelism,
         }
     }
 }
@@ -137,6 +193,9 @@ impl Default for SearchConfig {
         Self {
             k: 100,
             device: "cpu".to_string(),
+            device_mode: "cpu".to_string(),
+            selector_device: "cpu".to_string(),
+            decompress_device: "cpu".to_string(),
             dtype: "float32".to_string(),
             nprobe: 32,
             t_prime: None,
@@ -145,6 +204,8 @@ impl Default for SearchConfig {
             centroid_score_threshold: None,
             max_codes_per_centroid: None,
             max_candidates: None,
+            enable_inner_parallelism: Some(false),
+            enable_batch_parallelism: Some(true),
         }
     }
 }

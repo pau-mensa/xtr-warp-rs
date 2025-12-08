@@ -6,6 +6,7 @@ use crate::utils::types::{
 };
 
 /// WARP centroid selection for efficient top-k retrieval
+#[derive(Clone)]
 pub struct CentroidSelector {
     nprobe: u32,
     t_prime_policy: TPrimePolicy,
@@ -19,7 +20,7 @@ impl CentroidSelector {
     /// Create a new centroid selector with the given configuration
     pub fn new(config: &SearchConfig, num_embeddings: usize, num_centroids: usize) -> Self {
         let nprobe = config.nprobe;
-        let device = parse_device(&config.device).expect("Invalid device string");
+        let device = parse_device(&config.selector_device).expect("Invalid device string");
         let dtype = parse_dtype(&config.dtype).expect("Invalid dtype string");
 
         let t_prime_policy = match config.t_prime {

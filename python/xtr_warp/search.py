@@ -160,6 +160,9 @@ class XTRWarp:
         self.dtype: str | None = None
         self._torch_initialized = {}
         self._metadata: dict | None = None
+        self.device_mode: str | None = None
+        self.selector_device: str | None = None
+        self.decompress_device: str | None = None
 
     def _ensure_torch_initialized(self, device: str) -> str:
         """Initialize torch once per device type."""
@@ -303,7 +306,10 @@ class XTRWarp:
         return self._metadata
 
     def load(
-        self, device: str | list[str] = "cpu", dtype: torch.dtype = torch.float32
+        self,
+        device: str | list[str] = "cpu",
+        dtype: torch.dtype = torch.float32,
+        device_mode: str | None = None,
     ) -> "XTRWarp":
         """Load an index to a specific device with the specified precision.
 
@@ -313,6 +319,10 @@ class XTRWarp:
             'cpu', 'cuda', 'mps', or a list of cuda devices (eg. ['cuda:0', 'cuda:1']
         dtype:
             valid torch dtype
+        device_mode:
+            'cpu', 'cuda', 'mps', 'hybrid', or 'auto'. Hybrid keeps the index on CPU
+            but runs centroid scoring on an accelerator if available. Auto picks
+            hybrid when CUDA/MPS is available, otherwise CPU.
 
         """
         if self._loaded_searchers is not None:
@@ -322,18 +332,42 @@ class XTRWarp:
             return self
 
         devices = [device] if isinstance(device, str) else device
-        self.devices = devices
         dtype_str = str(dtype).split(".")[1]
         self.dtype = dtype_str
 
         _ = self._load_metadata()
-        _ = self._ensure_torch_initialized(devices[0])
+
+        if device_mode is None or device_mode == "auto":
+            if torch.cuda.is_available():
+                device_mode = "hybrid"
+            elif torch.backends.mps.is_available():
+                device_mode = "hybrid"
+            else:
+                device_mode = "cpu"
+
+        self.device_mode = device_mode.lower()
+
+        if self.device_mode == "hybrid":
+            self.selector_device = (
+                "cuda"
+                if torch.cuda.is_available()
+                else "mps"
+                if torch.backends.mps.is_available()
+                else "cpu"
+            )
+            self.decompress_device = "cpu"
+        else:
+            self.selector_device = devices[0]
+            self.decompress_device = devices[0]
+
+        _ = self._ensure_torch_initialized(self.selector_device.split(":")[0])
 
         self._loaded_searchers = []
-        for d in devices:
-            searcher = xtr_warp_rust.LoadedSearcher(self.index, d, dtype_str)
-            searcher.load()
-            self._loaded_searchers.append(searcher)
+        load_device = self.decompress_device
+        searcher = xtr_warp_rust.LoadedSearcher(self.index, load_device, dtype_str)
+        searcher.load()
+        self._loaded_searchers.append(searcher)
+        self.devices = [self.selector_device]
         return self
 
     def optimize_hyperparams(
@@ -413,6 +447,16 @@ class XTRWarp:
             error = "Index not loaded, call load() first"
             raise RuntimeError(error)
 
+        # Make sure queries live on the decompression device when possible
+        if isinstance(queries_embeddings, torch.Tensor):
+            if (
+                self.decompress_device
+                and self.decompress_device != "cpu"
+                and queries_embeddings.device.type
+                != self.decompress_device.split(":")[0]
+            ):
+                queries_embeddings = queries_embeddings.to(self.decompress_device)
+
         if isinstance(queries_embeddings, list):
             queries_embeddings = torch.nn.utils.rnn.pad_sequence(
                 sequences=[
@@ -450,7 +494,10 @@ class XTRWarp:
 
         search_config = xtr_warp_rust.SearchConfig(
             k=top_k,
-            device=self.devices[0],
+            device=self.selector_device or "cpu",
+            device_mode=self.device_mode or "cpu",
+            selector_device=self.selector_device or "cpu",
+            decompress_device=self.decompress_device or "cpu",
             dtype=self.dtype,
             nprobe=nprobe,
             t_prime=t_prime,
@@ -459,8 +506,15 @@ class XTRWarp:
             centroid_score_threshold=centroid_score_threshold,
             max_codes_per_centroid=None,
             max_candidates=max_candidates,
+            enable_inner_parallelism=(
+                (self.decompress_device or "cpu") == "cpu"
+                and (self.device_mode or "cpu") in ("hybrid", "cpu")
+            ),
+            enable_batch_parallelism=True,
         )
-        torch_path = self._ensure_torch_initialized(self.devices[0])
+        torch_path = self._ensure_torch_initialized(
+            (self.selector_device or "cpu").split(":")[0]
+        )
         if len(self.devices) == 1:
             scores = search_on_device(
                 torch_path=torch_path,

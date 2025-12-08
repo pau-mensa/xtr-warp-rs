@@ -1,5 +1,7 @@
 use anyhow::Result;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::search::centroid_selector::CentroidSelector;
 use crate::search::decompressor::CentroidDecompressor;
@@ -26,18 +28,25 @@ pub struct WARPScorer {
 
     /// Configuration
     config: SearchConfig,
+
+    selector_device: tch::Device,
+    decompress_device: tch::Device,
+    selector_centroids: tch::Tensor,
+    selector_sizes: tch::Tensor,
 }
 
 impl WARPScorer {
     pub fn new(index: &Arc<LoadedIndex>, config: SearchConfig) -> Result<Self> {
         // Initialize centroid selector from phase 1
+        let selector_device = parse_device(&config.selector_device)?;
+        let decompress_device = parse_device(&config.decompress_device)?;
         let centroid_selector = CentroidSelector::new(
             &config,
             index.metadata.num_embeddings,
             index.metadata.num_centroids,
         );
 
-        let device = parse_device(&config.device)?;
+        let device = parse_device(&config.decompress_device)?;
         let dtype = parse_dtype(&config.dtype)?;
 
         // Initialize decompressor from phase 1
@@ -46,7 +55,12 @@ impl WARPScorer {
             index.metadata.dim,
             device,
             dtype,
-            config.num_threads.unwrap_or(1usize),
+            // keep inner parallelism disabled for now
+            if config.enable_inner_parallelism.unwrap_or(false) {
+                config.num_threads.unwrap_or(1usize)
+            } else {
+                1usize
+            },
         )?;
 
         // Initialize merger
@@ -58,12 +72,27 @@ impl WARPScorer {
         };
         let merger = ResultMerger::new(merger_config);
 
+        let selector_centroids = if selector_device == decompress_device {
+            index.centroids.shallow_clone()
+        } else {
+            index.centroids.to_device(selector_device)
+        };
+        let selector_sizes = if selector_device == decompress_device {
+            index.sizes_compacted.shallow_clone()
+        } else {
+            index.sizes_compacted.to_device(selector_device)
+        };
+
         Ok(Self {
             index: Arc::clone(index),
             centroid_selector,
             decompressor,
             merger,
             config,
+            selector_device,
+            decompress_device,
+            selector_centroids,
+            selector_sizes,
         })
     }
 
@@ -78,41 +107,66 @@ impl WARPScorer {
 
         no_grad(|| {
             let batch_size = query.embeddings.size()[0] as usize;
-            let mut results = Vec::with_capacity(batch_size);
-
-            // Compute all centroid scores at once for efficiency
-            // [batch, num_tokens, dim] @ [num_centroids, dim].T = [batch, num_tokens, num_centroids]
-            let all_centroid_scores = query
-                .embeddings
-                .matmul(&self.index.centroids.transpose(0, 1));
-
-            // Process each query independently
-            for b in 0..batch_size {
+            println!("Query size is {:?}", query.embeddings.size());
+            let process_query = |b: usize| -> Result<SearchResult> {
                 // Extract single query tensors
                 let query_embeddings = query.embeddings.narrow(0, b as i64, 1).squeeze_dim(0);
-                let centroid_scores = all_centroid_scores.narrow(0, b as i64, 1).squeeze_dim(0);
-                // Create query mask
                 let query_mask = query_embeddings.ne(0).any_dim(1, false);
 
+                // Prepare query on selector device
+                let query_for_selector = if self.selector_device == query_embeddings.device() {
+                    query_embeddings.shallow_clone()
+                } else {
+                    query_embeddings.to_device(self.selector_device)
+                };
+                //let start = Instant::now();
+                // Compute centroid scores on selector device
+                let centroid_scores =
+                    query_for_selector.matmul(&self.selector_centroids.transpose(0, 1));
+                //let duration = start.elapsed();
+                //println!("MATMUL time is {:?}", duration);
+
+                //let start2 = Instant::now();
+
                 // Select centroids for this query using pre-computed scores
-                let selected = self.centroid_selector.select_centroids(
-                    &query_mask,
+                let mut selected = self.centroid_selector.select_centroids(
+                    &query_mask.to_device(self.selector_device),
                     &centroid_scores,
-                    &self.index.sizes_compacted,
+                    &self.selector_sizes,
                     self.index.kdummy_centroid,
                     k,
                 )?;
+                //let duration2 = start2.elapsed();
+                //println!("Centroids selector time is {:?}", duration2);
+
+                // Move selection back to decompress device if needed
+                if self.selector_device != self.decompress_device {
+                    selected.centroid_ids = selected.centroid_ids.to_device(self.decompress_device);
+                    selected.scores = selected.scores.to_device(self.decompress_device);
+                    selected.mse_estimate = selected.mse_estimate.to_device(self.decompress_device);
+                }
+
+                // Prepare query for decompression
+                let query_for_decompress = if self.decompress_device == query_embeddings.device() {
+                    query_embeddings
+                } else {
+                    query_embeddings.to_device(self.decompress_device)
+                };
 
                 // Decompress selected centroids
+                //let start3 = Instant::now();
                 let decompressed = self.decompressor.decompress_centroids(
                     &selected.centroid_ids.to_kind(tch::Kind::Int64),
                     &selected.scores,
                     &self.index,
-                    &query_embeddings,
+                    &query_for_decompress,
                     self.config.nprobe as usize,
                 )?;
+                //let duration3 = start3.elapsed();
+                //println!("Decompression time {:?}", duration3);
 
                 // Merge candidate scores
+                //let start4 = Instant::now();
                 let (pids, scores) = self.merger.merge_candidate_scores(
                     &decompressed.capacities,
                     &decompressed.sizes,
@@ -122,15 +176,20 @@ impl WARPScorer {
                     self.config.nprobe as usize,
                     k,
                 )?;
+                //let duration4 = start4.elapsed();
+                //println!("Merging time is {:?}", duration4);
 
-                // Build result for this query
-                results.push(SearchResult {
+                Ok(SearchResult {
                     passage_ids: pids[..k.min(pids.len())].to_vec(),
                     scores: scores[..k.min(scores.len())].to_vec(),
                     query_id: (b + 1) as usize,
-                });
-            }
+                })
+            };
 
+            let mut results = Vec::with_capacity(batch_size);
+            for b in 0..batch_size {
+                results.push(process_query(b)?);
+            }
             Ok(results)
         })
     }

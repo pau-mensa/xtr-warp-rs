@@ -287,8 +287,8 @@ if False:
     scores = index.search(
         queries_embeddings=queries_embeddings,
         top_k=500,
-        n_ivf_probe=32,
-        n_full_scores=4096,
+        n_ivf_probe=4,
+        n_full_scores=31800,
     )
     end_search = time.time()
     search_time = end_search - start_search
@@ -306,8 +306,8 @@ if False:
     _ = index.search(
         queries_embeddings=large_queries_embeddings,
         top_k=500,
-        n_ivf_probe=32,
-        n_full_scores=4096,
+        n_ivf_probe=4,
+        n_full_scores=31800,
     )
     end_search = time.time()
     heavy_search_time = end_search - start_search
@@ -393,15 +393,15 @@ print(f"🔍 Searching on {dataset_name}...")
 # Monitor peak memory during search
 memory_monitor = PeakMemoryMonitor(pre_operation_baseline=pre_index_memory)
 memory_monitor.start_monitoring()
-index.load("cpu")
+index.load("cpu", device_mode="hybrid")
 # queries_embeddings = queries_embeddings.to("cuda")
 start_search = time.time()
 scores = index.search(
     queries_embeddings=queries_embeddings,
     top_k=500,
-    nprobe=32,
-    centroid_score_threshold=0.5,
-    max_candidates=4096,
+    # nprobe=4,
+    # centroid_score_threshold=0.5,
+    # max_candidates=4096,
     num_threads=64,
     # t_prime=TEST_T_PRIME,
     # bound=128,
@@ -423,9 +423,9 @@ start_search = time.time()
 _ = index.search(
     queries_embeddings=large_queries_embeddings,
     top_k=500,
-    nprobe=32,
-    centroid_score_threshold=0.5,
-    max_candidates=4096,
+    # nprobe=4,
+    # centroid_score_threshold=0.5,
+    # max_candidates=4096,
     num_threads=64,
     # t_prime=TEST_T_PRIME,
     # bound=TEST_BOUND,

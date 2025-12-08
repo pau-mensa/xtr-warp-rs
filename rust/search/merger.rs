@@ -1,5 +1,6 @@
 use anyhow::Result;
 use ndarray::Array1;
+//use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -49,9 +50,6 @@ impl Ord for ScoredCandidate {
 pub struct MergerConfig {
     /// Maximum number of candidates to keep during merging
     pub max_candidates: usize,
-
-    /// Whether to use parallel merging
-    // pub use_parallel: bool,
 
     /// Number of threads for parallel operations
     pub num_threads: usize,
@@ -147,6 +145,7 @@ pub struct CandidateStride {
 }
 
 /// Main merger struct for combining results from multiple sources
+#[derive(Clone)]
 pub struct ResultMerger {
     config: MergerConfig,
 }
