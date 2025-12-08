@@ -3,7 +3,7 @@ use rayon::prelude::*;
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
-use crate::utils::types::{DecompressedCentroidsOutput, LoadedIndex};
+use crate::utils::types::{DecompressedCentroidsOutput, ReadOnlyIndex};
 
 /// Centroid decompressor for efficient residual decompression
 #[derive(Clone)]
@@ -70,9 +70,10 @@ impl CentroidDecompressor {
         &self,
         centroid_ids: &Tensor,
         centroid_scores: &Tensor,
-        index: &Arc<LoadedIndex>,
+        index: &Arc<ReadOnlyIndex>,
         query_embeddings: &Tensor, // [num_tokens, dim]
         nprobe: usize,
+        num_threads: usize,
     ) -> Result<DecompressedCentroidsOutput> {
         let centroid_ids = centroid_ids.to_kind(Kind::Int64);
         let num_cells = centroid_ids.size()[0] as usize;
@@ -191,12 +192,18 @@ impl CentroidDecompressor {
             (Vec::new(), Vec::new())
         };
 
-        let use_parallel = self.num_threads > 1; // && nprobe >= 4 && num_cells >= 8;
+        let worker_threads = if num_threads == 0 {
+            self.num_threads
+        } else {
+            num_threads
+        };
+
+        let use_parallel = worker_threads > 1; // && nprobe >= 4 && num_cells >= 8;
 
         if use_parallel {
             // Use scoped thread pool to respect num_threads parameter
             let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(self.num_threads)
+                .num_threads(worker_threads)
                 .build();
 
             let cell_results: Vec<_> = match pool {
@@ -358,7 +365,7 @@ impl CentroidDecompressor {
         &self,
         centroid_ids: &Tensor,
         centroid_scores: &Tensor,
-        index: &Arc<LoadedIndex>,
+        index: &Arc<ReadOnlyIndex>,
         query_embeddings: &Tensor, // [num_tokens, dim]
         nprobe: usize,
     ) -> Result<DecompressedCentroidsOutput> {

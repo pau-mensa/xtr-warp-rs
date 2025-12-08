@@ -261,6 +261,41 @@ pub struct LoadedIndex {
     pub metadata: IndexMetadata,
 }
 
+impl Clone for LoadedIndex {
+    fn clone(&self) -> Self {
+        Self {
+            centroids: self.centroids.shallow_clone(),
+            bucket_weights: self.bucket_weights.shallow_clone(),
+            sizes_compacted: self.sizes_compacted.shallow_clone(),
+            codes_compacted: self.codes_compacted.shallow_clone(),
+            residuals_compacted: self.residuals_compacted.shallow_clone(),
+            offsets_compacted: self.offsets_compacted.shallow_clone(),
+            kdummy_centroid: self.kdummy_centroid,
+            metadata: self.metadata.clone(),
+        }
+    }
+}
+
+/// Read-only wrapper that marks the loaded index as safe to share across threads.
+/// The tensors are never mutated after load, so we can treat them as Sync.
+pub struct ReadOnlyIndex(pub LoadedIndex);
+
+impl std::ops::Deref for ReadOnlyIndex {
+    type Target = LoadedIndex;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+unsafe impl Sync for ReadOnlyIndex {}
+
+impl Clone for ReadOnlyIndex {
+    fn clone(&self) -> Self {
+        ReadOnlyIndex(self.0.clone())
+    }
+}
+
 /// Query representation for search
 pub struct Query {
     pub embeddings: Tensor, // Always [batch, num_tokens, dim]
@@ -270,6 +305,25 @@ pub struct Query {
 pub struct QueryBatch {
     pub queries: Vec<Query>,
     pub max_tokens: usize,
+}
+
+/// Read-only tensor wrapper to opt into Sync when we guarantee no mutation.
+pub struct ReadOnlyTensor(pub Tensor);
+
+impl std::ops::Deref for ReadOnlyTensor {
+    type Target = Tensor;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+unsafe impl Sync for ReadOnlyTensor {}
+
+impl Clone for ReadOnlyTensor {
+    fn clone(&self) -> Self {
+        ReadOnlyTensor(self.0.shallow_clone())
+    }
 }
 
 /// Selected centroids for a query token

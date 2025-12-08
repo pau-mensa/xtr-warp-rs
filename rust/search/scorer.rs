@@ -1,13 +1,12 @@
 use anyhow::Result;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use rayon::prelude::*;
+use std::sync::Arc;
 
 use crate::search::centroid_selector::CentroidSelector;
 use crate::search::decompressor::CentroidDecompressor;
 use crate::search::merger::{MergerConfig, ResultMerger};
 use crate::utils::types::{
-    parse_device, parse_dtype, LoadedIndex, Query, SearchConfig, SearchResult,
+    parse_device, parse_dtype, Query, ReadOnlyIndex, ReadOnlyTensor, SearchConfig, SearchResult,
 };
 
 /// Main scorer struct that handles WARP scoring operations
@@ -15,7 +14,7 @@ use crate::utils::types::{
 /// with the ranking pipeline
 pub struct WARPScorer {
     /// Shared reference to the loaded index
-    index: Arc<LoadedIndex>,
+    index: Arc<ReadOnlyIndex>,
 
     /// Centroid selector component from phase 1
     centroid_selector: CentroidSelector,
@@ -31,12 +30,12 @@ pub struct WARPScorer {
 
     selector_device: tch::Device,
     decompress_device: tch::Device,
-    selector_centroids: tch::Tensor,
-    selector_sizes: tch::Tensor,
+    selector_centroids: ReadOnlyTensor,
+    selector_sizes: ReadOnlyTensor,
 }
 
 impl WARPScorer {
-    pub fn new(index: &Arc<LoadedIndex>, config: SearchConfig) -> Result<Self> {
+    pub fn new(index: &Arc<ReadOnlyIndex>, config: SearchConfig) -> Result<Self> {
         // Initialize centroid selector from phase 1
         let selector_device = parse_device(&config.selector_device)?;
         let decompress_device = parse_device(&config.decompress_device)?;
@@ -91,8 +90,8 @@ impl WARPScorer {
             config,
             selector_device,
             decompress_device,
-            selector_centroids,
-            selector_sizes,
+            selector_centroids: ReadOnlyTensor(selector_centroids),
+            selector_sizes: ReadOnlyTensor(selector_sizes),
         })
     }
 
@@ -101,96 +100,143 @@ impl WARPScorer {
         &self,
         query: &Query, // [batch, num_tokens, dim]
     ) -> Result<Vec<SearchResult>> {
-        use tch::no_grad;
-
         let k = self.config.k;
+        let batch_size = query.embeddings.size()[0] as usize;
+        println!("Query size is {:?}", query.embeddings.size());
 
-        no_grad(|| {
-            let batch_size = query.embeddings.size()[0] as usize;
-            println!("Query size is {:?}", query.embeddings.size());
-            let process_query = |b: usize| -> Result<SearchResult> {
-                // Extract single query tensors
-                let query_embeddings = query.embeddings.narrow(0, b as i64, 1).squeeze_dim(0);
-                let query_mask = query_embeddings.ne(0).any_dim(1, false);
+        let max_threads = self
+            .config
+            .num_threads
+            .unwrap_or_else(rayon::current_num_threads)
+            .max(1);
+        let device_mode = self.config.device_mode.to_lowercase();
+        let enable_batch_parallelism = self.config.enable_batch_parallelism.unwrap_or(false)
+            && max_threads > 1
+            && batch_size > 1
+            && (device_mode == "cpu" || device_mode == "hybrid");
 
-                // Prepare query on selector device
-                let query_for_selector = if self.selector_device == query_embeddings.device() {
-                    query_embeddings.shallow_clone()
-                } else {
-                    query_embeddings.to_device(self.selector_device)
-                };
-                //let start = Instant::now();
-                // Compute centroid scores on selector device
-                let centroid_scores =
-                    query_for_selector.matmul(&self.selector_centroids.transpose(0, 1));
-                //let duration = start.elapsed();
-                //println!("MATMUL time is {:?}", duration);
+        let allow_inner_parallelism = self.config.enable_inner_parallelism.unwrap_or(false);
 
-                //let start2 = Instant::now();
+        let outer_threads = if enable_batch_parallelism {
+            batch_size.min(max_threads)
+        } else {
+            1
+        };
+        let inner_threads = if !allow_inner_parallelism {
+            1
+        } else if enable_batch_parallelism && outer_threads >= max_threads {
+            1
+        } else if enable_batch_parallelism {
+            (max_threads / outer_threads).max(1)
+        } else {
+            max_threads
+        };
 
-                // Select centroids for this query using pre-computed scores
-                let mut selected = self.centroid_selector.select_centroids(
-                    &query_mask.to_device(self.selector_device),
-                    &centroid_scores,
-                    &self.selector_sizes,
-                    self.index.kdummy_centroid,
-                    k,
-                )?;
-                //let duration2 = start2.elapsed();
-                //println!("Centroids selector time is {:?}", duration2);
+        // Pre-split queries so each thread owns its tensor (Tensor is Send but not Sync)
+        let queries: Vec<tch::Tensor> = (0..batch_size)
+            .map(|b| query.embeddings.narrow(0, b as i64, 1).squeeze_dim(0))
+            .collect();
 
-                // Move selection back to decompress device if needed
-                if self.selector_device != self.decompress_device {
-                    selected.centroid_ids = selected.centroid_ids.to_device(self.decompress_device);
-                    selected.scores = selected.scores.to_device(self.decompress_device);
-                    selected.mse_estimate = selected.mse_estimate.to_device(self.decompress_device);
-                }
+        let selector_centroids = self.selector_centroids.clone();
+        let selector_sizes = self.selector_sizes.clone();
+        let centroid_selector = self.centroid_selector.clone();
+        let decompressor = self.decompressor.clone();
+        let merger = self.merger.clone();
+        let index = Arc::clone(&self.index);
+        let selector_device = self.selector_device;
+        let decompress_device = self.decompress_device;
+        let nprobe = self.config.nprobe as usize;
 
-                // Prepare query for decompression
-                let query_for_decompress = if self.decompress_device == query_embeddings.device() {
-                    query_embeddings
-                } else {
-                    query_embeddings.to_device(self.decompress_device)
-                };
+        let process_query = move |b: usize,
+                                  query_embeddings: tch::Tensor|
+              -> Result<SearchResult> {
+            let _guard = tch::no_grad_guard();
 
-                // Decompress selected centroids
-                //let start3 = Instant::now();
-                let decompressed = self.decompressor.decompress_centroids(
-                    &selected.centroid_ids.to_kind(tch::Kind::Int64),
-                    &selected.scores,
-                    &self.index,
-                    &query_for_decompress,
-                    self.config.nprobe as usize,
-                )?;
-                //let duration3 = start3.elapsed();
-                //println!("Decompression time {:?}", duration3);
+            let query_mask = query_embeddings.ne(0).any_dim(1, false);
 
-                // Merge candidate scores
-                //let start4 = Instant::now();
-                let (pids, scores) = self.merger.merge_candidate_scores(
-                    &decompressed.capacities,
-                    &decompressed.sizes,
-                    &decompressed.passage_ids,
-                    &decompressed.scores,
-                    &selected.mse_estimate,
-                    self.config.nprobe as usize,
-                    k,
-                )?;
-                //let duration4 = start4.elapsed();
-                //println!("Merging time is {:?}", duration4);
-
-                Ok(SearchResult {
-                    passage_ids: pids[..k.min(pids.len())].to_vec(),
-                    scores: scores[..k.min(scores.len())].to_vec(),
-                    query_id: (b + 1) as usize,
-                })
+            // Prepare query on selector device
+            let query_for_selector = if selector_device == query_embeddings.device() {
+                query_embeddings.shallow_clone()
+            } else {
+                query_embeddings.to_device(selector_device)
             };
 
+            // Compute centroid scores on selector device
+            let centroid_scores = query_for_selector.matmul(&selector_centroids.transpose(0, 1));
+
+            // Select centroids for this query using pre-computed scores
+            let mut selected = centroid_selector.select_centroids(
+                &query_mask.to_device(selector_device),
+                &centroid_scores,
+                &selector_sizes,
+                index.kdummy_centroid,
+                k,
+            )?;
+
+            // Move selection back to decompress device if needed
+            if selector_device != decompress_device {
+                selected.centroid_ids = selected.centroid_ids.to_device(decompress_device);
+                selected.scores = selected.scores.to_device(decompress_device);
+                selected.mse_estimate = selected.mse_estimate.to_device(decompress_device);
+            }
+
+            // Prepare query for decompression
+            let query_for_decompress = if decompress_device == query_embeddings.device() {
+                query_embeddings
+            } else {
+                query_embeddings.to_device(decompress_device)
+            };
+
+            // Decompress selected centroids
+            let decompressed = decompressor.decompress_centroids(
+                &selected.centroid_ids.to_kind(tch::Kind::Int64),
+                &selected.scores,
+                &index,
+                &query_for_decompress,
+                nprobe,
+                inner_threads,
+            )?;
+
+            // Merge candidate scores
+            let (pids, scores) = merger.merge_candidate_scores(
+                &decompressed.capacities,
+                &decompressed.sizes,
+                &decompressed.passage_ids,
+                &decompressed.scores,
+                &selected.mse_estimate,
+                nprobe,
+                k,
+            )?;
+
+            Ok(SearchResult {
+                passage_ids: pids[..k.min(pids.len())].to_vec(),
+                scores: scores[..k.min(scores.len())].to_vec(),
+                query_id: (b + 1) as usize,
+            })
+        };
+
+        if outer_threads == 1 {
             let mut results = Vec::with_capacity(batch_size);
-            for b in 0..batch_size {
-                results.push(process_query(b)?);
+            for (idx, q) in queries.into_iter().enumerate() {
+                results.push(process_query(idx, q)?);
             }
             Ok(results)
-        })
+        } else {
+            // Custom pool so we don't oversubscribe beyond the heuristic
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(outer_threads)
+                .build()
+                .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+            let results: Result<Vec<SearchResult>> = pool.install(|| {
+                queries
+                    .into_par_iter()
+                    .enumerate()
+                    .map(|(idx, q)| process_query(idx, q))
+                    .collect()
+            });
+
+            results
+        }
     }
 }

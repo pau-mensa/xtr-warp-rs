@@ -18,7 +18,9 @@ pub mod utils;
 // Re-exports for convenience
 use crate::index::create::create_index;
 use search::{IndexLoader, Searcher};
-use utils::types::{IndexConfig, LoadedIndex, Query, SearchConfig, SearchResult};
+use utils::types::{
+    IndexConfig, Query, ReadOnlyIndex, SearchConfig, SearchResult,
+};
 
 /// Dynamically loads the native Torch shared library (e.g., `libtorch.so` or `torch.dll`).
 ///
@@ -109,7 +111,7 @@ fn get_dtype(dtype: &str) -> Result<Kind, PyErr> {
 /// Represents a loaded index
 #[pyclass(unsendable)]
 struct LoadedSearcher {
-    loaded_index: Option<Arc<LoadedIndex>>,
+    loaded_index: Option<Arc<ReadOnlyIndex>>,
     index_path: String,
     device: Device,
     dtype: Kind,
@@ -137,6 +139,7 @@ impl LoadedSearcher {
         let loaded_index = Arc::new(
             index_loader
                 .load()
+                .map(ReadOnlyIndex)
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to load index: {}", e)))?,
         );
         self.loaded_index = Some(loaded_index);

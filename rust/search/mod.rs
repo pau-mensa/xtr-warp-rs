@@ -16,7 +16,7 @@ pub use scorer::WARPScorer;
 
 use anyhow::Result;
 
-use crate::utils::types::{LoadedIndex, Query, SearchConfig, SearchResult};
+use crate::utils::types::{Query, ReadOnlyIndex, SearchConfig, SearchResult};
 
 /// Main search interface combining all components
 pub struct Searcher {
@@ -25,7 +25,7 @@ pub struct Searcher {
 
 impl Searcher {
     /// Create a new searcher with loaded index
-    pub fn new(index: &Arc<LoadedIndex>, config: &SearchConfig) -> Result<Self> {
+    pub fn new(index: &Arc<ReadOnlyIndex>, config: &SearchConfig) -> Result<Self> {
         // Initialize the WARP scorer which integrates all phase 1 components
         let scorer = WARPScorer::new(index, config.clone())?;
 

@@ -258,7 +258,7 @@ else:
     queries_embeddings = torch.load(f"queries_embeddings_{dataset_name}.pt")
 
 # FastPlaid
-if False:
+if True:
     print(f"\n=== 🚀 FastPlaid Evaluation ===")
 
     # Get baseline memory before creating index
@@ -286,9 +286,9 @@ if False:
     start_search = time.time()
     scores = index.search(
         queries_embeddings=queries_embeddings,
-        top_k=500,
-        n_ivf_probe=4,
-        n_full_scores=31800,
+        top_k=20,
+        # n_ivf_probe=4,
+        # n_full_scores=4096,
     )
     end_search = time.time()
     search_time = end_search - start_search
@@ -305,9 +305,9 @@ if False:
     start_search = time.time()
     _ = index.search(
         queries_embeddings=large_queries_embeddings,
-        top_k=500,
-        n_ivf_probe=4,
-        n_full_scores=31800,
+        top_k=20,
+        # n_ivf_probe=4,
+        # n_full_scores=4096,
     )
     end_search = time.time()
     heavy_search_time = end_search - start_search
@@ -361,131 +361,132 @@ if False:
 
     print(f"🎉 Finished evaluation for dataset: {dataset_name}\n")
 
-# XTR-Warp
+if True:
+    # XTR-Warp
 
-print(f"\n=== 🚀 XTR-Warp Evaluation ===")
+    print(f"\n=== 🚀 XTR-Warp Evaluation ===")
 
-# Get baseline memory before creating index
-pre_index_memory = get_memory_baseline()
-print(f"🧠 Memory before XTR-Warp index: {pre_index_memory:.2f} MB")
+    # Get baseline memory before creating index
+    pre_index_memory = get_memory_baseline()
+    print(f"🧠 Memory before XTR-Warp index: {pre_index_memory:.2f} MB")
 
-index = XTRWarp(index=os.path.join(".indexes", dataset_name))
-print(f"🏗️  Building index for {dataset_name}...")
-print(f"Document shape: {documents_embeddings[0].shape}")
-start_index = time.time()
-index.create(
-    documents_embeddings=documents_embeddings,
-    kmeans_niters=4,
-    max_points_per_centroid=256,
-    nbits=4,
-    seed=42,
-    device="cuda",
-)
-end_index = time.time()
-indexing_time = end_index - start_index
-post_index_memory = get_memory_baseline()
-print(
-    f"🧠 Memory after indexing: {post_index_memory:.2f} MB (↗️ +{post_index_memory - pre_index_memory:.2f} MB)"
-)
-print(f"\t✅ {dataset_name} indexing: {indexing_time:.2f} seconds")
+    index = XTRWarp(index=os.path.join(".indexes", dataset_name))
+    print(f"🏗️  Building index for {dataset_name}...")
+    print(f"Document shape: {documents_embeddings[0].shape}")
+    start_index = time.time()
+    # index.create(
+    #    documents_embeddings=documents_embeddings,
+    #    kmeans_niters=4,
+    #    max_points_per_centroid=256,
+    #    nbits=4,
+    #    seed=42,
+    #    device="cuda",
+    # )
+    end_index = time.time()
+    indexing_time = end_index - start_index
+    post_index_memory = get_memory_baseline()
+    print(
+        f"🧠 Memory after indexing: {post_index_memory:.2f} MB (↗️ +{post_index_memory - pre_index_memory:.2f} MB)"
+    )
+    print(f"\t✅ {dataset_name} indexing: {indexing_time:.2f} seconds")
 
-print(f"🔍 Searching on {dataset_name}...")
-# Monitor peak memory during search
-memory_monitor = PeakMemoryMonitor(pre_operation_baseline=pre_index_memory)
-memory_monitor.start_monitoring()
-index.load("cpu", device_mode="hybrid")
-# queries_embeddings = queries_embeddings.to("cuda")
-start_search = time.time()
-scores = index.search(
-    queries_embeddings=queries_embeddings,
-    top_k=500,
-    # nprobe=4,
-    # centroid_score_threshold=0.5,
-    # max_candidates=4096,
-    num_threads=64,
-    # t_prime=TEST_T_PRIME,
-    # bound=128,
-    # dtype=torch.float16,
-)
-end_search = time.time()
-search_time = end_search - start_search
-peak_memory, total_increase = memory_monitor.stop_monitoring()
-print(
-    f"🧠 XTR-Warp peak memory during search: {peak_memory:.2f} MB (↗️ +{total_increase:.2f} MB from baseline)"
-)
-
-large_queries_embeddings = torch.cat(
-    ([queries_embeddings] * ((1000 // queries_embeddings.shape[0]) + 1))[:1000]
-)  # .to(torch.float16)
-
-print(f"🔍 50_000 queries on {dataset_name} - {large_queries_embeddings.shape}...")
-start_search = time.time()
-_ = index.search(
-    queries_embeddings=large_queries_embeddings,
-    top_k=500,
-    # nprobe=4,
-    # centroid_score_threshold=0.5,
-    # max_candidates=4096,
-    num_threads=64,
-    # t_prime=TEST_T_PRIME,
-    # bound=TEST_BOUND,
-    # dtype=torch.float16,
-)
-end_search = time.time()
-heavy_search_time = end_search - start_search
-queries_per_second = large_queries_embeddings.shape[0] / heavy_search_time
-print(
-    f"\t✅ {dataset_name} search: {heavy_search_time:.2f} seconds ({queries_per_second:.2f} QPS)"
-)
-
-results = []
-for (query_id, _), query_scores in zip(queries.items(), scores, strict=True):
-    results.append(
-        [
-            {"id": documents_ids[document_id], "score": score}
-            for document_id, score in query_scores
-            if documents_ids[document_id] != query_id
-        ]
+    print(f"🔍 Searching on {dataset_name}...")
+    # Monitor peak memory during search
+    memory_monitor = PeakMemoryMonitor(pre_operation_baseline=pre_index_memory)
+    memory_monitor.start_monitoring()
+    index.load("cuda", device_mode="hybrid")
+    # queries_embeddings = queries_embeddings.to("cuda")
+    start_search = time.time()
+    scores = index.search(
+        queries_embeddings=queries_embeddings,
+        top_k=20,
+        nprobe=4,
+        # centroid_score_threshold=0.0,
+        # max_candidates=32000,
+        num_threads=1,
+        # t_prime=TEST_T_PRIME,
+        # bound=128,
+        # dtype=torch.float16,
+    )
+    end_search = time.time()
+    search_time = end_search - start_search
+    peak_memory, total_increase = memory_monitor.stop_monitoring()
+    print(
+        f"🧠 XTR-Warp peak memory during search: {peak_memory:.2f} MB (↗️ +{total_increase:.2f} MB from baseline)"
     )
 
-if args.debug:
-    log_query_hits("XTR-WARP", queries, results, qrels, available_doc_ids)
+    large_queries_embeddings = torch.cat(
+        ([queries_embeddings] * ((1000 // queries_embeddings.shape[0]) + 1))[:1000]
+    )  # .to(torch.float16)
 
-print(f"📊 Calculating metrics for {dataset_name}...")
-print(qrels)
-evaluation_scores = evaluate(
-    scores=results,
-    qrels=qrels,
-    queries=list(queries.values()),
-    metrics=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100"],
-)
+    print(f"🔍 50_000 queries on {dataset_name} - {large_queries_embeddings.shape}...")
+    start_search = time.time()
+    _ = index.search(
+        queries_embeddings=large_queries_embeddings,
+        top_k=20,
+        nprobe=4,
+        # centroid_score_threshold=0.0,
+        # max_candidates=32000,
+        num_threads=1,
+        # t_prime=TEST_T_PRIME,
+        # bound=TEST_BOUND,
+        # dtype=torch.float16,
+    )
+    end_search = time.time()
+    heavy_search_time = end_search - start_search
+    queries_per_second = large_queries_embeddings.shape[0] / heavy_search_time
+    print(
+        f"\t✅ {dataset_name} search: {heavy_search_time:.2f} seconds ({queries_per_second:.2f} QPS)"
+    )
 
-print(f"\n--- 📈 Final Scores for {dataset_name} ---")
-print(evaluation_scores)
+    results = []
+    for (query_id, _), query_scores in zip(queries.items(), scores, strict=True):
+        results.append(
+            [
+                {"id": documents_ids[document_id], "score": score}
+                for document_id, score in query_scores
+                if documents_ids[document_id] != query_id
+            ]
+        )
 
-output_dir = "./benchmark"
-os.makedirs(output_dir, exist_ok=True)
+    if args.debug:
+        log_query_hits("XTR-WARP", queries, results, qrels, available_doc_ids)
 
-output_data = {
-    "dataset": dataset_name,
-    "indexing": round(indexing_time, 3),
-    "search": round(search_time, 3),
-    "qps": round(queries_per_second, 2),
-    "size": len(documents),
-    "queries": num_queries,
-    "scores": evaluation_scores,
-    "memory": {
-        "peak_search_mb": round(peak_memory, 2),
-        "total_increase_mb": round(total_increase, 2),
-    },
-}
+    print(f"📊 Calculating metrics for {dataset_name}...")
+    print(qrels)
+    evaluation_scores = evaluate(
+        scores=results,
+        qrels=qrels,
+        queries=list(queries.values()),
+        metrics=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100"],
+    )
 
-output_filepath = os.path.join(output_dir, f"{dataset_name}.json")
-print(f"💾 Exporting results to {output_filepath}")
-with open(output_filepath, "w") as f:
-    json.dump(output_data, f, indent=4)
+    print(f"\n--- 📈 Final Scores for {dataset_name} ---")
+    print(evaluation_scores)
 
-print(f"🎉 Finished evaluation for dataset: {dataset_name}\n")
+    output_dir = "./benchmark"
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_data = {
+        "dataset": dataset_name,
+        "indexing": round(indexing_time, 3),
+        "search": round(search_time, 3),
+        "qps": round(queries_per_second, 2),
+        "size": len(documents),
+        "queries": num_queries,
+        "scores": evaluation_scores,
+        "memory": {
+            "peak_search_mb": round(peak_memory, 2),
+            "total_increase_mb": round(total_increase, 2),
+        },
+    }
+
+    output_filepath = os.path.join(output_dir, f"{dataset_name}.json")
+    print(f"💾 Exporting results to {output_filepath}")
+    with open(output_filepath, "w") as f:
+        json.dump(output_data, f, indent=4)
+
+    print(f"🎉 Finished evaluation for dataset: {dataset_name}\n")
 
 # Pylate
 if False:
