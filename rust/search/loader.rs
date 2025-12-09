@@ -10,19 +10,13 @@ use crate::utils::types::{CentroidId, IndexMetadata, LoadedIndex};
 /// Index loader responsible for loading WARP index components from disk
 pub struct IndexLoader {
     index_path: PathBuf,
-    // load_with_mmap: bool,
     device: Device,
     dtype: Kind,
 }
 
 impl IndexLoader {
     /// Create a new index loader
-    pub fn new(
-        index_path: impl AsRef<Path>,
-        device: Device,
-        dtype: Kind,
-        //load_with_mmap: bool,
-    ) -> Result<Self> {
+    pub fn new(index_path: impl AsRef<Path>, device: Device, dtype: Kind) -> Result<Self> {
         let path = index_path.as_ref();
 
         if !path.exists() {
@@ -35,7 +29,6 @@ impl IndexLoader {
 
         Ok(Self {
             index_path: path.to_path_buf(),
-            // load_with_mmap,
             device,
             dtype,
         })

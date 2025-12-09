@@ -35,7 +35,7 @@ from xtr_warp.evaluation import evaluate, load_beir
 # from xtr_warp_rust import evaluation, search
 from xtr_warp.search import XTRWarp
 
-DEVICE = "cuda"
+DEVICE = "cpu"
 TEST_BOUND = 128
 # Use a modest t_prime that the reduced test index can satisfy; the default
 # heuristic (>=1000) assumes production-scale indexes and undervalues missing
@@ -258,7 +258,7 @@ else:
     queries_embeddings = torch.load(f"queries_embeddings_{dataset_name}.pt")
 
 # FastPlaid
-if True:
+if False:
     print(f"\n=== 🚀 FastPlaid Evaluation ===")
 
     # Get baseline memory before creating index
@@ -380,7 +380,7 @@ if True:
     #    max_points_per_centroid=256,
     #    nbits=4,
     #    seed=42,
-    #    device="cuda",
+    #    device=DEVICE,
     # )
     end_index = time.time()
     indexing_time = end_index - start_index
@@ -394,16 +394,16 @@ if True:
     # Monitor peak memory during search
     memory_monitor = PeakMemoryMonitor(pre_operation_baseline=pre_index_memory)
     memory_monitor.start_monitoring()
-    index.load("cuda", device_mode="hybrid")
+    index.load("auto")
     # queries_embeddings = queries_embeddings.to("cuda")
     start_search = time.time()
     scores = index.search(
         queries_embeddings=queries_embeddings,
         top_k=20,
-        nprobe=4,
+        # nprobe=4,
         # centroid_score_threshold=0.0,
         # max_candidates=32000,
-        num_threads=1,
+        num_threads=64,
         # t_prime=TEST_T_PRIME,
         # bound=128,
         # dtype=torch.float16,
@@ -424,10 +424,10 @@ if True:
     _ = index.search(
         queries_embeddings=large_queries_embeddings,
         top_k=20,
-        nprobe=4,
+        # nprobe=4,
         # centroid_score_threshold=0.0,
         # max_candidates=32000,
-        num_threads=1,
+        num_threads=64,
         # t_prime=TEST_T_PRIME,
         # bound=TEST_BOUND,
         # dtype=torch.float16,

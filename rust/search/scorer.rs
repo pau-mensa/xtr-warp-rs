@@ -109,11 +109,9 @@ impl WARPScorer {
             .num_threads
             .unwrap_or_else(rayon::current_num_threads)
             .max(1);
-        let device_mode = self.config.device_mode.to_lowercase();
         let enable_batch_parallelism = self.config.enable_batch_parallelism.unwrap_or(false)
             && max_threads > 1
-            && batch_size > 1
-            && (device_mode == "cpu" || device_mode == "hybrid");
+            && batch_size > 1;
 
         let allow_inner_parallelism = self.config.enable_inner_parallelism.unwrap_or(false);
 

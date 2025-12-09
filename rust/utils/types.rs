@@ -32,9 +32,6 @@ pub struct IndexConfig {
     /// Device to use (e.g. "cpu", "cuda:0")
     pub device: Device,
 
-    /// Whether to load index with memory mapping
-    // pub load_with_mmap: bool,
-
     /// Number of bits for residual compression (2 or 4)
     pub nbits: i64,
 
@@ -47,7 +44,6 @@ impl Default for IndexConfig {
         Self {
             index_path: PathBuf::from("./index"),
             device: Device::Cpu,
-            // load_with_mmap: false,
             nbits: 4,
             embedding_dim: 128,
         }
@@ -61,14 +57,6 @@ pub struct SearchConfig {
     /// Number of top results to return
     #[pyo3(get, set)]
     pub k: usize,
-
-    /// Device to perform the search on
-    #[pyo3(get, set)]
-    pub device: String,
-
-    /// Overall device mode: cpu | cuda | mps | hybrid
-    #[pyo3(get, set)]
-    pub device_mode: String,
 
     /// Device to run centroid selection/matmul on
     #[pyo3(get, set)]
@@ -126,7 +114,8 @@ impl SearchConfig {
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         k,
-        device,
+        selector_device,
+        decompress_device,
         dtype=None,
         nprobe=None,
         t_prime=None,
@@ -135,15 +124,13 @@ impl SearchConfig {
         centroid_score_threshold=None,
         max_codes_per_centroid=None,
         max_candidates=None,
-        device_mode=None,
-        selector_device=None,
-        decompress_device=None,
         enable_inner_parallelism=None,
         enable_batch_parallelism=None,
     ))]
     fn new(
         k: usize,
-        device: String,
+        selector_device: String,
+        decompress_device: String,
         dtype: Option<String>,
         nprobe: Option<u32>,
         t_prime: Option<usize>,
@@ -152,30 +139,15 @@ impl SearchConfig {
         centroid_score_threshold: Option<f32>,
         max_codes_per_centroid: Option<u32>,
         max_candidates: Option<usize>,
-        device_mode: Option<String>,
-        selector_device: Option<String>,
-        decompress_device: Option<String>,
         enable_inner_parallelism: Option<bool>,
         enable_batch_parallelism: Option<bool>,
     ) -> Self {
-        let mode = device_mode.unwrap_or_else(|| "cpu".to_string());
-        let selector = selector_device.unwrap_or_else(|| device.clone());
-        // If hybrid, default decompression to CPU; otherwise match the selector
-        let decompress = decompress_device.unwrap_or_else(|| {
-            if mode.to_lowercase() == "hybrid" {
-                "cpu".to_string()
-            } else {
-                device.clone()
-            }
-        });
         Self {
             k,
-            device,
-            device_mode: mode,
-            selector_device: selector,
-            decompress_device: decompress,
+            selector_device: selector_device,
+            decompress_device: decompress_device,
             dtype: dtype.unwrap_or("float32".to_string()),
-            nprobe: nprobe.unwrap_or(32),
+            nprobe: nprobe.unwrap_or(4),
             t_prime,
             bound: bound.unwrap_or(128),
             num_threads,
@@ -192,12 +164,10 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             k: 100,
-            device: "cpu".to_string(),
-            device_mode: "cpu".to_string(),
             selector_device: "cpu".to_string(),
             decompress_device: "cpu".to_string(),
             dtype: "float32".to_string(),
-            nprobe: 32,
+            nprobe: 4,
             t_prime: None,
             bound: 128,
             num_threads: Some(1usize),
@@ -386,6 +356,7 @@ impl TPrimePolicy {
 pub fn parse_device(device: &str) -> anyhow::Result<Device> {
     match device.to_lowercase().as_str() {
         "cpu" => Ok(Device::Cpu),
+        "mps" => Ok(Device::Mps),
         "cuda" => Ok(Device::Cuda(0)), // Default to the first CUDA device.
         s if s.starts_with("cuda:") => {
             let parts: Vec<&str> = s.split(':').collect();
