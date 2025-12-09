@@ -18,9 +18,7 @@ pub mod utils;
 // Re-exports for convenience
 use crate::index::create::create_index;
 use search::{IndexLoader, Searcher};
-use utils::types::{
-    IndexConfig, Query, ReadOnlyIndex, SearchConfig, SearchResult,
-};
+use utils::types::{IndexConfig, Query, ReadOnlyIndex, SearchConfig, SearchResult};
 
 /// Dynamically loads the native Torch shared library (e.g., `libtorch.so` or `torch.dll`).
 ///
@@ -72,6 +70,7 @@ fn call_torch(torch_path: String) -> Result<(), anyhow::Error> {
 fn get_device(device: &str) -> Result<Device, PyErr> {
     match device.to_lowercase().as_str() {
         "cpu" => Ok(Device::Cpu),
+        "mps" => Ok(Device::Mps),
         "cuda" => Ok(Device::Cuda(0)), // Default to the first CUDA device.
         s if s.starts_with("cuda:") => {
             let parts: Vec<&str> = s.split(':').collect();
