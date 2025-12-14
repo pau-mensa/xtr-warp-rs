@@ -64,7 +64,9 @@ pub fn create_index(
         sample_tensors_vec.push(&document_embeddings[pid as usize]);
     }
 
-    let sampled_embeddings = Tensor::cat(&sample_tensors_vec, 0).to_device(config.device);
+    let sampled_embeddings = Tensor::cat(&sample_tensors_vec, 0)
+        .to_kind(Kind::Half)
+        .to_device(config.device);
 
     let path_str = config
         .index_path
@@ -83,7 +85,7 @@ pub fn create_index(
     )?;
 
     // Encode all documents into codes and residuals
-    compress_into_residuals(
+    let chunk_stats = compress_into_residuals(
         n_docs,
         num_chunks,
         config.nbits,
@@ -94,44 +96,11 @@ pub fn create_index(
         &codec,
     )?;
 
-    // Now read back the metadata files to get embeddings offsets
-    let mut current_emb_offset: usize = 0;
-    let mut chk_emb_offsets: Vec<usize> = Vec::new();
-
-    for chk_idx in 0..num_chunks {
-        let chk_meta_fpath =
-            Path::new(&config.index_path).join(format!("{}.metadata.json", chk_idx));
-        let meta_f_r = File::open(&chk_meta_fpath)?;
-        let buf_reader = BufReader::new(meta_f_r);
-        let mut json_val: serde_json::Value = serde_json::from_reader(buf_reader)?;
-
-        if let Some(meta_obj) = json_val.as_object_mut() {
-            meta_obj.insert("embedding_offset".to_string(), json!(current_emb_offset));
-            chk_emb_offsets.push(current_emb_offset);
-
-            let embs_in_chk = meta_obj
-                .get("num_embeddings")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "'num_embeddings' not found or invalid in {}",
-                        chk_meta_fpath.display()
-                    )
-                })? as usize;
-            current_emb_offset += embs_in_chk;
-
-            let meta_f_w_updated = File::create(&chk_meta_fpath)?;
-            let writer_updated = BufWriter::new(meta_f_w_updated);
-            serde_json::to_writer_pretty(writer_updated, &json_val)?;
-        } else {
-            return Err(anyhow!(
-                "Metadata in {} is not a JSON object",
-                chk_meta_fpath.display()
-            ));
-        }
-    }
-
-    let total_num_embs = current_emb_offset;
+    let chk_emb_offsets: Vec<usize> = chunk_stats.iter().map(|s| s.embedding_offset).collect();
+    let total_num_embs = chunk_stats
+        .last()
+        .map(|s| s.embedding_offset + s.num_embeddings)
+        .unwrap_or(0);
     // Build inverted file (IVF) structure
     build_ivf(
         &chk_emb_offsets,
@@ -193,16 +162,17 @@ fn train_residual_codec(
 
     let heldout_samples = sample_splits[1].shallow_clone();
 
+    let centroids_half = centroids.to_kind(Kind::Half);
     let initial_codec = ResidualCodec::load(
         nbits,
-        centroids.copy(),
+        centroids_half.copy(),
         Tensor::zeros(&[embedding_dim as i64], (Kind::Float, device)),
         None,
         None,
         device,
     )?;
 
-    let heldout_codes = compress_into_codes(&heldout_samples, &initial_codec.centroids);
+    let heldout_codes = compress_into_codes(&heldout_samples, &initial_codec.centroids); //TODO need to understand if this is giving a centroid per token or a centroid per dimension (per dimension would make more sense)
 
     let mut recon_embs_vec = Vec::new();
     for code_batch_idxs in heldout_codes.split((1 << 20) as i64, 0) {
@@ -229,7 +199,7 @@ fn train_residual_codec(
 
     let final_codec = ResidualCodec::load(
         nbits,
-        initial_codec.centroids.copy(),
+        initial_codec.centroids.copy(), // TODO could this be improved by setting the avg_res_per_dim, b_cutoffs, b_weights so we don't have to copy the centroids tensor?
         avg_res_per_dim,
         Some(b_cutoffs.copy()),
         Some(b_weights.copy()),
@@ -258,6 +228,8 @@ fn train_residual_codec(
 }
 
 pub fn compress_into_codes(embs: &Tensor, centroids: &Tensor) -> Tensor {
+    let embs = embs.to_kind(Kind::Half);
+    let centroids = centroids.to_kind(Kind::Half);
     let mut codes = Vec::new();
     let batch_sz = (1 << 29) / centroids.size()[0] as i64;
     for mut emb_batch in embs.split(batch_sz, 0) {
@@ -282,6 +254,11 @@ pub fn packbits(res: &Tensor) -> Tensor {
     packed
 }
 
+pub struct ChunkStats {
+    pub embedding_offset: usize,
+    pub num_embeddings: usize,
+}
+
 pub fn compress_into_residuals(
     n_docs: usize,
     n_chunks: usize,
@@ -291,9 +268,11 @@ pub fn compress_into_residuals(
     device: Device,
     index_path: &str,
     codec: &ResidualCodec,
-) -> Result<()> {
+) -> Result<Vec<ChunkStats>> {
     const CHUNK_SIZE: usize = 25_000;
     let proc_chunk_sz = CHUNK_SIZE.min(1 + n_docs);
+    let mut chunk_stats = Vec::with_capacity(n_chunks);
+    let mut current_emb_offset: usize = 0;
 
     for chk_idx in 0..n_chunks {
         let chk_offset = chk_idx * proc_chunk_sz;
@@ -301,10 +280,12 @@ pub fn compress_into_residuals(
 
         let chk_embs_vec: Vec<Tensor> = document_embeddings[chk_offset..chk_end_offset]
             .iter()
-            .map(|t| t.shallow_clone())
+            .map(|t| t.to_kind(Kind::Half))
             .collect();
         let chk_doclens: Vec<i64> = chk_embs_vec.iter().map(|e| e.size()[0]).collect();
-        let chk_embs_tensor = Tensor::cat(&chk_embs_vec, 0).to_device(device);
+        let chk_embs_tensor = Tensor::cat(&chk_embs_vec, 0)
+            .to_kind(Kind::Half)
+            .to_device(device);
 
         let mut chk_codes_list: Vec<Tensor> = Vec::new();
         let mut chk_res_list: Vec<Tensor> = Vec::new();
@@ -322,24 +303,7 @@ pub fn compress_into_residuals(
             let mut res_batch = &emb_batch - &recon_centroids;
 
             let bucket_cutoffs = codec.bucket_cutoffs.as_ref().unwrap().contiguous();
-
-            if bucket_cutoffs.dim() == 2 {
-                // Per-dimension bucketize
-                let dim = res_batch.size()[1];
-
-                let mut bucketized_dims = Vec::new();
-                for d in 0..dim {
-                    let res_dim = res_batch.narrow(1, d, 1).squeeze_dim(1);
-                    let cutoffs_dim = bucket_cutoffs.get(d as i64);
-                    let bucketized =
-                        Tensor::bucketize(&res_dim, &cutoffs_dim, true, false).unsqueeze(1);
-                    bucketized_dims.push(bucketized);
-                }
-                res_batch = Tensor::cat(&bucketized_dims, 1);
-            } else {
-                // Global bucketize (original behavior)
-                res_batch = Tensor::bucketize(&res_batch, &bucket_cutoffs, true, false);
-            }
+            res_batch = Tensor::bucketize(&res_batch, &bucket_cutoffs, true, false);
 
             let mut res_shape = res_batch.size();
             res_shape.push(nbits as i64);
@@ -358,6 +322,7 @@ pub fn compress_into_residuals(
 
         let chk_codes = Tensor::cat(&chk_codes_list, 0);
         let chk_residuals = Tensor::cat(&chk_res_list, 0);
+        let chunk_num_embeddings = chk_codes.size()[0] as usize;
 
         let chk_codes_fpath = Path::new(&index_path).join(&format!("{}.codes.npy", chk_idx));
         chk_codes
@@ -377,14 +342,21 @@ pub fn compress_into_residuals(
         let chk_meta = json!({
             "passage_offset": chk_offset,
             "num_passages": chk_doclens.len(),
-            "num_embeddings": chk_codes.size()[0] as usize,
+            "num_embeddings": chunk_num_embeddings,
+            "embedding_offset": current_emb_offset,
         });
         let chk_meta_fpath = Path::new(&index_path).join(format!("{}.metadata.json", chk_idx));
         let meta_f_w = File::create(chk_meta_fpath)?;
         let buf_writer_meta = BufWriter::new(meta_f_w);
         serde_json::to_writer(buf_writer_meta, &chk_meta)?;
+
+        chunk_stats.push(ChunkStats {
+            embedding_offset: current_emb_offset,
+            num_embeddings: chunk_num_embeddings,
+        });
+        current_emb_offset += chunk_num_embeddings;
     }
-    Ok(())
+    Ok(chunk_stats)
 }
 
 pub fn optimize_ivf(
@@ -474,11 +446,6 @@ fn build_ivf(
     index_path: &str,
     device: Device,
 ) -> Result<()> {
-    // Steps from XTR-WARP/fast-plaid:
-    // 1. Sort codes by centroid ID
-    // 2. Count embeddings per centroid using bincount
-    // 3. Build posting lists for non-empty centroids
-    // 4. Return optimized IVF structure
     let all_codes = Tensor::zeros(&[total_num_embs as i64], (Kind::Int64, device));
 
     for chk_idx in 0..n_chunks {
