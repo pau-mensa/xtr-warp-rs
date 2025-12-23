@@ -381,26 +381,36 @@ class XTRWarp:
         def _clamp(v: float, low: int, high: int) -> int:
             return max(low, min(int(v), high))
 
+        # Probe more aggressively on denser indices even for small top_k
         if top_k <= 20:
-            nprobe = _clamp(1 + density / 2000, 1, 4)
+            base_probe = 2
         elif top_k <= 100:
-            nprobe = _clamp(2 + density / 2000, 2, 8)
+            base_probe = 4
         else:
-            nprobe = _clamp(4 + density / 1500, 4, 16)
+            base_probe = 6
 
-        bound = max(nprobe * 4, min(256, int(0.02 * num_partitions)))
+        density_boost = int(
+            math.log10(max(1.0, density))
+        )  # 0 for sparse, +1 per order of magnitude
+        nprobe = _clamp(base_probe + density_boost, 2, min(32, num_partitions))
+
+        # Bound controls how many centroids we score before pruning
+        bound = max(nprobe * 8, int(0.05 * num_partitions))
 
         centroid_score_threshold = 0.5
-        if density > 1500 or top_k >= 50:
+        if density > 1000 or top_k >= 50:
             centroid_score_threshold -= 0.05
         if density > 2500 or top_k >= 200:
             centroid_score_threshold -= 0.05
 
-        avg_emb_per_centroid = self._metadata["num_embeddings"] / max(
-            1, self._metadata.get("num_partitions", 1)
+        # Allow more candidates on dense corpora and multi-token queries
+        est_candidates = density * max(1, nprobe) * max(1, num_tokens) * 1.5
+        max_candidates = int(est_candidates)
+        max_candidates = max(max_candidates, top_k * 50)
+        max_candidates = min(
+            max_candidates,
+            self._metadata.get("num_embeddings", max_candidates),
         )
-        max_candidates = int(avg_emb_per_centroid * max(1, nprobe) * max(1, num_tokens))
-        max_candidates = max(max_candidates, top_k * 10)
 
         return bound, nprobe, centroid_score_threshold, max_candidates
 
@@ -414,8 +424,6 @@ class XTRWarp:
         nprobe: int | None = None,
         max_candidates: int | None = None,
         centroid_score_threshold: float | None = None,
-        enable_inner_parallelism: bool = True,
-        enable_batch_parallelism: bool = True,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
 
@@ -438,10 +446,6 @@ class XTRWarp:
             Maximum number of candidates to consider before the final sort.
         centroid_score_threshold:
             Threshold for centroid scores.
-        enable_inner_parallelism:
-            Whether to enable inner parallelism.
-        enable_batch_parallelism:
-            Whether to enable batch parallelism.
 
         """
         if (
@@ -506,8 +510,6 @@ class XTRWarp:
             centroid_score_threshold=centroid_score_threshold,
             max_codes_per_centroid=None,
             max_candidates=max_candidates,
-            enable_inner_parallelism=enable_inner_parallelism,
-            enable_batch_parallelism=enable_batch_parallelism,
         )
         torch_path = self._ensure_torch_initialized(self.selector_device)
         if len(self.devices) == 1:
