@@ -219,6 +219,10 @@ impl ResultMerger {
     /// Copies a candidate stride to another
     fn copy_candidate_stride(source: &AnnotatedStrideView, destination: &mut AnnotatedStrideView) {
         let size = source.size;
+        if destination.pids.len() < size {
+            destination.pids.resize(size, 0);
+            destination.scores.resize(size, 0.0);
+        }
         destination.size = size;
         destination.pids[..size].copy_from_slice(&source.pids[..size]);
         destination.scores[..size].copy_from_slice(&source.scores[..size]);
