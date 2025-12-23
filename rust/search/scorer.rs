@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rayon::prelude::*;
+use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use std::sync::Arc;
 
 use crate::search::centroid_selector::CentroidSelector;
@@ -28,6 +28,9 @@ pub struct WARPScorer {
     /// Configuration
     config: SearchConfig,
 
+    /// Shared rayon thread pool respecting user-provided num_threads
+    thread_pool: Arc<ThreadPool>,
+
     selector_device: tch::Device,
     decompress_device: tch::Device,
     selector_centroids: ReadOnlyTensor,
@@ -48,18 +51,20 @@ impl WARPScorer {
         let device = parse_device(&config.decompress_device)?;
         let dtype = parse_dtype(&config.dtype)?;
 
+        // Build a dedicated rayon pool to reuse across all parallel sections
+        let num_threads = config
+            .num_threads
+            .unwrap_or_else(rayon::current_num_threads)
+            .max(1);
+        let thread_pool = Arc::new(ThreadPoolBuilder::new().num_threads(num_threads).build()?);
+
         // Initialize decompressor from phase 1
         let decompressor = CentroidDecompressor::new(
             index.metadata.nbits,
             index.metadata.dim,
             device,
             dtype,
-            // keep inner parallelism disabled for now
-            if config.enable_inner_parallelism.unwrap_or(false) {
-                config.num_threads.unwrap_or(1usize)
-            } else {
-                1usize
-            },
+            Arc::clone(&thread_pool),
         )?;
 
         // Initialize merger
@@ -88,6 +93,7 @@ impl WARPScorer {
             decompressor,
             merger,
             config,
+            thread_pool,
             selector_device,
             decompress_device,
             selector_centroids: ReadOnlyTensor(selector_centroids),
@@ -102,33 +108,8 @@ impl WARPScorer {
     ) -> Result<Vec<SearchResult>> {
         let k = self.config.k;
         let batch_size = query.embeddings.size()[0] as usize;
-        println!("Query size is {:?}", query.embeddings.size());
 
-        let max_threads = self
-            .config
-            .num_threads
-            .unwrap_or_else(rayon::current_num_threads)
-            .max(1);
-        let enable_batch_parallelism = self.config.enable_batch_parallelism.unwrap_or(false)
-            && max_threads > 1
-            && batch_size > 1;
-
-        let allow_inner_parallelism = self.config.enable_inner_parallelism.unwrap_or(false);
-
-        let outer_threads = if enable_batch_parallelism {
-            batch_size.min(max_threads)
-        } else {
-            1
-        };
-        let inner_threads = if !allow_inner_parallelism {
-            1
-        } else if enable_batch_parallelism && outer_threads >= max_threads {
-            1
-        } else if enable_batch_parallelism {
-            (max_threads / outer_threads).max(1)
-        } else {
-            max_threads
-        };
+        let use_parallel = self.thread_pool.current_num_threads() > 1 && batch_size > 1;
 
         // Pre-split queries so each thread owns its tensor (Tensor is Send but not Sync)
         let queries: Vec<tch::Tensor> = (0..batch_size)
@@ -192,7 +173,6 @@ impl WARPScorer {
                 &index,
                 &query_for_decompress,
                 nprobe,
-                inner_threads,
             )?;
 
             // Merge candidate scores
@@ -213,28 +193,20 @@ impl WARPScorer {
             })
         };
 
-        if outer_threads == 1 {
+        if !use_parallel {
             let mut results = Vec::with_capacity(batch_size);
             for (idx, q) in queries.into_iter().enumerate() {
                 results.push(process_query(idx, q)?);
             }
             Ok(results)
         } else {
-            // Custom pool so we don't oversubscribe beyond the heuristic
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(outer_threads)
-                .build()
-                .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
-
-            let results: Result<Vec<SearchResult>> = pool.install(|| {
+            self.thread_pool.install(|| {
                 queries
                     .into_par_iter()
                     .enumerate()
                     .map(|(idx, q)| process_query(idx, q))
                     .collect()
-            });
-
-            results
+            })
         }
     }
 }

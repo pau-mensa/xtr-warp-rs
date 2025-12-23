@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use rayon::prelude::*;
+use rayon::{prelude::*, ThreadPool};
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
@@ -11,9 +11,9 @@ pub struct CentroidDecompressor {
     nbits: u8,
     device: Device,
     dtype: Kind,
-    num_threads: usize,
     dim: usize,
     reversed_bit_map: [u8; 256],
+    thread_pool: Arc<ThreadPool>,
 }
 
 impl CentroidDecompressor {
@@ -23,7 +23,7 @@ impl CentroidDecompressor {
         dim: usize,
         device: Device,
         dtype: Kind,
-        num_threads: usize,
+        thread_pool: Arc<ThreadPool>,
     ) -> Result<Self> {
         if nbits != 2 && nbits != 4 {
             return Err(anyhow!("nbits must be 2 or 4, got {}", nbits));
@@ -35,9 +35,9 @@ impl CentroidDecompressor {
             nbits,
             device,
             dtype,
-            num_threads,
             dim,
             reversed_bit_map,
+            thread_pool,
         })
     }
 
@@ -73,7 +73,6 @@ impl CentroidDecompressor {
         index: &Arc<ReadOnlyIndex>,
         query_embeddings: &Tensor, // [num_tokens, dim]
         nprobe: usize,
-        num_threads: usize,
     ) -> Result<DecompressedCentroidsOutput> {
         let centroid_ids = centroid_ids.to_kind(Kind::Int64);
         let num_cells = centroid_ids.size()[0] as usize;
@@ -192,65 +191,30 @@ impl CentroidDecompressor {
             (Vec::new(), Vec::new())
         };
 
-        let worker_threads = if num_threads == 0 {
-            self.num_threads
-        } else {
-            num_threads
-        };
-
-        let use_parallel = worker_threads > 1; // && nprobe >= 4 && num_cells >= 8;
+        let use_parallel = self.thread_pool.current_num_threads() > 1 && num_cells > 1;
 
         if use_parallel {
-            // Use scoped thread pool to respect num_threads parameter
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(worker_threads)
-                .build();
-
-            let cell_results: Vec<_> = match pool {
-                Ok(pool) => pool.install(|| {
-                    (0..num_cells)
-                        .into_par_iter()
-                        .map(|cell_idx| {
-                            self.process_cell(
-                                cell_idx,
-                                &capacities_vec,
-                                &centroid_scores_vec,
-                                nprobe,
-                                num_tokens,
-                                bucket_score_stride,
-                                &bucket_scores_flat,
-                                &cell_ranges,
-                                &all_pids_vec,
-                                &all_residuals_data,
-                                residual_bytes_per_embedding,
-                                bucket_dim_shift,
-                            )
-                        })
-                        .collect()
-                }),
-                Err(_) => {
-                    // Fallback to global thread pool if custom pool creation fails
-                    (0..num_cells)
-                        .into_par_iter()
-                        .map(|cell_idx| {
-                            self.process_cell(
-                                cell_idx,
-                                &capacities_vec,
-                                &centroid_scores_vec,
-                                nprobe,
-                                num_tokens,
-                                bucket_score_stride,
-                                &bucket_scores_flat,
-                                &cell_ranges,
-                                &all_pids_vec,
-                                &all_residuals_data,
-                                residual_bytes_per_embedding,
-                                bucket_dim_shift,
-                            )
-                        })
-                        .collect()
-                },
-            };
+            let cell_results: Vec<_> = self.thread_pool.install(|| {
+                (0..num_cells)
+                    .into_par_iter()
+                    .map(|cell_idx| {
+                        self.process_cell(
+                            cell_idx,
+                            &capacities_vec,
+                            &centroid_scores_vec,
+                            nprobe,
+                            num_tokens,
+                            bucket_score_stride,
+                            &bucket_scores_flat,
+                            &cell_ranges,
+                            &all_pids_vec,
+                            &all_residuals_data,
+                            residual_bytes_per_embedding,
+                            bucket_dim_shift,
+                        )
+                    })
+                    .collect()
+            });
 
             // rebuild the results
             offsets.clear();

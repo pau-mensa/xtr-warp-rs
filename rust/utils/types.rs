@@ -97,14 +97,6 @@ pub struct SearchConfig {
     /// The number of candidates to consider before the sorting
     #[pyo3(get, set)]
     pub max_candidates: Option<usize>,
-
-    /// Enable inner parallelism in decompression/merge (currently off by default)
-    #[pyo3(get, set)]
-    pub enable_inner_parallelism: Option<bool>,
-
-    /// Enable per-query batch parallelism on CPU/hybrid
-    #[pyo3(get, set)]
-    pub enable_batch_parallelism: Option<bool>,
 }
 
 #[pymethods]
@@ -124,8 +116,6 @@ impl SearchConfig {
         centroid_score_threshold=None,
         max_codes_per_centroid=None,
         max_candidates=None,
-        enable_inner_parallelism=None,
-        enable_batch_parallelism=None,
     ))]
     fn new(
         k: usize,
@@ -139,8 +129,6 @@ impl SearchConfig {
         centroid_score_threshold: Option<f32>,
         max_codes_per_centroid: Option<u32>,
         max_candidates: Option<usize>,
-        enable_inner_parallelism: Option<bool>,
-        enable_batch_parallelism: Option<bool>,
     ) -> Self {
         Self {
             k,
@@ -154,8 +142,6 @@ impl SearchConfig {
             centroid_score_threshold,
             max_codes_per_centroid,
             max_candidates,
-            enable_inner_parallelism,
-            enable_batch_parallelism,
         }
     }
 }
@@ -174,8 +160,6 @@ impl Default for SearchConfig {
             centroid_score_threshold: None,
             max_codes_per_centroid: None,
             max_candidates: None,
-            enable_inner_parallelism: Some(false),
-            enable_batch_parallelism: Some(true),
         }
     }
 }
