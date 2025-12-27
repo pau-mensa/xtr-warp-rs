@@ -307,6 +307,7 @@ class XTRWarp:
     def load(
         self,
         device: str | list[str] = "auto",
+        decompress_device: str = "cpu",
         dtype: torch.dtype = torch.float32,
     ) -> "XTRWarp":
         """Load an index to a specific device with the specified precision.
@@ -343,7 +344,7 @@ class XTRWarp:
                 if torch.backends.mps.is_available()
                 else "cpu"
             )
-            self.decompress_device = "cpu"
+            self.decompress_device = decompress_device
             self.devices = [self.decompress_device]
             _ = self._ensure_torch_initialized(self.selector_device)
         elif isinstance(device, list):
@@ -352,13 +353,17 @@ class XTRWarp:
             self.devices = devices
         else:
             self.selector_device = device
-            # we want the decompression on cpu to take advantage of the parallelism
-            self.decompress_device = "cpu"
-            self.devices = ["cpu"]
+            self.decompress_device = decompress_device
+            # Keep the loaded searcher on the decompression device (e.g., cuda for speed).
+            self.devices = [self.decompress_device]
 
         self._loaded_searchers = []
+        # Ensure torch is initialized on both selector and decompression devices if they differ.
+        _ = self._ensure_torch_initialized(self.selector_device)
+        if self.decompress_device != self.selector_device:
+            _ = self._ensure_torch_initialized(self.decompress_device)
+
         for d in self.devices:
-            _ = self._ensure_torch_initialized(d)
             searcher = xtr_warp_rust.LoadedSearcher(self.index, d, dtype_str)
             searcher.load()
             self._loaded_searchers.append(searcher)
@@ -473,11 +478,13 @@ class XTRWarp:
             error = f"Expected 2D or 3D tensor, got {queries_embeddings.dim()}D tensor"
             raise ValueError(error)
 
-        if (
-            self.decompress_device != "cpu"
-            and queries_embeddings.device.type != self.decompress_device.split(":")[0]
-        ):
-            queries_embeddings = queries_embeddings.to(self.decompress_device)
+        if self.decompress_device != "cpu":
+            if queries_embeddings.device.type != self.decompress_device.split(":")[0]:
+                queries_embeddings = queries_embeddings.to(self.decompress_device)
+        else:
+            # Ensure queries are on CPU when decompression runs on CPU to avoid device mismatch.
+            if queries_embeddings.is_cuda:
+                queries_embeddings = queries_embeddings.to("cpu")
 
         optimized = self.optimize_hyperparams(top_k, queries_embeddings)
 
