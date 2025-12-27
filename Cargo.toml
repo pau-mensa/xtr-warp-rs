@@ -42,3 +42,9 @@ opt-level = 3
 
 [profile.release]
 opt-level = 3
+
+[build-dependencies]
+cc = "1.0"
+
+[dependencies.torch-sys]
+version = "0.20.0"
