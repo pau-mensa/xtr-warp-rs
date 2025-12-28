@@ -78,6 +78,10 @@ pub struct SearchConfig {
     #[pyo3(get, set)]
     pub bound: usize,
 
+    /// The batch size for cuda processing
+    #[pyo3(get, set)]
+    pub batch_size: i64,
+
     /// Optional number of threads for parallel search
     #[pyo3(get, set)]
     pub num_threads: Option<usize>,
@@ -107,6 +111,7 @@ impl SearchConfig {
         nprobe=None,
         t_prime=None,
         bound=None,
+        batch_size=None,
         num_threads=None,
         centroid_score_threshold=None,
         max_codes_per_centroid=None,
@@ -119,6 +124,7 @@ impl SearchConfig {
         nprobe: Option<u32>,
         t_prime: Option<usize>,
         bound: Option<usize>,
+        batch_size: Option<i64>,
         num_threads: Option<usize>,
         centroid_score_threshold: Option<f32>,
         max_codes_per_centroid: Option<u32>,
@@ -131,6 +137,7 @@ impl SearchConfig {
             nprobe: nprobe.unwrap_or(4),
             t_prime,
             bound: bound.unwrap_or(128),
+            batch_size: batch_size.unwrap_or(8192i64),
             num_threads,
             centroid_score_threshold,
             max_codes_per_centroid,
@@ -148,6 +155,7 @@ impl Default for SearchConfig {
             nprobe: 4,
             t_prime: None,
             bound: 128,
+            batch_size: 8192i64,
             num_threads: Some(1usize),
             centroid_score_threshold: None,
             max_codes_per_centroid: None,

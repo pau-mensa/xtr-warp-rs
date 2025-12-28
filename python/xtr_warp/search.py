@@ -408,12 +408,13 @@ class XTRWarp:
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int,
-        num_threads: int = 1,
+        num_threads: int | None = 1,
         bound: int | None = None,
         t_prime: int | None = None,
         nprobe: int | None = None,
         max_candidates: int | None = None,
         centroid_score_threshold: float | None = None,
+        batch_size: int | None = 8192,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
 
@@ -424,23 +425,36 @@ class XTRWarp:
         top_k:
             Number of top results to return.
         num_threads:
-            Number of threads to use for the search.
+            Upper bound of threads to use for the search.
             Used only if index is loaded in cpu. Defaults to 1.
         bound:
             The number of centroids to consider per query. Defaults to None.
         nprobe:
-            Number of inverted file probes to use.
+            Number of inverted file probes to use. Defaults to None.
         t_prime:
             Value to use for the t_prime policy. Defaults to None.
         max_candidates:
             Maximum number of candidates to consider before the final sort.
         centroid_score_threshold:
-            Threshold for centroid scores.
+            Threshold for centroid scores. Defaults to None.
+        batch_size:
+            Batch size for the query matmul against the centroids.
+            Used only if index is loaded in cuda. Defaults to 8192.
 
         """
         if self._loaded_searchers is None or self.devices is None:
             error = "Index not loaded, call load() first"
             raise RuntimeError(error)
+
+        if (
+            num_threads is not None
+            and num_threads > 1
+            and self.devices[0].startswith("cuda")
+        ):
+            warning = (
+                "num_threads > 1 is not supported for cuda devices, defaulting to 1"
+            )
+            logger.warning(warning)
 
         if isinstance(queries_embeddings, list):
             queries_embeddings = torch.nn.utils.rnn.pad_sequence(
@@ -489,6 +503,7 @@ class XTRWarp:
             nprobe=nprobe,
             t_prime=t_prime,
             bound=bound,
+            batch_size=batch_size,
             num_threads=num_threads,
             centroid_score_threshold=centroid_score_threshold,
             max_codes_per_centroid=None,
