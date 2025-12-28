@@ -102,6 +102,7 @@ impl CentroidDecompressor {
                 passage_ids: Tensor::zeros(&[0], (Kind::Int64, self.device)),
                 scores: Tensor::zeros(&[0], (self.dtype, self.device)),
                 offsets: Tensor::zeros(&[1], (Kind::Int64, self.device)),
+                token_indices: Tensor::zeros(&[0], (Kind::Int64, self.device)),
             });
         }
 
@@ -332,6 +333,19 @@ impl CentroidDecompressor {
             passage_ids: pids_tensor,
             scores: scores_tensor,
             offsets: offsets_tensor,
+            token_indices: {
+                let num_cells = candidate_sizes.len();
+                let mut token_indices = Vec::with_capacity(candidate_pids.len());
+                for cell_idx in 0..num_cells {
+                    let token_idx = (cell_idx / nprobe) as i64;
+                    for _ in 0..candidate_sizes[cell_idx] {
+                        token_indices.push(token_idx);
+                    }
+                }
+                Tensor::from_slice(&token_indices)
+                    .to_device(self.device)
+                    .to_kind(Kind::Int64)
+            },
         })
     }
 
@@ -373,6 +387,7 @@ impl CentroidDecompressor {
                 passage_ids: Tensor::zeros(&[0], (Kind::Int64, device)),
                 scores: Tensor::zeros(&[0], (Kind::Float, device)),
                 offsets,
+                token_indices: Tensor::zeros(&[0], (Kind::Int64, device)),
             });
         }
 
@@ -385,10 +400,11 @@ impl CentroidDecompressor {
 
         let candidate_cell_starts =
             start_offsets.repeat_interleave_self_tensor(&capacities_i64, 0, Some(total_capacity));
-        let candidate_begins =
-            begins
-                .to_kind(Kind::Int64)
-                .repeat_interleave_self_tensor(&capacities_i64, 0, Some(total_capacity));
+        let candidate_begins = begins.to_kind(Kind::Int64).repeat_interleave_self_tensor(
+            &capacities_i64,
+            0,
+            Some(total_capacity),
+        );
 
         let intra = &ranges - &candidate_cell_starts;
         let embedding_indices = &candidate_begins + &intra;
@@ -484,6 +500,7 @@ impl CentroidDecompressor {
             passage_ids,
             scores,
             offsets,
+            token_indices,
         })
     }
 
@@ -524,6 +541,7 @@ impl CentroidDecompressor {
                 passage_ids: Tensor::zeros(&[0], (Kind::Int64, self.device)),
                 scores: Tensor::zeros(&[0], (self.dtype, self.device)),
                 offsets: Tensor::zeros(&[1], (Kind::Int64, self.device)),
+                token_indices: Tensor::zeros(&[0], (Kind::Int64, self.device)),
             });
         }
 
@@ -702,6 +720,19 @@ impl CentroidDecompressor {
             passage_ids: pids_tensor,
             scores: scores_tensor,
             offsets: offsets_tensor,
+            token_indices: {
+                let num_cells = candidate_sizes.len();
+                let mut token_indices = Vec::with_capacity(candidate_pids.len());
+                for cell_idx in 0..num_cells {
+                    let token_idx = (cell_idx / nprobe) as i64;
+                    for _ in 0..candidate_sizes[cell_idx] {
+                        token_indices.push(token_idx);
+                    }
+                }
+                Tensor::from_slice(&token_indices)
+                    .to_device(self.device)
+                    .to_kind(Kind::Int64)
+            },
         })
     }
 

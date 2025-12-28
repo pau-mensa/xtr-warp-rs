@@ -301,6 +301,7 @@ pub struct DecompressedCentroidsOutput {
     pub passage_ids: Tensor,
     pub scores: Tensor,
     pub offsets: Tensor,
+    pub token_indices: Tensor, // Token index per candidate row
 }
 
 /// Candidate for final ranking

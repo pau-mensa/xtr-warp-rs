@@ -283,6 +283,7 @@ impl ResultMerger {
         candidate_sizes: &Tensor,
         candidate_pids: &Tensor,
         candidate_scores: &Tensor,
+        candidate_token_indices: Option<&Tensor>,
         mse_estimates: &Tensor,
         nprobe: usize,
         k: usize,
@@ -293,6 +294,7 @@ impl ResultMerger {
                 candidate_sizes,
                 candidate_pids,
                 candidate_scores,
+                candidate_token_indices,
                 mse_estimates,
                 nprobe,
                 k,
@@ -415,6 +417,7 @@ impl ResultMerger {
         candidate_sizes: &Tensor,
         candidate_pids: &Tensor,
         candidate_scores: &Tensor,
+        candidate_token_indices: Option<&Tensor>,
         mse_estimates: &Tensor,
         nprobe: usize,
         k: usize,
@@ -433,12 +436,16 @@ impl ResultMerger {
         let scores = candidate_scores.shallow_clone();
         let mse_estimates = mse_estimates.shallow_clone();
 
-        // Token index per cell, repeated per candidate
-        let num_cells = sizes.size()[0];
-        let mut token_indices = Tensor::arange(num_cells, (Kind::Int64, device));
-        token_indices = token_indices.divide_scalar_mode(nprobe as i64, "trunc");
-        let candidate_tokens =
-            Tensor::repeat_interleave_self_tensor(&token_indices, &sizes, 0, None);
+        let candidate_tokens = match candidate_token_indices {
+            Some(t) => t.shallow_clone(),
+            None => {
+                // Token index per cell, repeated per candidate
+                let num_cells = sizes.size()[0];
+                let mut token_indices = Tensor::arange(num_cells, (Kind::Int64, device));
+                token_indices = token_indices.divide_scalar_mode(nprobe as i64, "trunc");
+                Tensor::repeat_interleave_self_tensor(&token_indices, &sizes, 0, None)
+            },
+        };
 
         // Flatten token+pid into a combined id to compactly deduplicate
         let combined_ids = pids * kNumTokens + candidate_tokens;
@@ -494,18 +501,14 @@ impl ResultMerger {
 
         // Deterministic per-PID sum using cumulative sums to avoid nondeterministic atomics.
         // Exclusive prefix to get exact per-pid sums.
-        let delta_cumsum = delta.cumsum(0, delta.kind());
+        let delta_cumsum = delta.cumsum(0, delta.kind()).contiguous();
         let mut prefix = Tensor::zeros(
             &[delta_cumsum.size()[0] + 1],
             (delta_cumsum.kind(), delta_cumsum.device()),
         );
-        let prefix_indices =
-            Tensor::arange(delta_cumsum.size()[0], (Kind::Int64, delta_cumsum.device())) + 1;
-        prefix.index_put_(
-            &[Some(&prefix_indices)],
-            &delta_cumsum,
-            /*accumulate=*/ false,
-        );
+        prefix
+            .narrow(0, 1, delta_cumsum.size()[0])
+            .copy_(&delta_cumsum);
 
         let end_indices = pid_counts.cumsum(0, Kind::Int64) - 1;
         let start_indices = end_indices.shallow_clone() - pid_counts + 1;
