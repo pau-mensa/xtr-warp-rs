@@ -39,10 +39,16 @@ impl IndexLoader {
         let index_path = self.index_path.as_path();
 
         // Load bucket weights (for scoring)
-        let bucket_weights = self.load_torch_tensor(index_path.join("bucket_weights.npy"))?;
+        let bucket_weights = self
+            .load_torch_tensor(index_path.join("bucket_weights.npy"))
+            .unwrap()
+            .to_dtype(self.dtype, false, false);
 
         // Load centroids
-        let centroids = self.load_torch_tensor(index_path.join("centroids.npy"))?;
+        let centroids = self
+            .load_torch_tensor(index_path.join("centroids.npy"))
+            .unwrap()
+            .to_dtype(self.dtype, false, false);
 
         // Load compacted sizes per centroid
         let sizes_compacted = self.load_torch_tensor(index_path.join("sizes.compacted.npy"))?;
@@ -121,9 +127,7 @@ impl IndexLoader {
         let tensor = Tensor::read_npy(&path)
             .map_err(|e| anyhow!("Failed to load tensor {:?}: {}", path, e))?;
 
-        Ok(tensor
-            .to_device(self.device)
-            .to_dtype(self.dtype, false, false))
+        Ok(tensor.to_device(self.device))
     }
 
     /// Compute offsets from sizes for efficient indexing
