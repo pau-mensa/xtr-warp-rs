@@ -35,7 +35,7 @@ from xtr_warp.evaluation import evaluate, load_beir
 # from xtr_warp_rust import evaluation, search
 from xtr_warp.search import XTRWarp
 
-DEVICE = "cpu"
+DEVICE = "cuda"
 TEST_BOUND = 128
 # Use a modest t_prime that the reduced test index can satisfy; the default
 # heuristic (>=1000) assumes production-scale indexes and undervalues missing
@@ -256,6 +256,10 @@ if False:
 else:
     documents_embeddings = torch.load(f"documents_embeddings_{dataset_name}.pt")
     queries_embeddings = torch.load(f"queries_embeddings_{dataset_name}.pt")
+    if args.n_docs is not None:
+        documents_embeddings = documents_embeddings[: args.n_docs]
+    if args.n_queries is not None:
+        queries_embeddings = queries_embeddings[: args.n_queries]
 
 # FastPlaid
 if False:
@@ -270,7 +274,7 @@ if False:
     )
     print(f"🏗️  Building index for {dataset_name}...")
     start_index = time.time()
-    index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+    # index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
     end_index = time.time()
     indexing_time = end_index - start_index
     post_index_memory = get_memory_baseline()
@@ -286,8 +290,8 @@ if False:
     start_search = time.time()
     scores = index.search(
         queries_embeddings=queries_embeddings,
-        top_k=20,
-        # n_ivf_probe=4,
+        top_k=500,
+        n_ivf_probe=8,
         # n_full_scores=4096,
     )
     end_search = time.time()
@@ -305,8 +309,8 @@ if False:
     start_search = time.time()
     _ = index.search(
         queries_embeddings=large_queries_embeddings,
-        top_k=20,
-        # n_ivf_probe=4,
+        top_k=500,
+        n_ivf_probe=8,
         # n_full_scores=4096,
     )
     end_search = time.time()
@@ -394,7 +398,7 @@ if True:
     # Monitor peak memory during search
     memory_monitor = PeakMemoryMonitor(pre_operation_baseline=pre_index_memory)
     memory_monitor.start_monitoring()
-    index.load("auto")
+    index.load("cuda")
     # queries_embeddings = queries_embeddings.to("cuda")
     start_search = time.time()
     scores = index.search(
@@ -402,11 +406,12 @@ if True:
         top_k=20,
         # nprobe=4,
         # centroid_score_threshold=0.0,
-        # max_candidates=32000,
+        # max_candidates=800,
         num_threads=64,
         # t_prime=TEST_T_PRIME,
         # bound=128,
         # dtype=torch.float16,
+        batch_size=1000000,
     )
     end_search = time.time()
     search_time = end_search - start_search
@@ -426,11 +431,12 @@ if True:
         top_k=20,
         # nprobe=4,
         # centroid_score_threshold=0.0,
-        # max_candidates=32000,
+        # max_candidates=800,
         num_threads=64,
         # t_prime=TEST_T_PRIME,
         # bound=TEST_BOUND,
         # dtype=torch.float16,
+        batch_size=1000000,
     )
     end_search = time.time()
     heavy_search_time = end_search - start_search
