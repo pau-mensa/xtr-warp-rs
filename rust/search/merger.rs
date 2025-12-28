@@ -1,13 +1,12 @@
 use anyhow::Result;
-use ndarray::Array1;
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ptr;
-use std::sync::Arc;
-use tch::{no_grad, Device, Tensor};
+use tch::{no_grad, Device, Kind, Tensor};
 use torch_sys::C_tensor;
 
 use crate::utils::types::{PassageId, Score};
+
+//TODO num tokens can't be hardcoded to 32
 
 extern "C" {
     fn xtr_warp_gpu_merge(
@@ -23,43 +22,6 @@ extern "C" {
     );
 }
 
-/// Represents a scored candidate document
-#[derive(Debug, Clone)]
-pub struct ScoredCandidate {
-    /// Passage/document ID
-    pub pid: PassageId,
-
-    /// Score for this candidate
-    pub score: Score,
-
-    /// Source centroid index (for debugging/tracing)
-    pub centroid_id: Option<u32>,
-
-    /// Token-level scores (if available)
-    pub token_scores: Option<Vec<Score>>,
-}
-
-impl PartialEq for ScoredCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.score == other.score && self.pid == other.pid
-    }
-}
-
-impl Eq for ScoredCandidate {}
-
-impl PartialOrd for ScoredCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // Reverse ordering for max-heap behavior
-        other.score.partial_cmp(&self.score)
-    }
-}
-
-impl Ord for ScoredCandidate {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
-    }
-}
-
 /// Configuration for the merger
 #[derive(Debug, Clone)]
 pub struct MergerConfig {
@@ -71,33 +33,6 @@ pub struct MergerConfig {
 
     /// Device to use
     pub device: Device,
-}
-
-/// Strategy for combining scores from multiple sources
-#[derive(Clone)]
-pub enum ScoreCombination {
-    /// Take maximum score across all occurrences
-    Max,
-
-    /// Sum scores across all occurrences
-    Sum,
-
-    /// Average scores across all occurrences
-    Average,
-
-    /// Custom combination function
-    Custom(Arc<dyn Fn(&[f32]) -> f32 + Send + Sync>),
-}
-
-impl std::fmt::Debug for ScoreCombination {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Max => write!(f, "Max"),
-            Self::Sum => write!(f, "Sum"),
-            Self::Average => write!(f, "Average"),
-            Self::Custom(_) => write!(f, "Custom(<function>)"),
-        }
-    }
 }
 
 /// Represents a view into strided candidate data
@@ -142,21 +77,6 @@ impl ReduceSumMseCombiner {
     fn new(lhs_mse: f32, rhs_mse: f32) -> Self {
         ReduceSumMseCombiner { lhs_mse, rhs_mse }
     }
-}
-
-/// Represents a stride of candidates from a single source
-pub struct CandidateStride {
-    /// Passage IDs in this stride
-    pub pids: Array1<PassageId>,
-
-    /// Scores for each PID
-    pub scores: Array1<Score>,
-
-    /// Actual size (may be less than capacity)
-    pub size: usize,
-
-    /// Capacity of this stride
-    pub capacity: usize,
 }
 
 /// Main merger struct for combining results from multiple sources
@@ -368,12 +288,8 @@ impl ResultMerger {
         k: usize,
     ) -> Result<(Vec<PassageId>, Vec<Score>)> {
         // If tensors are on CUDA and the GPU merge kernel is available, use it.
-        if candidate_pids.device().is_cuda()
-            && candidate_scores.device().is_cuda()
-            && candidate_sizes.device().is_cuda()
-            && mse_estimates.device().is_cuda()
-        {
-            if let Ok((pids, scores)) = Self::merge_candidate_scores_cuda(
+        if self.config.device.is_cuda() {
+            if let Ok((pids, scores)) = self.merge_candidate_scores_cuda(
                 candidate_sizes,
                 candidate_pids,
                 candidate_scores,
@@ -495,6 +411,132 @@ impl ResultMerger {
     }
 
     fn merge_candidate_scores_cuda(
+        &self,
+        candidate_sizes: &Tensor,
+        candidate_pids: &Tensor,
+        candidate_scores: &Tensor,
+        mse_estimates: &Tensor,
+        nprobe: usize,
+        k: usize,
+        max_candidates: usize,
+    ) -> Result<(Vec<PassageId>, Vec<Score>)> {
+        let kNumTokens = 32i64;
+        if candidate_pids.numel() == 0 {
+            let empty_pid: Vec<i64> = Vec::new();
+            let empty_scores: Vec<f32> = Vec::new();
+            return Ok((empty_pid, empty_scores));
+        }
+
+        let device = candidate_pids.device();
+        let sizes = candidate_sizes.shallow_clone();
+        let pids = candidate_pids.shallow_clone();
+        let scores = candidate_scores.shallow_clone();
+        let mse_estimates = mse_estimates.shallow_clone();
+
+        // Token index per cell, repeated per candidate
+        let num_cells = sizes.size()[0];
+        let mut token_indices = Tensor::arange(num_cells, (Kind::Int64, device));
+        token_indices = token_indices.divide_scalar_mode(nprobe as i64, "trunc");
+        let candidate_tokens =
+            Tensor::repeat_interleave_self_tensor(&token_indices, &sizes, 0, None);
+
+        // Flatten token+pid into a combined id to compactly deduplicate
+        let combined_ids = pids * kNumTokens + candidate_tokens;
+        let sort_result = combined_ids.sort(0, /*descending=*/ false);
+        let sorted_ids = sort_result.0;
+        let sort_idx = sort_result.1;
+        let sorted_scores = scores.index_select(0, &sort_idx);
+
+        // Unique ids and inverse for max reduction
+        let unique_result = sorted_ids.unique_consecutive(
+            /*return_inverse=*/ true, /*return_counts=*/ false, 0,
+        );
+        let unique_ids = unique_result.0;
+        let inverse = unique_result.1;
+        let max_init = Tensor::full(
+            unique_ids.size(),
+            f64::NEG_INFINITY,
+            (sorted_scores.kind(), sorted_scores.device()),
+        );
+        let max_per_id = Tensor::index_reduce(
+            &max_init,
+            0,
+            &inverse,
+            &sorted_scores,
+            "amax",
+            /*include_self=*/ true,
+        );
+
+        // Split combined id back into pid and token
+        let pid = unique_ids
+            .divide_scalar_mode(kNumTokens, "trunc")
+            .to_kind(Kind::Int64);
+        let token = (unique_ids - pid.shallow_clone() * kNumTokens).to_kind(Kind::Int64);
+
+        // Prepare MSE vector (pad to kNumTokens if needed)
+        let mut mse = mse_estimates.shallow_clone();
+        if mse.size()[0] < kNumTokens {
+            let pad = Tensor::zeros(&[kNumTokens - mse.size()[0]], (mse.kind(), mse.device()));
+            mse = Tensor::cat(&[mse, pad], 0);
+        }
+        mse = mse.narrow(0, 0, kNumTokens);
+
+        let sum_mse = mse.sum(None);
+        let mse_for_tokens = mse.index_select(0, &token);
+        let delta = max_per_id - mse_for_tokens;
+
+        // Reduce by pid: since keys were sorted, pid is non-decreasing
+        let pid_result = &pid.unique_consecutive(
+            /*return_inverse=*/ true, /*return_counts=*/ true, 0,
+        );
+        let unique_pids = pid_result.0.shallow_clone();
+        let pid_counts = pid_result.2.to_kind(Kind::Int64);
+
+        // Deterministic per-PID sum using cumulative sums to avoid nondeterministic atomics.
+        // Exclusive prefix to get exact per-pid sums.
+        let delta_cumsum = delta.cumsum(0, delta.kind());
+        let mut prefix = Tensor::zeros(
+            &[delta_cumsum.size()[0] + 1],
+            (delta_cumsum.kind(), delta_cumsum.device()),
+        );
+        let prefix_indices =
+            Tensor::arange(delta_cumsum.size()[0], (Kind::Int64, delta_cumsum.device())) + 1;
+        prefix.index_put_(
+            &[Some(&prefix_indices)],
+            &delta_cumsum,
+            /*accumulate=*/ false,
+        );
+
+        let end_indices = pid_counts.cumsum(0, Kind::Int64) - 1;
+        let start_indices = end_indices.shallow_clone() - pid_counts + 1;
+        let sums_at_end = prefix.index_select(0, &(end_indices + 1));
+        let sums_before = prefix.index_select(0, &start_indices);
+        let deltas_per_pid = sums_at_end - sums_before;
+        let totals = deltas_per_pid + sum_mse;
+
+        if totals.numel() == 0 {
+            let empty_pid: Vec<i64> = Vec::new();
+            let empty_scores_out: Vec<f32> = Vec::new();
+            return Ok((empty_pid, empty_scores_out));
+        }
+
+        let totals_size = totals.size();
+        let num_candidates = totals_size.get(0).unwrap();
+        let budget = k.max(max_candidates.min(*num_candidates as usize));
+        let take_k = (budget as i64).min(*num_candidates);
+
+        let topk = totals.topk(take_k, 0, /*largest=*/ true, /*sorted=*/ true);
+        let top_scores: Vec<f32> = topk.0.to_device(Device::Cpu).try_into()?;
+        let top_indices = topk.1;
+        let top_pids: Vec<i64> = unique_pids
+            .index_select(0, &top_indices)
+            .to_device(Device::Cpu)
+            .try_into()?;
+
+        return Ok((top_pids, top_scores));
+    }
+
+    fn merge_candidate_scores_cuda_cpp(
         candidate_sizes: &Tensor,
         candidate_pids: &Tensor,
         candidate_scores: &Tensor,
