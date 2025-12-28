@@ -494,18 +494,14 @@ impl ResultMerger {
 
         // Deterministic per-PID sum using cumulative sums to avoid nondeterministic atomics.
         // Exclusive prefix to get exact per-pid sums.
-        let delta_cumsum = delta.cumsum(0, delta.kind());
+        let delta_cumsum = delta.cumsum(0, delta.kind()).contiguous();
         let mut prefix = Tensor::zeros(
             &[delta_cumsum.size()[0] + 1],
             (delta_cumsum.kind(), delta_cumsum.device()),
         );
-        let prefix_indices =
-            Tensor::arange(delta_cumsum.size()[0], (Kind::Int64, delta_cumsum.device())) + 1;
-        prefix.index_put_(
-            &[Some(&prefix_indices)],
-            &delta_cumsum,
-            /*accumulate=*/ false,
-        );
+        prefix
+            .narrow(0, 1, delta_cumsum.size()[0])
+            .copy_(&delta_cumsum);
 
         let end_indices = pid_counts.cumsum(0, Kind::Int64) - 1;
         let start_indices = end_indices.shallow_clone() - pid_counts + 1;
