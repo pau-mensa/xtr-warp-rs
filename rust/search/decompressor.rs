@@ -121,6 +121,17 @@ impl CentroidDecompressor {
             "Expected at least one query token for decompression"
         );
 
+        if self.device.is_cuda() {
+            return self.decompress_centroids_cuda_ops(
+                &begins,
+                &capacities,
+                centroid_scores,
+                index,
+                &query_embeddings,
+                nprobe,
+            );
+        }
+
         let bucket_weights = index.bucket_weights.to_kind(self.dtype);
         let vt_bucket_scores =
             (query_embeddings.unsqueeze(2) * &bucket_weights.unsqueeze(0)).contiguous();
@@ -321,6 +332,158 @@ impl CentroidDecompressor {
             passage_ids: pids_tensor,
             scores: scores_tensor,
             offsets: offsets_tensor,
+        })
+    }
+
+    fn decompress_centroids_cuda_ops(
+        &self,
+        begins: &Tensor,
+        capacities: &Tensor,
+        centroid_scores: &Tensor,
+        index: &Arc<ReadOnlyIndex>,
+        query_embeddings: &Tensor, // [num_tokens, dim]
+        nprobe: usize,
+    ) -> Result<DecompressedCentroidsOutput> {
+        let device = query_embeddings.device();
+        anyhow::ensure!(
+            device.is_cuda(),
+            "CUDA decompression requested but query is on {:?}",
+            device
+        );
+        anyhow::ensure!(nprobe > 0, "nprobe must be greater than zero");
+
+        let capacities_i64 = capacities.to_kind(Kind::Int64);
+        let num_cells = capacities_i64.size()[0];
+        let total_capacity = capacities_i64.sum(Kind::Int64).int64_value(&[]).max(0);
+
+        // Sizes are used to define per-cell ranges for downstream merge logic.
+        // We keep the contract by returning sizes == capacities (no per-cell dedup here).
+        let sizes = capacities_i64.to_kind(Kind::Int);
+
+        let end_offsets = capacities_i64.cumsum(0, Kind::Int64);
+        let offsets = Tensor::zeros(&[num_cells + 1], (Kind::Int64, device));
+        offsets
+            .narrow(0, 1, num_cells)
+            .copy_(&end_offsets.contiguous());
+
+        if total_capacity == 0 {
+            return Ok(DecompressedCentroidsOutput {
+                capacities: capacities.shallow_clone(),
+                sizes,
+                passage_ids: Tensor::zeros(&[0], (Kind::Int64, device)),
+                scores: Tensor::zeros(&[0], (Kind::Float, device)),
+                offsets,
+            });
+        }
+
+        let start_offsets = &end_offsets - &capacities_i64;
+        let ranges = Tensor::arange(total_capacity, (Kind::Int64, device));
+
+        let cell_ids = Tensor::arange(num_cells, (Kind::Int64, device));
+        let candidate_cells =
+            cell_ids.repeat_interleave_self_tensor(&capacities_i64, 0, Some(total_capacity));
+
+        let candidate_cell_starts =
+            start_offsets.repeat_interleave_self_tensor(&capacities_i64, 0, Some(total_capacity));
+        let candidate_begins =
+            begins
+                .to_kind(Kind::Int64)
+                .repeat_interleave_self_tensor(&capacities_i64, 0, Some(total_capacity));
+
+        let intra = &ranges - &candidate_cell_starts;
+        let embedding_indices = &candidate_begins + &intra;
+
+        let passage_ids = index
+            .codes_compacted
+            .index_select(0, &embedding_indices)
+            .to_kind(Kind::Int64);
+
+        let residuals = index
+            .residuals_compacted
+            .index_select(0, &embedding_indices)
+            .to_kind(Kind::Uint8);
+
+        let packed_vals_per_byte = (8u8 / self.nbits) as i64;
+        let packed_dim = residuals.size()[1];
+        let dim = query_embeddings.size()[1];
+        anyhow::ensure!(
+            packed_dim * packed_vals_per_byte == dim,
+            "Residual shape mismatch: packed_dim={} implies dim={}, but query dim={}",
+            packed_dim,
+            packed_dim * packed_vals_per_byte,
+            dim
+        );
+
+        // Reverse bit order within each n-bit segment.
+        let residuals = if self.nbits == 2 {
+            let odd_bits = residuals
+                .bitwise_and(0xAA)
+                .bitwise_right_shift_tensor_scalar(1);
+            let even_bits = residuals
+                .bitwise_and(0x55)
+                .bitwise_left_shift_tensor_scalar(1);
+            odd_bits.bitwise_or_tensor(&even_bits)
+        } else {
+            // nbits == 4
+            let swapped = {
+                let odd_bits = residuals
+                    .bitwise_and(0xAA)
+                    .bitwise_right_shift_tensor_scalar(1);
+                let even_bits = residuals
+                    .bitwise_and(0x55)
+                    .bitwise_left_shift_tensor_scalar(1);
+                odd_bits.bitwise_or_tensor(&even_bits)
+            };
+            let hi_pairs = swapped
+                .bitwise_and(0xCC)
+                .bitwise_right_shift_tensor_scalar(2);
+            let lo_pairs = swapped
+                .bitwise_and(0x33)
+                .bitwise_left_shift_tensor_scalar(2);
+            hi_pairs.bitwise_or_tensor(&lo_pairs)
+        };
+
+        let codes = if self.nbits == 2 {
+            let c0 = residuals.bitwise_right_shift_tensor_scalar(6);
+            let c1 = residuals
+                .bitwise_right_shift_tensor_scalar(4)
+                .bitwise_and(0x03);
+            let c2 = residuals
+                .bitwise_right_shift_tensor_scalar(2)
+                .bitwise_and(0x03);
+            let c3 = residuals.bitwise_and(0x03);
+            Tensor::stack(&[c0, c1, c2, c3], -1).view([total_capacity, dim])
+        } else {
+            // nbits == 4
+            let hi = residuals.bitwise_right_shift_tensor_scalar(4);
+            let lo = residuals.bitwise_and(0x0F);
+            Tensor::stack(&[hi, lo], -1).view([total_capacity, dim])
+        };
+
+        let token_indices = candidate_cells.divide_scalar_mode(nprobe as i64, "trunc");
+
+        let bucket_weights = index.bucket_weights.to_kind(Kind::Float);
+        let query = query_embeddings.to_kind(Kind::Float);
+
+        let query_per_candidate = query.index_select(0, &token_indices);
+        let codes_flat = codes.to_kind(Kind::Int64).view([-1]);
+        let weights_flat = bucket_weights.index_select(0, &codes_flat);
+        let weights = weights_flat.view([total_capacity, dim]);
+
+        let sum_dim = [1i64];
+        let residual_scores =
+            (&query_per_candidate * &weights).sum_dim_intlist(&sum_dim[..], false, Kind::Float);
+
+        let centroid_scores_f = centroid_scores.to_kind(Kind::Float);
+        let centroid_per_candidate = centroid_scores_f.index_select(0, &candidate_cells);
+        let scores = centroid_per_candidate + residual_scores;
+
+        Ok(DecompressedCentroidsOutput {
+            capacities: capacities.shallow_clone(),
+            sizes,
+            passage_ids,
+            scores,
+            offsets,
         })
     }
 
