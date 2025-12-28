@@ -58,13 +58,9 @@ pub struct SearchConfig {
     #[pyo3(get, set)]
     pub k: usize,
 
-    /// Device to run centroid selection/matmul on
+    /// Device to use for the search
     #[pyo3(get, set)]
-    pub selector_device: String,
-
-    /// Device to run decompression/merge on
-    #[pyo3(get, set)]
-    pub decompress_device: String,
+    pub device: String,
 
     /// Dtype to use for the search
     #[pyo3(get, set)]
@@ -106,8 +102,7 @@ impl SearchConfig {
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         k,
-        selector_device,
-        decompress_device,
+        device,
         dtype=None,
         nprobe=None,
         t_prime=None,
@@ -119,8 +114,7 @@ impl SearchConfig {
     ))]
     fn new(
         k: usize,
-        selector_device: String,
-        decompress_device: String,
+        device: String,
         dtype: Option<String>,
         nprobe: Option<u32>,
         t_prime: Option<usize>,
@@ -132,8 +126,7 @@ impl SearchConfig {
     ) -> Self {
         Self {
             k,
-            selector_device: selector_device,
-            decompress_device: decompress_device,
+            device: device,
             dtype: dtype.unwrap_or("float32".to_string()),
             nprobe: nprobe.unwrap_or(4),
             t_prime,
@@ -150,8 +143,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             k: 100,
-            selector_device: "cpu".to_string(),
-            decompress_device: "cpu".to_string(),
+            device: "cpu".to_string(),
             dtype: "float32".to_string(),
             nprobe: 4,
             t_prime: None,

@@ -160,8 +160,7 @@ class XTRWarp:
         self.dtype: str | None = None
         self._torch_initialized = {}
         self._metadata: dict | None = None
-        self.selector_device: str | None = None
-        self.decompress_device: str | None = None
+        self.device: str | None = None
 
     def _ensure_torch_initialized(self, device: str) -> str:
         """Initialize torch once per device type."""
@@ -307,7 +306,6 @@ class XTRWarp:
     def load(
         self,
         device: str | list[str] = "auto",
-        decompress_device: str = "cpu",
         dtype: torch.dtype = torch.float32,
     ) -> "XTRWarp":
         """Load an index to a specific device with the specified precision.
@@ -337,33 +335,20 @@ class XTRWarp:
         self.devices = devices
 
         if device == "auto":
-            self.selector_device = (
+            inferred_device = (
                 "cuda"
                 if torch.cuda.is_available()
                 else "mps"
                 if torch.backends.mps.is_available()
                 else "cpu"
             )
-            self.decompress_device = decompress_device
-            self.devices = [self.decompress_device]
-            _ = self._ensure_torch_initialized(self.selector_device)
-        elif isinstance(device, list):
-            self.selector_device = devices[0]
-            self.decompress_device = devices[0]
-            self.devices = devices
+            self.devices = [inferred_device]
         else:
-            self.selector_device = device
-            self.decompress_device = decompress_device
-            # Keep the loaded searcher on the decompression device (e.g., cuda for speed).
-            self.devices = [self.decompress_device]
+            self.devices = devices
 
         self._loaded_searchers = []
-        # Ensure torch is initialized on both selector and decompression devices if they differ.
-        _ = self._ensure_torch_initialized(self.selector_device)
-        if self.decompress_device != self.selector_device:
-            _ = self._ensure_torch_initialized(self.decompress_device)
-
         for d in self.devices:
+            _ = self._ensure_torch_initialized(d)
             searcher = xtr_warp_rust.LoadedSearcher(self.index, d, dtype_str)
             searcher.load()
             self._loaded_searchers.append(searcher)
@@ -453,12 +438,7 @@ class XTRWarp:
             Threshold for centroid scores.
 
         """
-        if (
-            self._loaded_searchers is None
-            or self.devices is None
-            or self.selector_device is None
-            or self.decompress_device is None
-        ):
+        if self._loaded_searchers is None or self.devices is None:
             error = "Index not loaded, call load() first"
             raise RuntimeError(error)
 
@@ -478,13 +458,10 @@ class XTRWarp:
             error = f"Expected 2D or 3D tensor, got {queries_embeddings.dim()}D tensor"
             raise ValueError(error)
 
-        if self.decompress_device != "cpu":
-            if queries_embeddings.device.type != self.decompress_device.split(":")[0]:
-                queries_embeddings = queries_embeddings.to(self.decompress_device)
-        else:
-            # Ensure queries are on CPU when decompression runs on CPU to avoid device mismatch.
-            if queries_embeddings.is_cuda:
-                queries_embeddings = queries_embeddings.to("cpu")
+        device = self.devices[0].split(":")[0]
+
+        if device != queries_embeddings.device.type:
+            queries_embeddings = queries_embeddings.to(device)
 
         optimized = self.optimize_hyperparams(top_k, queries_embeddings)
 
@@ -507,8 +484,7 @@ class XTRWarp:
 
         search_config = xtr_warp_rust.SearchConfig(
             k=top_k,
-            selector_device=self.selector_device,
-            decompress_device=self.decompress_device,
+            device=device,
             dtype=self.dtype,
             nprobe=nprobe,
             t_prime=t_prime,
@@ -518,7 +494,7 @@ class XTRWarp:
             max_codes_per_centroid=None,
             max_candidates=max_candidates,
         )
-        torch_path = self._ensure_torch_initialized(self.selector_device)
+        torch_path = self._ensure_torch_initialized(device)
         if len(self.devices) == 1:
             scores = search_on_device(
                 torch_path=torch_path,
