@@ -11,7 +11,7 @@ use std::sync::Arc;
 pub use centroid_selector::CentroidSelector;
 pub use decompressor::CentroidDecompressor;
 pub use loader::IndexLoader;
-pub use merger::{ResultMerger, ScoreCombination};
+pub use merger::ResultMerger;
 pub use scorer::WARPScorer;
 
 use anyhow::Result;
