@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use rand::prelude::SliceRandom;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
