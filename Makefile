@@ -39,4 +39,5 @@ build:
 	LIBTORCH_USE_PYTORCH=1 \
 	LIBTORCH_BYPASS_VERSION_CHECK=1 \
 	LD_LIBRARY_PATH="$${LIBTORCH}/lib:$${LD_LIBRARY_PATH}" \
+	CXXFLAGS="-w" \
 	maturin develop --release
