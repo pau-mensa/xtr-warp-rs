@@ -45,7 +45,7 @@ std::pair<torch::Tensor, torch::Tensor> gpu_merge_impl(
   // Token index per cell, repeated per candidate
   const auto num_cells = sizes.size(0);
   auto token_indices = torch::arange(num_cells, torch::TensorOptions().device(device).dtype(torch::kInt64));
-  token_indices = token_indices / nprobe;
+  token_indices = torch::div(token_indices, nprobe, /*rounding_mode=*/"trunc");
   auto candidate_tokens = torch::repeat_interleave(token_indices, sizes, /*dim=*/0);
   const auto num_tokens = (num_cells + nprobe - 1) / nprobe;
 
