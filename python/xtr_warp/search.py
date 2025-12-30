@@ -157,7 +157,7 @@ class XTRWarp:
         self._loaded_searchers: list | None = None
         self.index: str = index
         self.devices: list | None = None
-        self.dtype: str | None = None
+        self.dtype: torch.dtype | None = None
         self._torch_initialized = {}
         self._metadata: dict | None = None
         self.device: str | None = None
@@ -329,7 +329,7 @@ class XTRWarp:
 
         devices = [device] if isinstance(device, str) else device
         dtype_str = str(dtype).split(".")[1]
-        self.dtype = dtype_str
+        self.dtype = dtype
 
         _ = self._load_metadata()
         self.devices = devices
@@ -477,6 +477,9 @@ class XTRWarp:
         if device != queries_embeddings.device.type:
             queries_embeddings = queries_embeddings.to(device)
 
+        if self.dtype != queries_embeddings.dtype:
+            queries_embeddings = queries_embeddings.to(self.dtype)
+
         optimized = self.optimize_hyperparams(top_k, queries_embeddings)
 
         if optimized is None:
@@ -499,7 +502,7 @@ class XTRWarp:
         search_config = xtr_warp_rust.SearchConfig(
             k=top_k,
             device=device,
-            dtype=self.dtype,
+            dtype=str(self.dtype).split(".")[1],
             nprobe=nprobe,
             t_prime=t_prime,
             bound=bound,
