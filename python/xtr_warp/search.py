@@ -486,7 +486,7 @@ class XTRWarp:
             err = "Index metadata could not be accessed"
             raise RuntimeError(err)
 
-        print(
+        logger.debug(
             f"Bound: {optimized[0]}, nprobe: {optimized[1]}, centroid score threshold: {optimized[2]}, max candidates: {optimized[3]}"
         )
 
