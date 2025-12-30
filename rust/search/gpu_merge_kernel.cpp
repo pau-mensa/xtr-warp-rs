@@ -16,8 +16,6 @@ extern thread_local char *torch_last_err;
 
 namespace {
 
-constexpr int64_t kNumTokens = 32;
-
 // Flat reduction: max per (pid, token), then sum with MSE fill.
 std::pair<torch::Tensor, torch::Tensor> gpu_merge_impl(
     const torch::Tensor &candidate_sizes,
@@ -49,9 +47,10 @@ std::pair<torch::Tensor, torch::Tensor> gpu_merge_impl(
   auto token_indices = torch::arange(num_cells, torch::TensorOptions().device(device).dtype(torch::kInt64));
   token_indices = token_indices / nprobe;
   auto candidate_tokens = torch::repeat_interleave(token_indices, sizes, /*dim=*/0);
+  const auto num_tokens = (num_cells + nprobe - 1) / nprobe;
 
   // Flatten token+pid into a combined id to compactly deduplicate
-  auto combined_ids = pids * kNumTokens + candidate_tokens;
+  auto combined_ids = pids * num_tokens + candidate_tokens;
   auto sort_result = combined_ids.sort(0);
   auto sorted_ids = std::get<0>(sort_result);
   auto sort_idx = std::get<1>(sort_result);
@@ -67,16 +66,16 @@ std::pair<torch::Tensor, torch::Tensor> gpu_merge_impl(
   auto max_per_id = torch::index_reduce(max_init, 0, inverse, sorted_scores, "amax", /*include_self=*/true);
 
   // Split combined id back into pid and token
-  auto pid = torch::div(unique_ids, kNumTokens, /*rounding_mode=*/"trunc");
-  auto token = unique_ids - pid * kNumTokens;
+  auto pid = torch::div(unique_ids, num_tokens, /*rounding_mode=*/"trunc");
+  auto token = unique_ids - pid * num_tokens;
   token = token.to(torch::kInt64);
 
-  // Prepare MSE vector (pad to kNumTokens if needed)
-  if (mse.size(0) < kNumTokens) {
-    auto pad = torch::zeros({kNumTokens - mse.size(0)}, mse.options());
+  // Prepare MSE vector (pad to num_tokens if needed)
+  if (mse.size(0) < num_tokens) {
+    auto pad = torch::zeros({num_tokens - mse.size(0)}, mse.options());
     mse = torch::cat({mse, pad}, 0);
   }
-  mse = mse.narrow(0, 0, kNumTokens);
+  mse = mse.narrow(0, 0, num_tokens);
 
   auto sum_mse = mse.sum();
   auto mse_for_tokens = mse.index({token});
