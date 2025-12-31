@@ -357,21 +357,21 @@ class XTRWarp:
 
     def optimize_hyperparams(
         self, top_k: int, queries_embeddings: torch.Tensor
-    ) -> tuple[int, int, float, int] | None:
+    ) -> tuple[int, int, float, int, int] | None:
         """Optimize the search hyperparams based on search config and index density."""
         if self._metadata is None:
             return None
 
-        density = self._metadata.get("num_embeddings", 0) / max(
-            1, self._metadata.get("num_partitions", 1)
-        )
+        num_embeddings = self._metadata["num_embeddings"]
+        num_partitions = self._metadata["num_partitions"]
         num_tokens = queries_embeddings.size(1)
-        num_partitions = self._metadata.get("num_partitions", 128)
+
+        density = num_embeddings / max(1, num_partitions)
 
         def _clamp(v: float, low: int, high: int) -> int:
             return max(low, min(int(v), high))
 
-        # Probe more aggressively on denser indices even for small top_k
+        # Probe more aggressively on denser indices
         if top_k <= 20:
             base_probe = 2
         elif top_k <= 100:
@@ -383,6 +383,11 @@ class XTRWarp:
             math.log10(max(1.0, density))
         )  # 0 for sparse, +1 per order of magnitude
         nprobe = _clamp(base_probe + density_boost, 2, min(32, num_partitions))
+
+        # Very large partition counts (e.g. 65k) tend to need more probing to keep
+        # NDCG stable on long-query datasets
+        if num_partitions >= 65536 and num_tokens >= 48:
+            nprobe = max(nprobe, 12)
 
         # Bound controls how many centroids we score before pruning
         bound = max(nprobe * 8, int(0.05 * num_partitions))
@@ -397,12 +402,17 @@ class XTRWarp:
         est_candidates = density * max(1, nprobe) * max(1, num_tokens) * 1.5
         max_candidates = int(est_candidates)
         max_candidates = max(max_candidates, top_k * 50)
-        max_candidates = min(
-            max_candidates,
-            self._metadata.get("num_embeddings", max_candidates),
-        )
+        max_candidates = (
+            min(max_candidates, num_embeddings) // 4
+        )  # TODO this needs to be tested
 
-        return bound, nprobe, centroid_score_threshold, max_candidates
+        # t_prime controls how aggressively we estimate and correct quantization error
+        # we need to bump this up for dense/long-queries
+        t_prime = int(density * max(1, nprobe) * max(1, num_tokens // 2))
+        t_prime = _clamp(t_prime, 5_000, 200_000)
+        t_prime = min(t_prime, num_embeddings)
+
+        return bound, nprobe, centroid_score_threshold, max_candidates, t_prime
 
     def search(
         self,
@@ -486,10 +496,6 @@ class XTRWarp:
             err = "Index metadata could not be accessed"
             raise RuntimeError(err)
 
-        logger.debug(
-            f"Bound: {optimized[0]}, nprobe: {optimized[1]}, centroid score threshold: {optimized[2]}, max candidates: {optimized[3]}"
-        )
-
         if bound is None:
             bound = optimized[0]
         if nprobe is None:
@@ -498,6 +504,17 @@ class XTRWarp:
             centroid_score_threshold = optimized[2]
         if max_candidates is None:
             max_candidates = optimized[3]
+        if t_prime is None:
+            t_prime = optimized[4]
+
+        logger.warning(
+            "Search hyperparams - bound=%s nprobe=%s centroid_score_threshold=%s max_candidates=%s t_prime=%s",
+            bound,
+            nprobe,
+            centroid_score_threshold,
+            max_candidates,
+            t_prime,
+        )
 
         search_config = xtr_warp_rust.SearchConfig(
             k=top_k,

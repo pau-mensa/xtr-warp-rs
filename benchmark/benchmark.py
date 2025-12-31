@@ -177,14 +177,16 @@ def run_xtr_warp(
     index_monitor.start()
 
     start_index = time.time()
-    index.create(
-        documents_embeddings=documents_embeddings,
-        kmeans_niters=4,
-        max_points_per_centroid=256,
-        nbits=4,
-        seed=42,
-        device=config["device"],
-    )
+    if config["device"] == "cuda":
+        pass
+        # index.create(
+        #    documents_embeddings=documents_embeddings,
+        #    kmeans_niters=4,
+        #    max_points_per_centroid=256,
+        #    nbits=4,
+        #    seed=42,
+        #    device=config["device"],
+        # )
     end_index = time.time()
 
     index_memory = index_monitor.stop()
@@ -208,7 +210,10 @@ def run_xtr_warp(
         queries_embeddings=queries_embeddings,
         top_k=config["top_k"],
         num_threads=config["num_threads"],
-        batch_size=1000000,
+        # batch_size=1000,
+        # max_candidates=64_000,
+        # nprobe=8,
+        # t_prime=1000,
     )
     end_search = time.time()
     search_time = end_search - start_search
@@ -219,16 +224,20 @@ def run_xtr_warp(
     )
 
     large_queries_embeddings = torch.cat(
-        ([queries_embeddings] * ((1000 // queries_embeddings.shape[0]) + 1))[:1000]
-    )
+        ([queries_embeddings] * ((1000 // queries_embeddings.shape[0]) + 1))[:10]
+    )[:100]
 
-    print(f"🔍 1000 queries on {dataset_name} - {large_queries_embeddings.shape}...")
+    print(
+        f"🔍 {large_queries_embeddings.shape[0]} queries on {dataset_name} - {large_queries_embeddings.shape}..."
+    )
     start_search = time.time()
     _ = index.search(
         queries_embeddings=large_queries_embeddings,
         top_k=config["top_k"],
         num_threads=config["num_threads"],
-        batch_size=1000000,
+        # batch_size=1000,
+        # max_candidates=64_000,
+        # nprobe=8,
     )
     end_search = time.time()
     heavy_search_time = end_search - start_search
@@ -423,7 +432,8 @@ def run_fast_plaid(
     index_monitor.start()
 
     start_index = time.time()
-    index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+    if config["device"] == "cuda":
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
     end_index = time.time()
 
     index_memory = index_monitor.stop()
@@ -457,7 +467,7 @@ def run_fast_plaid(
         ([queries_embeddings] * ((1000 // queries_embeddings.shape[0]) + 1))[:1000]
     )
 
-    print(f"🔍 1000 queries on {dataset_name}...")
+    print(f"🔍 {queries_embeddings.shape[0]} queries on {dataset_name}...")
     start_search = time.time()
     _ = index.search(
         queries_embeddings=large_queries_embeddings,
