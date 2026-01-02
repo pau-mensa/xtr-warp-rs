@@ -3,14 +3,18 @@
 import subprocess
 import sys
 import time
-from pathlib import Path
 from datetime import datetime, timedelta
+from pathlib import Path
 
 DATASETS = [
     "scifact",
     "nfcorpus",
     "arguana",
     "quora",
+    "scidocs",
+    "fiqa",
+    "trec-covid",
+    "webis-touche2020",
 ]
 
 
