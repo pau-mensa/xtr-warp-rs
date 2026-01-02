@@ -1,11 +1,11 @@
 [package]
-name = "xtr_warp_rust"
+name = "xtr_warp_rs"
 version = "0.0.1"
 edition = "2021"
 build = "build.rs"
 
 [lib]
-name = "xtr_warp_rust"
+name = "xtr_warp_rs"
 crate-type = ["cdylib"]
 path = "rust/lib.rs"
 

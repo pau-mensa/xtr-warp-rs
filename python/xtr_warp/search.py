@@ -11,9 +11,8 @@ from typing import Literal
 import torch
 import torch.multiprocessing as mp
 from fastkmeans import FastKMeans
-from joblib import Parallel, delayed
 
-from . import xtr_warp_rust
+from . import xtr_warp_rs
 
 # from ..filtering import create, delete, update
 #
@@ -167,7 +166,7 @@ class XTRWarp:
         device_type = device.split(":")[0]  # 'cuda:0' -> 'cuda'
         if device_type not in self._torch_initialized:
             torch_path = _load_torch_path(device=device_type)
-            xtr_warp_rust.initialize_torch(torch_path)
+            xtr_warp_rs.initialize_torch(torch_path)
             self._torch_initialized[device_type] = torch_path
         return self._torch_initialized[device_type]
 
@@ -243,7 +242,7 @@ class XTRWarp:
             use_triton_kmeans=use_triton_kmeans,
         )
 
-        xtr_warp_rust.create(
+        xtr_warp_rs.create(
             index=self.index,
             torch_path=torch_path,
             device=device,
@@ -349,7 +348,7 @@ class XTRWarp:
         self._loaded_searchers = []
         for d in self.devices:
             _ = self._ensure_torch_initialized(d)
-            searcher = xtr_warp_rust.LoadedSearcher(self.index, d, dtype_str)
+            searcher = xtr_warp_rs.LoadedSearcher(self.index, d, dtype_str)
             searcher.load()
             self._loaded_searchers.append(searcher)
 
@@ -528,7 +527,7 @@ class XTRWarp:
             t_prime,
         )
 
-        search_config = xtr_warp_rust.SearchConfig(
+        search_config = xtr_warp_rs.SearchConfig(
             k=top_k,
             device=device,
             dtype=str(self.dtype).split(".")[1],

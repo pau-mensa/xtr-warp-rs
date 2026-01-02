@@ -324,7 +324,7 @@ fn load_and_search(
 /// along with the necessary data classes `SearchParameters` and `QueryResult`
 /// to interact with the library from Python.
 #[pymodule]
-#[pyo3(name = "xtr_warp_rust")]
+#[pyo3(name = "xtr_warp_rs")]
 fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SearchConfig>()?;
     m.add_class::<SearchResult>()?;
