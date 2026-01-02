@@ -1,16 +1,24 @@
-.PHONY: install-gpu install clean
+.PHONY: install-gpu install clean build test
+
+# Note: Due to PyTorch + Rust binding requirements, tests must be run with 'make test'
+# rather than 'uv run pytest' to ensure proper environment variables are set.
+# The chain is: make clean && make install-gpu && make build && make test
 
 install-gpu:
 	@echo "Installing..."
 	cargo clean
 	uv venv
 	uv pip install numpy
-	uv pip install torch==2.8.0 #--index-url https://download.pytorch.org/whl/cu130
-	LIBTORCH=$$(uv run python -c "import torch; import os; print(os.path.dirname(torch.__file__))") \
-	LIBTORCH_USE_PYTORCH=1 \
-	LIBTORCH_BYPASS_VERSION_CHECK=1 \
-	LD_LIBRARY_PATH="$${LIBTORCH}/lib:$${LD_LIBRARY_PATH}" \
-	uv pip install -e ".[dev]"
+	uv pip install torch --index-url https://download.pytorch.org/whl/cu130
+	uv pip install maturin pytest-cov pytest ruff pre-commit beir ranx fastkmeans joblib setuptools
+	@echo "Building with maturin..."
+	@. .venv/bin/activate && \
+	export LIBTORCH=$$(python -c "import torch; import os; print(os.path.dirname(torch.__file__))") && \
+	export LIBTORCH_USE_PYTORCH=1 && \
+	export LIBTORCH_BYPASS_VERSION_CHECK=1 && \
+	export LD_LIBRARY_PATH="$${LIBTORCH}/lib:$${LD_LIBRARY_PATH}" && \
+	export CXXFLAGS="-w" && \
+	maturin develop --release
 
 install:
 	@echo "Installing..."
@@ -18,11 +26,15 @@ install:
 	uv venv
 	uv pip install numpy
 	uv pip install torch --index-url https://download.pytorch.org/whl/cpu
-	LIBTORCH=$$(uv run python -c "import torch; import os; print(os.path.dirname(torch.__file__))") \
-	LIBTORCH_USE_PYTORCH=1 \
-	LIBTORCH_BYPASS_VERSION_CHECK=1 \
-	LD_LIBRARY_PATH="$${LIBTORCH}/lib:$${LD_LIBRARY_PATH}" \
-	uv pip install -e ".[dev]"
+	uv pip install maturin pytest-cov pytest ruff pre-commit beir ranx fastkmeans joblib setuptools
+	@echo "Building with maturin..."
+	@. .venv/bin/activate && \
+	export LIBTORCH=$$(python -c "import torch; import os; print(os.path.dirname(torch.__file__))") && \
+	export LIBTORCH_USE_PYTORCH=1 && \
+	export LIBTORCH_BYPASS_VERSION_CHECK=1 && \
+	export LD_LIBRARY_PATH="$${LIBTORCH}/lib:$${LD_LIBRARY_PATH}" && \
+	export CXXFLAGS="-w" && \
+	maturin develop --release
 
 clean:
 	cargo clean
@@ -35,9 +47,18 @@ clean:
 	find . -type f -name "*.pyc" -delete
 
 build:
-	LIBTORCH=$$(uv run python -c "import torch; import os; print(os.path.dirname(torch.__file__))") \
-	LIBTORCH_USE_PYTORCH=1 \
-	LIBTORCH_BYPASS_VERSION_CHECK=1 \
-	LD_LIBRARY_PATH="$${LIBTORCH}/lib:$${LD_LIBRARY_PATH}" \
-	CXXFLAGS="-w" \
+	@. .venv/bin/activate && \
+	export LIBTORCH=$$(python -c "import torch; import os; print(os.path.dirname(torch.__file__))") && \
+	export LIBTORCH_USE_PYTORCH=1 && \
+	export LIBTORCH_BYPASS_VERSION_CHECK=1 && \
+	export LD_LIBRARY_PATH="$${LIBTORCH}/lib:$${LD_LIBRARY_PATH}" && \
+	export CXXFLAGS="-w" && \
 	maturin develop --release
+
+test:
+	@. .venv/bin/activate && \
+	export LIBTORCH=$$(python -c "import torch; import os; print(os.path.dirname(torch.__file__))") && \
+	export LIBTORCH_USE_PYTORCH=1 && \
+	export LIBTORCH_BYPASS_VERSION_CHECK=1 && \
+	export LD_LIBRARY_PATH="$${LIBTORCH}/lib:$${LD_LIBRARY_PATH}" && \
+	pytest tests/test.py
