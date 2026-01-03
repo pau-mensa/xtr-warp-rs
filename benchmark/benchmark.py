@@ -178,15 +178,14 @@ def run_xtr_warp(
 
     start_index = time.time()
     if config["device"] == "cuda":
-        pass
-        # index.create(
-        #    documents_embeddings=documents_embeddings,
-        #    kmeans_niters=4,
-        #    max_points_per_centroid=256,
-        #    nbits=4,
-        #    seed=42,
-        #    device=config["device"],
-        # )
+        index.create(
+            documents_embeddings=documents_embeddings,
+            kmeans_niters=4,
+            max_points_per_centroid=256,
+            nbits=4,
+            seed=42,
+            device=config["device"],
+        )
     end_index = time.time()
 
     index_memory = index_monitor.stop()
@@ -209,11 +208,8 @@ def run_xtr_warp(
     scores = index.search(
         queries_embeddings=queries_embeddings,
         top_k=config["top_k"],
-        num_threads=config["num_threads"],
-        # batch_size=1000,
-        # max_candidates=64_000,
-        # nprobe=8,
-        # t_prime=1000,
+        num_threads=config.get("num_threads", 1),
+        batch_size=4096,
     )
     end_search = time.time()
     search_time = end_search - start_search
@@ -224,7 +220,7 @@ def run_xtr_warp(
     )
 
     large_queries_embeddings = torch.cat(
-        ([queries_embeddings] * ((1000 // queries_embeddings.shape[0]) + 1))[:10]
+        ([queries_embeddings] * ((1000 // queries_embeddings.shape[0]) + 1))[:1000]
     )[:100]
 
     print(
@@ -234,10 +230,7 @@ def run_xtr_warp(
     _ = index.search(
         queries_embeddings=large_queries_embeddings,
         top_k=config["top_k"],
-        num_threads=config["num_threads"],
-        # batch_size=1000,
-        # max_candidates=64_000,
-        # nprobe=8,
+        num_threads=config.get("num_threads", 1),
     )
     end_search = time.time()
     heavy_search_time = end_search - start_search
@@ -630,9 +623,11 @@ def main():
 
     if docs_emb_path.exists() and queries_emb_path.exists():
         print(f"📂 Loading cached embeddings from {embeddings_dir}")
+        # documents_embeddings = np.array([[]]) # placeholder for vram issues
         documents_embeddings = torch.load(docs_emb_path)
         queries_embeddings = torch.load(queries_emb_path)
         if args.n_docs is not None:
+            # documents_embeddings = np.array([[]]) # placeholder for vram issues
             documents_embeddings = documents_embeddings[: args.n_docs]
         if args.n_queries is not None:
             queries_embeddings = queries_embeddings[: args.n_queries]

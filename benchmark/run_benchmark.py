@@ -1,4 +1,13 @@
-#!/usr/bin/env python3
+# /// script
+# dependencies = [
+#    "pylate>=1.3.3",
+#    "beir>=2.2.0",
+#    "fast_plaid",
+#    "ranx",
+#    "psutil",
+#    "pyyaml"
+# ]
+# ///
 
 import subprocess
 import sys
