@@ -172,7 +172,7 @@ fn train_residual_codec(
         device,
     )?;
 
-    let heldout_codes = compress_into_codes(&heldout_samples, &initial_codec.centroids); //TODO need to understand if this is giving a centroid per token or a centroid per dimension (per dimension would make more sense)
+    let heldout_codes = compress_into_codes(&heldout_samples, &initial_codec.centroids);
 
     let mut recon_embs_vec = Vec::new();
     for code_batch_idxs in heldout_codes.split((1 << 20) as i64, 0) {

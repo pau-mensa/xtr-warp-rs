@@ -6,8 +6,6 @@ use torch_sys::C_tensor;
 
 use crate::utils::types::{PassageId, Score};
 
-//TODO num tokens can't be hardcoded to 32
-
 extern "C" {
     fn xtr_warp_gpu_merge(
         candidate_sizes: *const C_tensor,
