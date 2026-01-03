@@ -89,8 +89,8 @@ The output will be a list of lists, where each inner list contains tuples of (do
 
 ### CUDA Performance
 
-| Dataset (Size) | Metric | fast-plaid (CUDA) | xtr-warp-rs (CUDA) |
-|----------------|--------|-------------------|--------------------|
+| Dataset (Size) | Metric | fast-plaid | xtr-warp-rs |
+|----------------|--------|------------|-------------|
 | arguana (8,674) | qps | 110.26 | 1008.69 (+814.8%) |
 |  | indexing | 1.67s | 15.27s |
 |  | ndcg@10 | 0.47 | 0.49 |
@@ -126,8 +126,8 @@ The output will be a list of lists, where each inner list contains tuples of (do
 
 ### CPU Performance
 
-| Dataset (Size) | QPS fast-plaid (CPU) | QPS xtr-warp (Single) | QPS xtr-warp-rs (Multi) |
-|----------------|----------------------|-----------------------|-------------------------|
+| Dataset (Size) | QPS fast-plaid | QPS xtr-warp (Single) | QPS xtr-warp-rs (Multi) |
+|----------------|----------------|-----------------------|-------------------------|
 | arguana (8,674) | 4.79 | 82.93 (+1631.3%) | 247.93 (+5076.0%) |
 | fiqa (57,638) | 4.78 | 77.86 (+1528.9%) | 202.74 (+4141.4%) |
 | nfcorpus (3,633) | 6.69 | 109.74 (+1540.4%) | 482.13 (+7106.7%) |
