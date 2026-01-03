@@ -210,6 +210,11 @@ def run_xtr_warp(
         top_k=config["top_k"],
         num_threads=config.get("num_threads", 1),
         batch_size=4096,
+        nprobe=config.get("nprobe"),
+        bound=config.get("bound"),
+        t_prime=config.get("t_prime"),
+        max_candidates=config.get("max_candidates"),
+        centroid_score_threshold=config.get("centroid_score_threshold"),
     )
     end_search = time.time()
     search_time = end_search - start_search
@@ -231,6 +236,11 @@ def run_xtr_warp(
         queries_embeddings=large_queries_embeddings,
         top_k=config["top_k"],
         num_threads=config.get("num_threads", 1),
+        nprobe=config.get("nprobe"),
+        bound=config.get("bound"),
+        t_prime=config.get("t_prime"),
+        max_candidates=config.get("max_candidates"),
+        centroid_score_threshold=config.get("centroid_score_threshold"),
     )
     end_search = time.time()
     heavy_search_time = end_search - start_search
@@ -446,7 +456,8 @@ def run_fast_plaid(
     scores = index.search(
         queries_embeddings=queries_embeddings,
         top_k=config["top_k"],
-        n_ivf_probe=config["n_ivf_probe"],
+        n_ivf_probe=config.get("n_ivf_probe", 8),
+        n_full_scores=config.get("n_full_scores", 4096),
     )
     end_search = time.time()
     search_time = end_search - start_search

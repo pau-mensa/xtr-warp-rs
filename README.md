@@ -142,6 +142,10 @@ The output will be a list of lists, where each inner list contains tuples of (do
 > [!NOTE]  
 > These benchmarks were run on an NVIDIA 5090 with an AMD Ryzen 9950 CPU. Due to VRAM constraints, the `webis-touche2020` dataset had to be limited to 300k documents instead of the 380k original ones.
 
+### Reproducibility
+
+Check the [docs](benchmark/README.md) on how to run the benchmark scripts in order to reproduce the results.
+
 ## Usage
 
 ### Automatic Hyperparameter Optimization
