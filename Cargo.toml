@@ -1,11 +1,11 @@
 [package]
-name = "xtr_warp_rust"
+name = "xtr_warp_rs"
 version = "0.0.1"
 edition = "2021"
 build = "build.rs"
 
 [lib]
-name = "xtr_warp_rust"
+name = "xtr_warp_rs"
 crate-type = ["cdylib"]
 path = "rust/lib.rs"
 
@@ -42,3 +42,9 @@ opt-level = 3
 
 [profile.release]
 opt-level = 3
+
+[build-dependencies]
+cc = "1.0"
+
+[dependencies.torch-sys]
+version = "0.20.0"

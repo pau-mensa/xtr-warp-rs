@@ -1,47 +1,23 @@
 use anyhow::Result;
-use ndarray::Array1;
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use tch::{no_grad, Device, Tensor};
+use std::ptr;
+use tch::{no_grad, Device, Kind, Tensor};
+use torch_sys::C_tensor;
 
 use crate::utils::types::{PassageId, Score};
 
-/// Represents a scored candidate document
-#[derive(Debug, Clone)]
-pub struct ScoredCandidate {
-    /// Passage/document ID
-    pub pid: PassageId,
-
-    /// Score for this candidate
-    pub score: Score,
-
-    /// Source centroid index (for debugging/tracing)
-    pub centroid_id: Option<u32>,
-
-    /// Token-level scores (if available)
-    pub token_scores: Option<Vec<Score>>,
-}
-
-impl PartialEq for ScoredCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.score == other.score && self.pid == other.pid
-    }
-}
-
-impl Eq for ScoredCandidate {}
-
-impl PartialOrd for ScoredCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // Reverse ordering for max-heap behavior
-        other.score.partial_cmp(&self.score)
-    }
-}
-
-impl Ord for ScoredCandidate {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
-    }
+extern "C" {
+    fn xtr_warp_gpu_merge(
+        candidate_sizes: *const C_tensor,
+        candidate_pids: *const C_tensor,
+        candidate_scores: *const C_tensor,
+        mse_estimates: *const C_tensor,
+        nprobe: i64,
+        k: i64,
+        max_candidates: i64,
+        out_pids: *mut *mut C_tensor,
+        out_scores: *mut *mut C_tensor,
+    );
 }
 
 /// Configuration for the merger
@@ -50,41 +26,11 @@ pub struct MergerConfig {
     /// Maximum number of candidates to keep during merging
     pub max_candidates: usize,
 
-    /// Whether to use parallel merging
-    // pub use_parallel: bool,
-
     /// Number of threads for parallel operations
     pub num_threads: usize,
 
     /// Device to use
     pub device: Device,
-}
-
-/// Strategy for combining scores from multiple sources
-#[derive(Clone)]
-pub enum ScoreCombination {
-    /// Take maximum score across all occurrences
-    Max,
-
-    /// Sum scores across all occurrences
-    Sum,
-
-    /// Average scores across all occurrences
-    Average,
-
-    /// Custom combination function
-    Custom(Arc<dyn Fn(&[f32]) -> f32 + Send + Sync>),
-}
-
-impl std::fmt::Debug for ScoreCombination {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Max => write!(f, "Max"),
-            Self::Sum => write!(f, "Sum"),
-            Self::Average => write!(f, "Average"),
-            Self::Custom(_) => write!(f, "Custom(<function>)"),
-        }
-    }
 }
 
 /// Represents a view into strided candidate data
@@ -131,22 +77,8 @@ impl ReduceSumMseCombiner {
     }
 }
 
-/// Represents a stride of candidates from a single source
-pub struct CandidateStride {
-    /// Passage IDs in this stride
-    pub pids: Array1<PassageId>,
-
-    /// Scores for each PID
-    pub scores: Array1<Score>,
-
-    /// Actual size (may be less than capacity)
-    pub size: usize,
-
-    /// Capacity of this stride
-    pub capacity: usize,
-}
-
 /// Main merger struct for combining results from multiple sources
+#[derive(Clone)]
 pub struct ResultMerger {
     config: MergerConfig,
 }
@@ -220,6 +152,10 @@ impl ResultMerger {
     /// Copies a candidate stride to another
     fn copy_candidate_stride(source: &AnnotatedStrideView, destination: &mut AnnotatedStrideView) {
         let size = source.size;
+        if destination.pids.len() < size {
+            destination.pids.resize(size, 0);
+            destination.scores.resize(size, 0.0);
+        }
         destination.size = size;
         destination.pids[..size].copy_from_slice(&source.pids[..size]);
         destination.scores[..size].copy_from_slice(&source.scores[..size]);
@@ -269,23 +205,22 @@ impl ResultMerger {
         views_buffer: &mut Vec<AnnotatedStrideView>,
         nprobe: usize,
         mse_estimates: &[f32],
+        num_tokens: usize,
     ) {
-        const NUM_TOKENS: usize = 32;
-
         // Compute MSE prefix sums
-        let mut mse_prefix = vec![0.0; NUM_TOKENS + 1];
-        for i in 0..NUM_TOKENS {
+        let mut mse_prefix = vec![0.0; num_tokens + 1];
+        for i in 0..num_tokens {
             mse_prefix[i + 1] = mse_prefix[i] + mse_estimates.get(i).unwrap_or(&0.0);
         }
 
         let mut step_size = 1;
-        while step_size < NUM_TOKENS {
-            for lhs in (0..NUM_TOKENS).step_by(step_size * 2) {
+        while step_size < num_tokens {
+            for lhs in (0..num_tokens).step_by(step_size * 2) {
                 let rhs = lhs + step_size;
-                if rhs < NUM_TOKENS {
+                if rhs < num_tokens {
                     // Calculate MSE values using prefix sums
                     let lhs_mse = mse_prefix[rhs] - mse_prefix[lhs];
-                    let rhs_mse = mse_prefix[(rhs + step_size).min(NUM_TOKENS)] - mse_prefix[rhs];
+                    let rhs_mse = mse_prefix[(rhs + step_size).min(num_tokens)] - mse_prefix[rhs];
 
                     let combiner = ReduceSumMseCombiner::new(lhs_mse, rhs_mse);
                     Self::merge_candidate_strides_with_combiner(
@@ -349,12 +284,26 @@ impl ResultMerger {
         nprobe: usize,
         k: usize,
     ) -> Result<(Vec<PassageId>, Vec<Score>)> {
+        // use cuda if possible
+        if self.config.device.is_cuda() {
+            if let Ok((pids, scores)) = self.merge_candidate_scores_cuda(
+                candidate_sizes,
+                candidate_pids,
+                candidate_scores,
+                mse_estimates,
+                nprobe,
+                k,
+                self.config.max_candidates,
+            ) {
+                return Ok((pids, scores));
+            }
+        }
+
         no_grad(|| {
             let num_cells = capacities.size()[0] as usize;
             let num_candidates = candidate_pids.size()[0] as usize;
 
             // convert tensors to vectors for creating stride views
-            // we used to have .to_kind conversions here, bring them back if needed
             let sizes_vec: Vec<i32> = candidate_sizes.try_into()?;
             let pids_vec: Vec<PassageId> = candidate_pids.try_into()?;
             let scores_vec: Vec<Score> = candidate_scores.try_into()?;
@@ -416,8 +365,10 @@ impl ResultMerger {
 
             // Merge candidates for each token
             let mut last_num_iterations = 0;
-            for query_token_idx in 0..32 {
-                // TODO: Add early stopping here for queries with fewer than 32 tokens
+            // IMPORTANT: the original implementation uses a hardcoded constant (32)
+            // this destroys retrieval metrics for longer queries, so we infer the number of tokens
+            let num_tokens = (num_cells + nprobe - 1) / nprobe;
+            for query_token_idx in 0..num_tokens {
                 last_num_iterations = Self::merge_candidates_nprobe(
                     &mut views,
                     &mut views_buffer,
@@ -432,7 +383,13 @@ impl ResultMerger {
             }
 
             // Merge token-level scores into document-level scores
-            Self::merge_candidates_tokens(&mut views, &mut views_buffer, nprobe, &mse_vec);
+            Self::merge_candidates_tokens(
+                &mut views,
+                &mut views_buffer,
+                nprobe,
+                &mse_vec,
+                num_tokens,
+            );
 
             // Get top-k results from the first stride (which contains the final merged results)
             let budget = self.config.max_candidates.min(views[0].size).max(k);
@@ -455,6 +412,170 @@ impl ResultMerger {
 
             Ok((result_pids, result_scores))
         })
+    }
+
+    fn merge_candidate_scores_cuda(
+        &self,
+        candidate_sizes: &Tensor,
+        candidate_pids: &Tensor,
+        candidate_scores: &Tensor,
+        mse_estimates: &Tensor,
+        nprobe: usize,
+        k: usize,
+        max_candidates: usize,
+    ) -> Result<(Vec<PassageId>, Vec<Score>)> {
+        // I added the optional parameters in some functions
+        // because the torch signatures differ a bit from the cpp ones
+        if candidate_pids.numel() == 0 {
+            let empty_pid: Vec<i64> = Vec::new();
+            let empty_scores: Vec<f32> = Vec::new();
+            return Ok((empty_pid, empty_scores));
+        }
+
+        let device = candidate_pids.device();
+        let sizes = candidate_sizes.shallow_clone();
+        let pids = candidate_pids.shallow_clone();
+        let scores = candidate_scores.shallow_clone();
+        let mse_estimates = mse_estimates.shallow_clone();
+
+        // Token index per cell, repeated per candidate
+        let num_cells = sizes.size()[0];
+        // IMPORTANT: the original implementation uses a hardcoded constant (32)
+        // this destroys retrieval metrics for longer queries, so we infer the number of tokens
+        let num_tokens = (num_cells + (nprobe as i64) - 1) / (nprobe as i64);
+        let mut token_indices = Tensor::arange(num_cells, (Kind::Int64, device));
+        token_indices = token_indices.divide_scalar_mode(nprobe as i64, "trunc");
+        let candidate_tokens =
+            Tensor::repeat_interleave_self_tensor(&token_indices, &sizes, 0, None);
+
+        // Flatten token+pid into a combined id to compactly deduplicate
+        let combined_ids = pids * num_tokens + candidate_tokens;
+        let sort_result = combined_ids.sort(0, /*descending=*/ false);
+        let sorted_ids = sort_result.0;
+        let sort_idx = sort_result.1;
+        let sorted_scores = scores.index_select(0, &sort_idx);
+
+        // Unique ids and inverse for max reduction
+        let unique_result = sorted_ids.unique_consecutive(
+            /*return_inverse=*/ true, /*return_counts=*/ false, 0,
+        );
+        let unique_ids = unique_result.0;
+        let inverse = unique_result.1;
+        let max_init = Tensor::full(
+            unique_ids.size(),
+            f64::NEG_INFINITY,
+            (sorted_scores.kind(), sorted_scores.device()),
+        );
+        let max_per_id = Tensor::index_reduce(
+            &max_init,
+            0,
+            &inverse,
+            &sorted_scores,
+            "amax",
+            /*include_self=*/ true,
+        );
+
+        // Split combined id back into pid and token
+        let pid = unique_ids
+            .divide_scalar_mode(num_tokens, "trunc")
+            .to_kind(Kind::Int64);
+        let token = (unique_ids - pid.shallow_clone() * num_tokens).to_kind(Kind::Int64);
+
+        // Prepare MSE vector (pad/truncate to num_tokens)
+        let mut mse = mse_estimates.shallow_clone();
+        if mse.size()[0] < num_tokens {
+            let pad = Tensor::zeros(&[num_tokens - mse.size()[0]], (mse.kind(), mse.device()));
+            mse = Tensor::cat(&[mse, pad], 0);
+        }
+        mse = mse.narrow(0, 0, num_tokens);
+
+        let sum_mse = mse.sum(None);
+        let mse_for_tokens = mse.index_select(0, &token);
+        let delta = max_per_id - mse_for_tokens;
+
+        // Reduce by pid: since keys were sorted, pid is non-decreasing
+        let pid_result = &pid.unique_consecutive(
+            /*return_inverse=*/ true, /*return_counts=*/ true, 0,
+        );
+        let unique_pids = pid_result.0.shallow_clone();
+        let pid_counts = pid_result.2.to_kind(Kind::Int64);
+
+        // Deterministic per-PID sum using cumulative sums to avoid nondeterministic atomics.
+        // Exclusive prefix to get exact per-pid sums.
+        let delta_cumsum = delta.cumsum(0, delta.kind()).contiguous();
+        let prefix = Tensor::zeros(
+            &[delta_cumsum.size()[0] + 1],
+            (delta_cumsum.kind(), delta_cumsum.device()),
+        );
+        prefix
+            .narrow(0, 1, delta_cumsum.size()[0])
+            .copy_(&delta_cumsum);
+
+        let end_indices = pid_counts.cumsum(0, Kind::Int64) - 1;
+        let start_indices = end_indices.shallow_clone() - pid_counts + 1;
+        let sums_at_end = prefix.index_select(0, &(end_indices + 1));
+        let sums_before = prefix.index_select(0, &start_indices);
+        let deltas_per_pid = sums_at_end - sums_before;
+        let totals = deltas_per_pid + sum_mse;
+
+        if totals.numel() == 0 {
+            let empty_pid: Vec<i64> = Vec::new();
+            let empty_scores_out: Vec<f32> = Vec::new();
+            return Ok((empty_pid, empty_scores_out));
+        }
+
+        let totals_size = totals.size();
+        let num_candidates = totals_size.get(0).unwrap();
+        let budget = k.max(max_candidates.min(*num_candidates as usize));
+        let take_k = (budget as i64).min(*num_candidates);
+
+        let topk = totals.topk(take_k, 0, /*largest=*/ true, /*sorted=*/ true);
+        let top_scores: Vec<f32> = topk.0.to_device(Device::Cpu).try_into()?;
+        let top_indices = topk.1;
+        let top_pids: Vec<i64> = unique_pids
+            .index_select(0, &top_indices)
+            .to_device(Device::Cpu)
+            .try_into()?;
+
+        return Ok((top_pids, top_scores));
+    }
+
+    fn merge_candidate_scores_cuda_cpp(
+        &self,
+        candidate_sizes: &Tensor,
+        candidate_pids: &Tensor,
+        candidate_scores: &Tensor,
+        mse_estimates: &Tensor,
+        nprobe: usize,
+        k: usize,
+        max_candidates: usize,
+    ) -> Result<(Vec<PassageId>, Vec<Score>)> {
+        unsafe {
+            let mut out_pids: *mut C_tensor = ptr::null_mut();
+            let mut out_scores: *mut C_tensor = ptr::null_mut();
+
+            xtr_warp_gpu_merge(
+                candidate_sizes.as_ptr() as *const C_tensor,
+                candidate_pids.as_ptr() as *const C_tensor,
+                candidate_scores.as_ptr() as *const C_tensor,
+                mse_estimates.as_ptr() as *const C_tensor,
+                nprobe as i64,
+                k as i64,
+                max_candidates as i64,
+                &mut out_pids,
+                &mut out_scores,
+            );
+
+            if out_pids.is_null() || out_scores.is_null() {
+                anyhow::bail!("xtr_warp_gpu_merge returned null outputs");
+            }
+
+            let top_pids = Tensor::from_ptr(out_pids);
+            let top_scores = Tensor::from_ptr(out_scores);
+            let pids: Vec<i64> = top_pids.to_device(Device::Cpu).try_into()?;
+            let scores: Vec<f32> = top_scores.to_device(Device::Cpu).try_into()?;
+            Ok((pids, scores))
+        }
     }
 }
 

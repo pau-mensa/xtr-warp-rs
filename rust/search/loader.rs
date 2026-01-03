@@ -10,19 +10,13 @@ use crate::utils::types::{CentroidId, IndexMetadata, LoadedIndex};
 /// Index loader responsible for loading WARP index components from disk
 pub struct IndexLoader {
     index_path: PathBuf,
-    // load_with_mmap: bool,
     device: Device,
     dtype: Kind,
 }
 
 impl IndexLoader {
     /// Create a new index loader
-    pub fn new(
-        index_path: impl AsRef<Path>,
-        device: Device,
-        dtype: Kind,
-        //load_with_mmap: bool,
-    ) -> Result<Self> {
+    pub fn new(index_path: impl AsRef<Path>, device: Device, dtype: Kind) -> Result<Self> {
         let path = index_path.as_ref();
 
         if !path.exists() {
@@ -35,7 +29,6 @@ impl IndexLoader {
 
         Ok(Self {
             index_path: path.to_path_buf(),
-            // load_with_mmap,
             device,
             dtype,
         })
@@ -46,10 +39,16 @@ impl IndexLoader {
         let index_path = self.index_path.as_path();
 
         // Load bucket weights (for scoring)
-        let bucket_weights = self.load_torch_tensor(index_path.join("bucket_weights.npy"))?;
+        let bucket_weights = self
+            .load_torch_tensor(index_path.join("bucket_weights.npy"))
+            .unwrap()
+            .to_dtype(self.dtype, false, false);
 
         // Load centroids
-        let centroids = self.load_torch_tensor(index_path.join("centroids.npy"))?;
+        let centroids = self
+            .load_torch_tensor(index_path.join("centroids.npy"))
+            .unwrap()
+            .to_dtype(self.dtype, false, false);
 
         // Load compacted sizes per centroid
         let sizes_compacted = self.load_torch_tensor(index_path.join("sizes.compacted.npy"))?;
@@ -128,9 +127,7 @@ impl IndexLoader {
         let tensor = Tensor::read_npy(&path)
             .map_err(|e| anyhow!("Failed to load tensor {:?}: {}", path, e))?;
 
-        Ok(tensor
-            .to_device(self.device)
-            .to_dtype(self.dtype, false, false))
+        Ok(tensor.to_device(self.device))
     }
 
     /// Compute offsets from sizes for efficient indexing

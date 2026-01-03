@@ -32,9 +32,6 @@ pub struct IndexConfig {
     /// Device to use (e.g. "cpu", "cuda:0")
     pub device: Device,
 
-    /// Whether to load index with memory mapping
-    // pub load_with_mmap: bool,
-
     /// Number of bits for residual compression (2 or 4)
     pub nbits: i64,
 
@@ -47,7 +44,6 @@ impl Default for IndexConfig {
         Self {
             index_path: PathBuf::from("./index"),
             device: Device::Cpu,
-            // load_with_mmap: false,
             nbits: 4,
             embedding_dim: 128,
         }
@@ -62,7 +58,7 @@ pub struct SearchConfig {
     #[pyo3(get, set)]
     pub k: usize,
 
-    /// Device to perform the search on
+    /// Device to use for the search
     #[pyo3(get, set)]
     pub device: String,
 
@@ -82,9 +78,9 @@ pub struct SearchConfig {
     #[pyo3(get, set)]
     pub bound: usize,
 
-    /// Whether to enable parallel search
+    /// The batch size for cuda processing
     #[pyo3(get, set)]
-    pub parallel: bool,
+    pub batch_size: i64,
 
     /// Optional number of threads for parallel search
     #[pyo3(get, set)]
@@ -108,7 +104,19 @@ impl SearchConfig {
     /// Creates a new SearchConfig instance from Python
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (k, device, dtype=None, nprobe=None, t_prime=None, bound=None, parallel=None, num_threads=None, centroid_score_threshold=None, max_codes_per_centroid=None, max_candidates=None))]
+    #[pyo3(signature = (
+        k,
+        device,
+        dtype=None,
+        nprobe=None,
+        t_prime=None,
+        bound=None,
+        batch_size=None,
+        num_threads=None,
+        centroid_score_threshold=None,
+        max_codes_per_centroid=None,
+        max_candidates=None,
+    ))]
     fn new(
         k: usize,
         device: String,
@@ -116,7 +124,7 @@ impl SearchConfig {
         nprobe: Option<u32>,
         t_prime: Option<usize>,
         bound: Option<usize>,
-        parallel: Option<bool>,
+        batch_size: Option<i64>,
         num_threads: Option<usize>,
         centroid_score_threshold: Option<f32>,
         max_codes_per_centroid: Option<u32>,
@@ -124,12 +132,12 @@ impl SearchConfig {
     ) -> Self {
         Self {
             k,
-            device,
+            device: device,
             dtype: dtype.unwrap_or("float32".to_string()),
-            nprobe: nprobe.unwrap_or(32),
+            nprobe: nprobe.unwrap_or(4),
             t_prime,
             bound: bound.unwrap_or(128),
-            parallel: parallel.unwrap_or(true),
+            batch_size: batch_size.unwrap_or(8192i64),
             num_threads,
             centroid_score_threshold,
             max_codes_per_centroid,
@@ -144,11 +152,11 @@ impl Default for SearchConfig {
             k: 100,
             device: "cpu".to_string(),
             dtype: "float32".to_string(),
-            nprobe: 32,
+            nprobe: 4,
             t_prime: None,
             bound: 128,
-            parallel: false,
-            num_threads: None,
+            batch_size: 8192i64,
+            num_threads: Some(1usize),
             centroid_score_threshold: None,
             max_codes_per_centroid: None,
             max_candidates: None,
@@ -207,6 +215,41 @@ pub struct LoadedIndex {
     pub metadata: IndexMetadata,
 }
 
+impl Clone for LoadedIndex {
+    fn clone(&self) -> Self {
+        Self {
+            centroids: self.centroids.shallow_clone(),
+            bucket_weights: self.bucket_weights.shallow_clone(),
+            sizes_compacted: self.sizes_compacted.shallow_clone(),
+            codes_compacted: self.codes_compacted.shallow_clone(),
+            residuals_compacted: self.residuals_compacted.shallow_clone(),
+            offsets_compacted: self.offsets_compacted.shallow_clone(),
+            kdummy_centroid: self.kdummy_centroid,
+            metadata: self.metadata.clone(),
+        }
+    }
+}
+
+/// Read-only wrapper that marks the loaded index as safe to share across threads.
+/// The tensors are never mutated after load, so we can treat them as Sync.
+pub struct ReadOnlyIndex(pub LoadedIndex);
+
+impl std::ops::Deref for ReadOnlyIndex {
+    type Target = LoadedIndex;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+unsafe impl Sync for ReadOnlyIndex {}
+
+impl Clone for ReadOnlyIndex {
+    fn clone(&self) -> Self {
+        ReadOnlyIndex(self.0.clone())
+    }
+}
+
 /// Query representation for search
 pub struct Query {
     pub embeddings: Tensor, // Always [batch, num_tokens, dim]
@@ -216,6 +259,25 @@ pub struct Query {
 pub struct QueryBatch {
     pub queries: Vec<Query>,
     pub max_tokens: usize,
+}
+
+/// Read-only tensor wrapper to opt into Sync when we guarantee no mutation.
+pub struct ReadOnlyTensor(pub Tensor);
+
+impl std::ops::Deref for ReadOnlyTensor {
+    type Target = Tensor;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+unsafe impl Sync for ReadOnlyTensor {}
+
+impl Clone for ReadOnlyTensor {
+    fn clone(&self) -> Self {
+        ReadOnlyTensor(self.0.shallow_clone())
+    }
 }
 
 /// Selected centroids for a query token
@@ -278,6 +340,7 @@ impl TPrimePolicy {
 pub fn parse_device(device: &str) -> anyhow::Result<Device> {
     match device.to_lowercase().as_str() {
         "cpu" => Ok(Device::Cpu),
+        "mps" => Ok(Device::Mps),
         "cuda" => Ok(Device::Cuda(0)), // Default to the first CUDA device.
         s if s.starts_with("cuda:") => {
             let parts: Vec<&str> = s.split(':').collect();
