@@ -313,7 +313,7 @@ class XTRWarp:
         ----
         device:
             'auto', 'cpu', 'cuda', 'mps', or a list of cuda devices
-                (eg. ['cuda:0', 'cuda:1']
+                (eg. ['cuda:0', 'cuda:1'])
             auto, cuda, mps and a list of cuda devices keep the index on CPU
                 but run centroid scoring on the accelerator.
         dtype:
@@ -457,7 +457,7 @@ class XTRWarp:
         max_candidates:
             Maximum number of candidates to consider before the final sort.
         centroid_score_threshold:
-            Threshold for centroid scores. Defaults to None.
+            Threshold for centroid scores, from 0 to 1. Defaults to None.
         batch_size:
             Batch size for the query matmul against the centroids.
             Used only if index is loaded in cuda. Defaults to 8192.
@@ -518,7 +518,7 @@ class XTRWarp:
         if t_prime is None:
             t_prime = optimized[4]
 
-        logger.warning(
+        logger.debug(
             "Search hyperparams - bound=%s nprobe=%s centroid_score_threshold=%s max_candidates=%s t_prime=%s",
             bound,
             nprobe,
