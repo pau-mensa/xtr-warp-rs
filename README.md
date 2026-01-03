@@ -210,7 +210,7 @@ You can cite **xtr-warp-rs** in your work as follows:
 ```bibtex
 @software{xtrwarprs,
   author = {Montserrat, Pau},
-  title = {xtr-warp-rs: A High-Performance Multi-Vector Search Engine},
+  title = {WARP: The Multi-Vector Search Engine To Rule Them All},
   year = {2025},
   url = {https://github.com/pau-mensa/xtr-warp-rs}
 }
@@ -239,4 +239,4 @@ This is an active in development project. Contributions are welcome, particularl
 
 ## Acknowledgments
 
-I would like to personally acknowledge the creators and maintainers of the FastPlaid library, from which I took most of the boilerplate code used here.
+I would like to personally acknowledge the creators and maintainers of the [FastPlaid](https://github.com/lightonai/fast-plaid/tree/main) library, from which I took most of the boilerplate code used here.
