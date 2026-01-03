@@ -269,6 +269,5 @@ fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(initialize_torch, m)?)?;
     m.add_function(wrap_pyfunction!(create, m)?)?;
-    //m.add_function(wrap_pyfunction!(load_and_search, m)?)?;
     Ok(())
 }
