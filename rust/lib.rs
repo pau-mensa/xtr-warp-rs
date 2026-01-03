@@ -254,69 +254,6 @@ fn create(
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)))
 }
 
-/// Loads an index and performs a search in a single, high-level operation.
-///
-/// This is the primary entry point for searching. It handles loading the index
-/// from disk, moving it to the specified device, executing the search with the
-/// given queries, and returning the results.
-///
-/// Args:
-///     index (str): Path to the directory containing the pre-built index.
-///     torch_path (str): Path to the Torch shared library (e.g., `libtorch.so`).
-///     device (str): The compute device for the search (e.g., "cpu", "cuda:0").
-///     queries_embeddings (torch.Tensor): A 3D tensor of query embeddings with
-///         shape `[num_queries, num_tokens, embedding_dim]`.
-///     search_parameters (SearchParameters): A configuration object specifying
-///         search behavior, such as `k` and `nprobe`.
-///     subset (list[list[int]], optional): A list where each inner list contains
-///         the document IDs to restrict the search to for the corresponding query.
-///
-/// Returns:
-///     list[QueryResult]: A list of result objects, each containing the
-///     `doc_id` and `score` for a retrieved document.
-/*#[pyfunction]
-fn load_and_search(
-    _py: Python<'_>,
-    index: String,
-    torch_path: String,
-    queries_embeddings: PyTensor,
-    search_config: SearchConfig,
-) -> PyResult<Vec<SearchResult>> {
-    call_torch(torch_path)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
-
-    let device = get_device(&search_config.device)?;
-    let query_tensor = queries_embeddings.to_device(device);
-
-    // Always expect 3D tensor [batch, num_tokens, dim]
-    let shape = query_tensor.size();
-    if shape.len() != 3 {
-        return Err(PyRuntimeError::new_err(format!(
-            "Expected 3D tensor [batch, num_tokens, dim], got {}D tensor with shape {:?}",
-            shape.len(),
-            shape
-        )));
-    }
-
-    let dtype = get_dtype(&search_config.dtype)?;
-    let index = IndexLoader::new(index, device, dtype)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index loader: {}", e)))?;
-    let loaded_index = index
-        .load()
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load index: {}", e)))?;
-    let searcher = Searcher::new(loaded_index, &search_config)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create searcher: {}", e)))?;
-
-    // Process batch
-    let results = searcher
-        .search(Query {
-            embeddings: query_tensor,
-        })
-        .map_err(|e| PyRuntimeError::new_err(format!("Search failed: {}", e)))?;
-
-    Ok(results)
-}*/
-
 /// A high-performance document retrieval toolkit using a ColBERT-style late
 /// interaction model, implemented in Rust with Python bindings.
 ///
