@@ -7,7 +7,7 @@ use crate::search::centroid_selector::CentroidSelector;
 use crate::search::decompressor::CentroidDecompressor;
 use crate::search::merger::{MergerConfig, ResultMerger};
 use crate::utils::types::{
-    parse_device, parse_dtype, Query, ReadOnlyIndex, SearchConfig, SearchResult,
+    parse_device, parse_dtype, Query, ReadOnlyIndex, ReadOnlyTensor, SearchConfig, SearchResult,
 };
 
 /// Main scorer struct that handles WARP scoring operations
@@ -94,18 +94,10 @@ impl WARPScorer {
         &self,
         query_idx: usize,
         query_embeddings: Tensor,
-        centroid_scores: Option<Tensor>,
+        centroid_scores: Tensor,
+        query_mask: Tensor,
         k: usize,
     ) -> Result<SearchResult> {
-        let _guard = tch::no_grad_guard();
-
-        let query_mask = query_embeddings
-            .ne(0)
-            .any_dim(if query_embeddings.dim() == 2 { 1 } else { 0 }, false);
-
-        let centroid_scores = centroid_scores
-            .unwrap_or_else(|| query_embeddings.matmul(&self.index.centroids.transpose(0, 1)));
-
         let selected = self.centroid_selector.select_centroids(
             &query_mask.to_device(self.device),
             &centroid_scores,
@@ -142,111 +134,101 @@ impl WARPScorer {
         &self,
         query: &Query, // [batch, num_tokens, dim]
     ) -> Result<Vec<SearchResult>> {
+        let _guard = tch::no_grad_guard();
+
         let k = self.config.k;
         let n_queries = query.embeddings.size()[0] as usize;
         let use_parallel = self.thread_pool.current_num_threads() > 1 && n_queries > 1;
+        // Need to wrap it to ensure it can be shared in the parallel path
+        let masks: ReadOnlyTensor = ReadOnlyTensor(query.embeddings.ne(0).any_dim(2, false));
 
-        match self.device {
-            Device::Cpu => {
-                if !use_parallel {
-                    // sequential cpu
-                    (0..n_queries)
-                        .map(|idx| self.process_query(idx, query.embeddings.i(idx as i64), None, k))
-                        .collect()
-                } else {
-                    // parallel cpu
-                    let queries: Vec<_> = (0..n_queries)
-                        .map(|b| query.embeddings.narrow(0, b as i64, 1).squeeze_dim(0))
-                        .collect();
+        if use_parallel {
+            if self.device != Device::Cpu {
+                anyhow::bail!("Parallel processing is not supported on an accelerator. Set num_threads=1 if you want to use an accelerator or set device='cpu' if you want to use parallel processing.");
+            }
+            // parallel cpu
+            let queries: Vec<ReadOnlyTensor> = (0..n_queries)
+                .map(|b| ReadOnlyTensor(query.embeddings.select(0, b as i64)))
+                .collect();
 
-                    let centroid_selector = self.centroid_selector.clone();
-                    let decompressor = self.decompressor.clone();
-                    let merger = self.merger.clone();
-                    let index = Arc::clone(&self.index);
-                    let nprobe = self.config.nprobe as usize;
-                    let device = self.device;
+            let centroid_selector = self.centroid_selector.clone();
+            let decompressor = self.decompressor.clone();
+            let merger = self.merger.clone();
+            let index = Arc::clone(&self.index);
+            let nprobe = self.config.nprobe as usize;
+            let device = self.device;
 
-                    self.thread_pool.install(move || {
-                        queries
-                            .into_par_iter()
-                            .enumerate()
-                            .map(|(idx, query_embeddings)| {
-                                let _guard = tch::no_grad_guard();
+            self.thread_pool.install(move || {
+                queries
+                    .into_par_iter()
+                    .enumerate()
+                    .map(|(idx, query_embeddings)| {
+                        let query_mask = masks.i(idx as i64);
+                        let centroid_scores =
+                            query_embeddings.matmul(&index.centroids.transpose(0, 1));
 
-                                let query_mask = query_embeddings.ne(0).any_dim(1, false);
-                                let centroid_scores =
-                                    query_embeddings.matmul(&index.centroids.transpose(0, 1));
+                        let selected = centroid_selector.select_centroids(
+                            &query_mask.to_device(device),
+                            &centroid_scores,
+                            &index.sizes_compacted,
+                            index.kdummy_centroid,
+                            k,
+                        )?;
 
-                                let selected = centroid_selector.select_centroids(
-                                    &query_mask.to_device(device),
-                                    &centroid_scores,
-                                    &index.sizes_compacted,
-                                    index.kdummy_centroid,
-                                    k,
-                                )?;
+                        let decompressed = decompressor.decompress_centroids(
+                            &selected.centroid_ids.to_kind(Kind::Int64),
+                            &selected.scores,
+                            &index,
+                            &query_embeddings,
+                            nprobe,
+                        )?;
 
-                                let decompressed = decompressor.decompress_centroids(
-                                    &selected.centroid_ids.to_kind(Kind::Int64),
-                                    &selected.scores,
-                                    &index,
-                                    &query_embeddings,
-                                    nprobe,
-                                )?;
+                        let (pids, scores) = merger.merge_candidate_scores(
+                            &decompressed.capacities,
+                            &decompressed.sizes,
+                            &decompressed.passage_ids,
+                            &decompressed.scores,
+                            &selected.mse_estimate,
+                            nprobe,
+                            k,
+                        )?;
 
-                                let (pids, scores) = merger.merge_candidate_scores(
-                                    &decompressed.capacities,
-                                    &decompressed.sizes,
-                                    &decompressed.passage_ids,
-                                    &decompressed.scores,
-                                    &selected.mse_estimate,
-                                    nprobe,
-                                    k,
-                                )?;
-
-                                Ok(SearchResult {
-                                    passage_ids: pids[..k.min(pids.len())].to_vec(),
-                                    scores: scores[..k.min(scores.len())].to_vec(),
-                                    query_id: idx + 1,
-                                })
-                            })
-                            .collect()
+                        Ok(SearchResult {
+                            passage_ids: pids[..k.min(pids.len())].to_vec(),
+                            scores: scores[..k.min(scores.len())].to_vec(),
+                            query_id: idx + 1,
+                        })
                     })
+                    .collect()
+            })
+        } else {
+            // accelerator path (optimized for cuda)
+            let mut results = Vec::with_capacity(n_queries);
+
+            for c in (0..n_queries).step_by(self.batch_size as usize) {
+                let batch_size = self.batch_size.min((n_queries - c) as i64);
+                let batch_queries = query.embeddings.narrow(0, c as i64, batch_size);
+                let batch_mask = masks.narrow(0, c as i64, batch_size);
+
+                let centroid_scores = Tensor::einsum(
+                    "btd,cd->btc",
+                    &[&batch_queries, &self.index.centroids],
+                    None::<&[i64]>,
+                );
+
+                for b in 0..batch_size {
+                    // TODO this could be vectorized, with some effort
+                    let result = self.process_query(
+                        c + b as usize,
+                        batch_queries.i(b),
+                        centroid_scores.i(b),
+                        batch_mask.i(b),
+                        k,
+                    )?;
+                    results.push(result);
                 }
-            },
-            _ => {
-                // accelerator path (optimized for cuda)
-                let mut results = Vec::with_capacity(n_queries);
-
-                if !use_parallel {
-                    // no multi thread for cuda
-                    for c in (0..n_queries).step_by(self.batch_size as usize) {
-                        let batch_size = self.batch_size.min((n_queries - c) as i64);
-                        let batch_queries = query.embeddings.narrow(0, c as i64, batch_size);
-
-                        let centroid_scores = Tensor::einsum(
-                            "btd,cd->btc",
-                            &[&batch_queries, &self.index.centroids],
-                            None::<&[i64]>,
-                        );
-
-                        let query_mask = batch_queries.ne(0).any_dim(2, false);
-
-                        for b in 0..batch_size {
-                            let result = self.process_query(
-                                c + b as usize,
-                                batch_queries.i(b),
-                                Some(centroid_scores.i(b)),
-                                k,
-                            )?;
-                            results.push(result);
-                        }
-                    }
-                    Ok(results)
-                } else {
-                    // parallel processing is not supported on an accelerator
-                    anyhow::bail!("Parallel processing is not supported on an accelerator. Set num_threads=1 if you want to use an accelerator or set device='cpu' if you want to use parallel processing.");
-                }
-            },
+            }
+            Ok(results)
         }
     }
 }

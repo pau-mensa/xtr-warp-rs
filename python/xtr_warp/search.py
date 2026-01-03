@@ -476,6 +476,7 @@ class XTRWarp:
                 "num_threads > 1 is not supported for cuda devices, defaulting to 1"
             )
             logger.warning(warning)
+            num_threads = 1
 
         if isinstance(queries_embeddings, list):
             queries_embeddings = torch.nn.utils.rnn.pad_sequence(

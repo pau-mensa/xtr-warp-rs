@@ -1,24 +1,8 @@
 use anyhow::Result;
 use std::collections::BTreeMap;
-use std::ptr;
 use tch::{no_grad, Device, Kind, Tensor};
-use torch_sys::C_tensor;
 
 use crate::utils::types::{PassageId, Score};
-
-extern "C" {
-    fn xtr_warp_gpu_merge(
-        candidate_sizes: *const C_tensor,
-        candidate_pids: *const C_tensor,
-        candidate_scores: *const C_tensor,
-        mse_estimates: *const C_tensor,
-        nprobe: i64,
-        k: i64,
-        max_candidates: i64,
-        out_pids: *mut *mut C_tensor,
-        out_scores: *mut *mut C_tensor,
-    );
-}
 
 /// Configuration for the merger
 #[derive(Debug, Clone)]
@@ -538,44 +522,6 @@ impl ResultMerger {
             .try_into()?;
 
         return Ok((top_pids, top_scores));
-    }
-
-    fn merge_candidate_scores_cuda_cpp(
-        &self,
-        candidate_sizes: &Tensor,
-        candidate_pids: &Tensor,
-        candidate_scores: &Tensor,
-        mse_estimates: &Tensor,
-        nprobe: usize,
-        k: usize,
-        max_candidates: usize,
-    ) -> Result<(Vec<PassageId>, Vec<Score>)> {
-        unsafe {
-            let mut out_pids: *mut C_tensor = ptr::null_mut();
-            let mut out_scores: *mut C_tensor = ptr::null_mut();
-
-            xtr_warp_gpu_merge(
-                candidate_sizes.as_ptr() as *const C_tensor,
-                candidate_pids.as_ptr() as *const C_tensor,
-                candidate_scores.as_ptr() as *const C_tensor,
-                mse_estimates.as_ptr() as *const C_tensor,
-                nprobe as i64,
-                k as i64,
-                max_candidates as i64,
-                &mut out_pids,
-                &mut out_scores,
-            );
-
-            if out_pids.is_null() || out_scores.is_null() {
-                anyhow::bail!("xtr_warp_gpu_merge returned null outputs");
-            }
-
-            let top_pids = Tensor::from_ptr(out_pids);
-            let top_scores = Tensor::from_ptr(out_scores);
-            let pids: Vec<i64> = top_pids.to_device(Device::Cpu).try_into()?;
-            let scores: Vec<f32> = top_scores.to_device(Device::Cpu).try_into()?;
-            Ok((pids, scores))
-        }
     }
 }
 
