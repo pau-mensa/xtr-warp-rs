@@ -34,8 +34,8 @@ jobs:
 
       - name: Install dependencies and run common tests
         run: |
-          uv pip install pytest pytest-cov
-          uv run pytest tests/test.py
+          make install
+          make test
 
   build_wheels:
     name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }}
