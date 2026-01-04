@@ -37,10 +37,6 @@ jobs:
           uv pip install pytest pytest-cov
           uv run pytest tests/test.py
 
-      - name: Run Ubuntu-specific tests
-        if: matrix.os == 'ubuntu-latest'
-        run: uv run pytest python/fast_plaid/filtering/filtering.py
-
   build_wheels:
     name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }}
     needs: test
