@@ -20,6 +20,10 @@ jobs:
         python-version: ["3.10", "3.12", "3.13"]
 
     runs-on: ${{ matrix.os }}
+    env:
+      LIBTORCH_USE_PYTORCH: "1"
+      LIBTORCH_BYPASS_VERSION_CHECK: "1"
+      PIP_EXTRA_INDEX_URL: "https://download.pytorch.org/whl/cpu/torch_stable.html"
 
     steps:
       - name: Checkout code
@@ -34,8 +38,8 @@ jobs:
 
       - name: Install dependencies and run common tests
         run: |
-          uv pip install pytest pytest-cov
-          uv run pytest tests/test.py
+          make install
+          make test
 
   build_wheels:
     name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }}
@@ -89,6 +93,7 @@ jobs:
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_MANYLINUX_ARM64_IMAGE: manylinux_2_28
           CIBW_ENVIRONMENT: |
+            LIBTORCH_USE_PYTORCH=1
             PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu/torch_stable.html"
           CIBW_PIP_ARGS: "--no-cache-dir --no-build-isolation"
           CIBW_BEFORE_BUILD: "pip install torch==2.9.0 numpy maturin delvewheel"
