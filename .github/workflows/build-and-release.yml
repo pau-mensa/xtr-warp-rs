@@ -38,6 +38,7 @@ jobs:
 
       - name: Run tests
         run: |
+          uv pip install pytest pytest-cov
           make test
 
   build_wheels:
