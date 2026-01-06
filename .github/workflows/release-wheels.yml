@@ -76,10 +76,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Prepare version metadata
+        shell: bash
         run: |
-          python scripts/release_prep.py \
-            --version "${{ inputs.base_version }}.${{ inputs.torch_suffix }}" \
-            --torch-req "${{ inputs.torch_req }}"
+          python scripts/release_prep.py --version "${{ inputs.base_version }}.${{ inputs.torch_suffix }}" --torch-req "${{ inputs.torch_req }}"
 
       - name: Prepare Python Version for CIBW_BUILD
         id: prepare_python_version
