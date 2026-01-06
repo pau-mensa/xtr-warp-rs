@@ -1,0 +1,19 @@
+name: Publish (torch 2.9.x)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_version:
+        description: 'Base version (e.g. "0.0.1")'
+        required: true
+        type: string
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-wheels.yml
+    with:
+      base_version: ${{ inputs.base_version }}
+      torch_suffix: "290"
+      torch_version: "2.9.0"
+      torch_req: "torch>=2.9,<2.10"
+    secrets: inherit

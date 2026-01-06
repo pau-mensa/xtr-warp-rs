@@ -10,6 +10,11 @@ use std::path::Path;
 use std::sync::Arc;
 use tch::{Device, Kind};
 
+#[cfg(windows)]
+use winapi::um::errhandlingapi::GetLastError;
+#[cfg(windows)]
+use winapi::um::libloaderapi::LoadLibraryA;
+
 // Module declarations
 pub mod index;
 pub mod search;

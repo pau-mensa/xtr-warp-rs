@@ -1,0 +1,137 @@
+name: Release Wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_version:
+        description: 'Base version (e.g. "0.0.1")'
+        required: true
+        type: string
+      torch_suffix:
+        description: 'Torch suffix (270/280/290)'
+        required: true
+        type: choice
+        options: ["270", "280", "290"]
+      torch_version:
+        description: 'Torch pinned version (e.g. "2.9.0")'
+        required: true
+        type: string
+      torch_req:
+        description: 'Torch requirement metadata (e.g. "torch>=2.9,<2.10")'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      base_version:
+        required: true
+        type: string
+      torch_suffix:
+        required: true
+        type: string
+      torch_version:
+        required: true
+        type: string
+      torch_req:
+        required: true
+        type: string
+    secrets:
+      PYPI_API_TOKEN:
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.torch_suffix }}
+  cancel-in-progress: true
+
+jobs:
+  build_wheels:
+    name: Build wheels (torch ${{ inputs.torch_version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free Disk Space (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Prepare version metadata
+        run: |
+          python scripts/release_prep.py \
+            --version "${{ inputs.base_version }}.${{ inputs.torch_suffix }}" \
+            --torch-req "${{ inputs.torch_req }}"
+
+      - name: Prepare Python Version for CIBW_BUILD
+        id: prepare_python_version
+        shell: bash
+        run: |
+          PYTHON_VERSION_NO_DOT=$(echo "${{ matrix.python-version }}" | tr -d '.')
+          echo "PYTHON_VERSION_NO_DOT=$PYTHON_VERSION_NO_DOT" >> $GITHUB_OUTPUT
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.23.3
+        env:
+          CIBW_BUILD: "cp${{ steps.prepare_python_version.outputs.PYTHON_VERSION_NO_DOT }}-*"
+          CIBW_SKIP: "*-manylinux_i686 *-musllinux_* *-win32"
+          CIBW_BUILD_VERBOSITY: 1
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_ARM64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT: |
+            LIBTORCH_USE_PYTORCH=1
+            LIBTORCH_BYPASS_VERSION_CHECK=1
+            PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu/torch_stable.html"
+          CIBW_ENVIRONMENT_PASS_LINUX: LIBTORCH_USE_PYTORCH LIBTORCH_BYPASS_VERSION_CHECK PIP_EXTRA_INDEX_URL
+          CIBW_PIP_ARGS: "--no-cache-dir --no-build-isolation"
+          CIBW_BEFORE_BUILD: "pip install torch==${{ inputs.torch_version }} numpy maturin delvewheel"
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+            LD_LIBRARY_PATH=$(python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):$LD_LIBRARY_PATH auditwheel repair -w {dest_dir} {wheel} --exclude libtorch.so --exclude libtorch_cpu.so --exclude libtorch_python.so
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: >
+            DYLD_LIBRARY_PATH=$(python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))') delocate-wheel -w {dest_dir} -v {wheel} --exclude libtorch.dylib --exclude libtorch_cpu.dylib --exclude libtorch_python.dylib
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
+            FOR /F "usebackq tokens=*" %i IN (`python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"`) DO (set "PATH=%i;%PATH%" && delvewheel repair -w {dest_dir} {wheel} --no-dll torch.dll --no-dll torch_cpu.dll --no-dll torch_python.dll)
+
+      - name: Upload wheels to artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ inputs.torch_suffix }}-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: ./wheelhouse/*.whl
+
+  publish:
+    name: Publish to PyPI (torch ${{ inputs.torch_version }})
+    needs: build_wheels
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-${{ inputs.torch_suffix }}-*-py*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.12.4
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true

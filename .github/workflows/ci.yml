@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.13"]
+
+    runs-on: ${{ matrix.os }}
+    env:
+      LIBTORCH_USE_PYTORCH: "1"
+      LIBTORCH_BYPASS_VERSION_CHECK: "1"
+      PIP_EXTRA_INDEX_URL: "https://download.pytorch.org/whl/cpu/torch_stable.html"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
+          python-version: ${{ matrix.python-version }}
+          activate-environment: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install deps and run tests
+        run: |
+          uv pip install --no-cache-dir "torch==2.9.0" pytest pytest-cov
+          uv pip install --no-cache-dir -e .
+          make test
