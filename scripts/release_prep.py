@@ -14,6 +14,15 @@ def _set_section_key_version(path: Path, section: str, key: str, version: str) -
     section_header = f"[{section}]"
 
     for i, line in enumerate(lines):
+        line_ending = ""
+        line_core = line
+        if line_core.endswith("\n"):
+            line_ending = "\n"
+            line_core = line_core[:-1]
+        if line_core.endswith("\r"):
+            line_ending = "\r" + line_ending
+            line_core = line_core[:-1]
+
         stripped = line.strip()
         if stripped == section_header:
             in_section = True
@@ -24,12 +33,12 @@ def _set_section_key_version(path: Path, section: str, key: str, version: str) -
         if not in_section:
             continue
 
-        match = re.match(rf'^({re.escape(key)}\s*=\s*)"[^"]*"(.*)$', line)
+        match = re.match(rf'^({re.escape(key)}\s*=\s*)"[^"]*"(.*)$', line_core)
         if not match:
             continue
         if changed:
             raise SystemExit(f"{path}: found multiple '{key} = ...' entries in [{section}]")
-        lines[i] = f'{match.group(1)}"{version}"{match.group(2)}'
+        lines[i] = f'{match.group(1)}"{version}"{match.group(2)}{line_ending}'
         changed = True
 
     if not changed:
@@ -76,6 +85,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare repo versions for release builds.")
     parser.add_argument("--version", required=True, help="PEP 440 version (e.g. 0.0.1.290)")
     parser.add_argument(
+        "--cargo-version",
+        default=None,
+        help='Cargo package version (SemVer, e.g. "0.0.1"). Defaults to the first 3 components of --version.',
+    )
+    parser.add_argument(
         "--torch-req",
         default=None,
         help='Replace torch requirement string (e.g. "torch>=2.9,<2.10")',
@@ -91,7 +105,14 @@ def main() -> int:
     cargo_toml = root / "Cargo.toml"
     pyproject_toml = root / "pyproject.toml"
 
-    set_cargo_version(cargo_toml, args.version, dry_run=args.dry_run)
+    cargo_version = args.cargo_version
+    if cargo_version is None:
+        parts = args.version.split(".")
+        if len(parts) < 3:
+            raise SystemExit("--version must have at least 3 numeric components to derive --cargo-version")
+        cargo_version = ".".join(parts[:3])
+
+    set_cargo_version(cargo_toml, cargo_version, dry_run=args.dry_run)
     set_pyproject_version(pyproject_toml, args.version, dry_run=args.dry_run)
     if args.torch_req:
         set_pyproject_torch_req(pyproject_toml, args.torch_req, dry_run=args.dry_run)
