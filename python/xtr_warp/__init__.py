@@ -7,6 +7,12 @@ a ColBERT-style late interaction retrieval system.
 from .evaluation import evaluate, load_beir
 from .search import XTRWarp
 
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+except ImportError:  # pragma: no cover (py<3.8)
+    PackageNotFoundError = Exception  # type: ignore[misc,assignment]
+    _pkg_version = None  # type: ignore[assignment]
+
 # Import the Rust extension module
 try:
     from . import xtr_warp_rs
@@ -23,5 +29,8 @@ except ImportError:
         )
         xtr_warp_rs = None
 
-__version__ = "0.0.1"
+try:
+    __version__ = _pkg_version("xtr-warp-rs") if _pkg_version else "0.0.0"
+except PackageNotFoundError:
+    __version__ = "0.0.0"
 __all__ = ["XTRWarp", "xtr_warp_rs", "evaluate", "load_beir"]
