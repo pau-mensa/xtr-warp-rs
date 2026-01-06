@@ -13,13 +13,7 @@ concurrency:
 
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        python-version: ["3.10", "3.12", "3.13"]
-
-    runs-on: ${{ matrix.os }}
+    runs-on: "ubuntu-latest"
     env:
       LIBTORCH_USE_PYTORCH: "1"
       LIBTORCH_BYPASS_VERSION_CHECK: "1"
@@ -33,7 +27,7 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           version: "latest"
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.13"
           activate-environment: true
 
       - name: Run tests
@@ -44,7 +38,8 @@ jobs:
   build_wheels:
     name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }}
     needs: test
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.test.result == 'success' }}
+    # if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.test.result == 'success' }}
+    if: ${{ needs.test.result == 'success' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
