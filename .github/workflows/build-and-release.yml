@@ -37,7 +37,7 @@ jobs:
 
   build_wheels:
     name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }}
-    needs: test
+    #needs: test
     # if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.test.result == 'success' }}
     #if: ${{ needs.test.result == 'success' }}
     runs-on: ${{ matrix.os }}
