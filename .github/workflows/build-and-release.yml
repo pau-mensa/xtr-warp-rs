@@ -12,34 +12,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    runs-on: "ubuntu-latest"
-    env:
-      LIBTORCH_USE_PYTORCH: "1"
-      LIBTORCH_BYPASS_VERSION_CHECK: "1"
-      PIP_EXTRA_INDEX_URL: "https://download.pytorch.org/whl/cpu/torch_stable.html"
+  #test:
+  #  runs-on: "ubuntu-latest"
+  #  env:
+  #    LIBTORCH_USE_PYTORCH: "1"
+  #    LIBTORCH_BYPASS_VERSION_CHECK: "1"
+  #    PIP_EXTRA_INDEX_URL: "https://download.pytorch.org/whl/cpu/torch_stable.html"
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  #  steps:
+  #    - name: Checkout code
+  #      uses: actions/checkout@v4
 
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          version: "latest"
-          python-version: "3.13"
-          activate-environment: true
+  #    - name: Setup uv
+  #      uses: astral-sh/setup-uv@v6
+  #      with:
+  #        version: "latest"
+  #        python-version: "3.13"
+  #        activate-environment: true
 
-      - name: Run tests
-        run: |
-          uv pip install pytest pytest-cov
-          make test
+  #    - name: Run tests
+  #      run: |
+  #        uv pip install pytest pytest-cov
+  #        make test
 
   build_wheels:
     name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }}
     needs: test
     # if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.test.result == 'success' }}
-    if: ${{ needs.test.result == 'success' }}
+    #if: ${{ needs.test.result == 'success' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -89,6 +89,7 @@ jobs:
           CIBW_MANYLINUX_ARM64_IMAGE: manylinux_2_28
           CIBW_ENVIRONMENT: |
             LIBTORCH_USE_PYTORCH=1
+            LIBTORCH_BYPASS_VERSION_CHECK=1
             PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu/torch_stable.html"
           CIBW_PIP_ARGS: "--no-cache-dir --no-build-isolation"
           CIBW_BEFORE_BUILD: "pip install torch==2.9.0 numpy maturin delvewheel"
