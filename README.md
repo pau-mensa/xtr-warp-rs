@@ -1,14 +1,17 @@
 <div align="center">
+  <h1>Warp</h1>
   <p align="center">
     <img src="assets/logo.png" alt="Warp Logo" width="400">
   </p>
-  <h1>Warp</h1>
 </div>
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg" alt="Python Versions">
   <img src="https://github.com/pau-mensa/xtr-warp-rs/actions/workflows/ci.yml/badge.svg" alt="CI Status">
   <img src="https://img.shields.io/badge/Platform-Ubuntu%7C%20macOS%20%7C%20Windows-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License">
+  <a href="https://github.com/rust-lang/rust"><img src="https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="rust"></a>
+  <a href="https://github.com/pyo3"><img src="https://img.shields.io/badge/PyO₃-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="PyO₃"></a>
+  <a href="https://github.com/LaurentMazare/tch-rs"><img src="https://img.shields.io/badge/tch--rs-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="tch-rs"></a>
 </p>
 <div align="center">
     The Multi-Vector Search Engine To Rule Them All
@@ -41,9 +44,9 @@ xtr-warp-rs supports three torch versions:
 
 | xtr-warp-rs Version | PyTorch Version | Installation Command                |
 | ------------------- | --------------- | ----------------------------------- |
-| 0.0.1.290         | 2.9.0           | `pip install xtr-warp-rs==0.0.1.290` |
-| 0.0.1.280         | 2.8.0           | `pip install xtr-warp-rs==0.0.1.280` |
-| 0.0.1.270         | 2.7.0           | `pip install xtr-warp-rs==0.0.1.270` |
+| 0.0.1.290         | 2.9.0           | `uv pip install xtr-warp-rs==0.0.1.290` |
+| 0.0.1.280         | 2.8.0           | `uv pip install xtr-warp-rs==0.0.1.280` |
+| 0.0.1.270         | 2.7.0           | `uv pip install xtr-warp-rs==0.0.1.270` |
 
 ### Build from Source
 
