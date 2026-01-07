@@ -22,6 +22,20 @@ The engine achieves a speedup of **3-10x** on CUDA and of **4-70x** on CPU (depe
 
 ## Installation
 
+```bash
+uv pip install xtr-warp-rs
+```
+
+## PyTorch Compatibility
+
+xtr-warp-rs supports three torch versions:
+
+| xtr-warp-rs Version | PyTorch Version | Installation Command                |
+| ------------------- | --------------- | ----------------------------------- |
+| 0.0.1.290         | 2.9.0           | `pip install xtr-warp-rs==0.0.1.290` |
+| 0.0.1.280         | 2.8.0           | `pip install xtr-warp-rs==0.0.1.280` |
+| 0.0.1.270         | 2.7.0           | `pip install xtr-warp-rs==0.0.1.270` |
+
 ### Build from Source
 
 **Install Rust:**
@@ -168,7 +182,7 @@ bound                       None        Centroids considered before selecting to
 t_prime                     None        Missing-token penalty (larger = harsher, smaller = more forgiving) (e.g 5000)
 centroid_score_threshold    None        Per-token filter to skip weak tokens, from 0 to 1 (e.g 0.5)
 max_candidates              None        Cap on document candidates before final selection (e.g 64000)
-batch_size                  8192        Batch size for centroid scoring on CUDA
+batch_size                  8192        Batch size for centroid scoring (watch out for VRAM spike in large indices)
 num_threads                 1           Upper bound for CPU parallelism during search (not used on CUDA)
 ```
 
@@ -198,8 +212,8 @@ device                    required       Device where to load the index (e.g., "
 dtype                     torch.float32  Dtype to use for the centroids and bucket weights. Lowers the memory footprint but can cause alterations in retrieval metrics
 ```
 
-> [!TIP]
-> While loading on `cuda` is the fastest way to serve inference, `cpu` is still extremely competitive, especially when multiple threads are used.
+> [!WARNING]
+> The operator `aten::unique_dim` is not implemented in torch for the `mps` device, so if you want to use it you will need to set up the env var `PYTORCH_ENABLE_MPS_FALLBACK=1`, which fallbacks to the CPU
 
 &nbsp;
 

@@ -81,7 +81,8 @@ impl CentroidSelector {
                 Tensor::zeros(&[num_query_tokens, nprobe_i64], (self.dtype, self.device));
             let mut mse = Tensor::zeros(&[num_query_tokens], (self.dtype, self.device));
 
-            // This is assuming the padding tokens will be 0, which is probably unrealistic
+            // We only want to treat the non-zero tokens
+            // Note that this skips tensors padded with 0, not with the pad token
             let mask_indices = query_mask.to_kind(Kind::Bool).nonzero().squeeze_dim(-1);
             let active_tokens = mask_indices.size()[0];
 

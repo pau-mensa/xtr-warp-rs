@@ -35,7 +35,7 @@ pub struct WARPScorer {
     /// Device to perform the scoring on
     device: tch::Device,
 
-    /// Batch size for cuda processing
+    /// Batch size for centroid matmul
     batch_size: i64,
 }
 
@@ -144,6 +144,9 @@ impl WARPScorer {
 
         if use_parallel {
             if self.device != Device::Cpu {
+                // While this would work (only requires moving the tensors from the accelerator to the cpu)
+                // the data movement can kill the efficiency gained anyway, and I don't want to worry about
+                // performance in this path. Can be enabled later if required.
                 anyhow::bail!("Parallel processing is not supported on an accelerator. Set num_threads=1 if you want to use an accelerator or set device='cpu' if you want to use parallel processing.");
             }
             // parallel cpu
