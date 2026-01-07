@@ -1,11 +1,10 @@
 name: Test Release
 
 on:
-  pull_request:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag (e.g. "0.0.1")'
+        description: 'Release tag (e.g. "0.0.1.280")'
         required: true
         type: string
 
@@ -35,6 +34,6 @@ jobs:
 
       - name: Run tests
         run: |
-          uv pip install xtr-warp-rs==0.0.1.280
+          uv pip install xtr-warp-rs==${{ inputs.release_tag }}
           uv pip install pytest pytest-cov
           pytest tests/test.py
