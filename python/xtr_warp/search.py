@@ -459,8 +459,7 @@ class XTRWarp:
         centroid_score_threshold:
             Threshold for centroid scores, from 0 to 1. Defaults to None.
         batch_size:
-            Batch size for the query matmul against the centroids.
-            Used only if index is loaded in cuda. Defaults to 8192.
+            Batch size for the query matmul against the centroids. Defaults to 8192.
 
         """
         if self._loaded_searchers is None or self.devices is None:

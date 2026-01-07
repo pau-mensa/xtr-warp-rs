@@ -78,7 +78,7 @@ pub struct SearchConfig {
     #[pyo3(get, set)]
     pub bound: usize,
 
-    /// The batch size for cuda processing
+    /// The batch size for centroid matmul
     #[pyo3(get, set)]
     pub batch_size: i64,
 
