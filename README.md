@@ -1,4 +1,7 @@
 <div align="center">
+  <p align="center">
+    <img src="assets/logo.png" alt="Warp Logo" width="400">
+  </p>
   <h1>Warp</h1>
 </div>
 <p align="center">
