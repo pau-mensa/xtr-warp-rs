@@ -1,6 +1,7 @@
 name: Test Release
 
 on:
+  pull_request:
   workflow_dispatch:
     inputs:
       release_tag:
@@ -34,6 +35,6 @@ jobs:
 
       - name: Run tests
         run: |
-          uv pip install xtr-warp-rs=={{ inputs.release_tag }}
+          uv pip install xtr-warp-rs==0.0.1
           uv pip install pytest pytest-cov
           make test
