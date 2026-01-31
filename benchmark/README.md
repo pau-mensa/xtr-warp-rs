@@ -25,7 +25,7 @@ benchmark/
 
 ## Configuration Format (YAML)
 
-Experiment configurations are stored as YAML files in the `experiments/` directory. The filename format should be `{framework}_{experiment_id}.yaml`.
+Experiment configurations are stored as YAML files in the `experiments/` directory. The filename format should be `{framework}_{experiment_id}.yaml` (`xtr-warp_0.yaml` for example).
 
 ### Common Parameters
 

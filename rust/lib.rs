@@ -22,6 +22,7 @@ pub mod utils;
 
 // Re-exports for convenience
 use crate::index::create::create_index;
+use crate::index::source::InMemoryEmbeddingSource;
 use search::{IndexLoader, Searcher};
 use utils::types::{IndexConfig, Query, ReadOnlyIndex, SearchConfig, SearchResult};
 
@@ -237,6 +238,9 @@ fn create(
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
     let device = get_device(&device)?;
+    let nbits: u8 = nbits
+        .try_into()
+        .map_err(|_| PyValueError::new_err("nbits must be in 0..=255"))?;
     let centroids = centroids.to_device(device);
 
     let embeddings: Vec<_> = embeddings
@@ -244,6 +248,7 @@ fn create(
         .map(|tensor| tensor.to_device(device))
         .collect();
 
+    let mut source = InMemoryEmbeddingSource::new(embeddings);
     create_index(
         &IndexConfig {
             index_path: Path::new(&index).to_path_buf(),
@@ -252,7 +257,7 @@ fn create(
             nbits,
             embedding_dim: embedding_dim.unwrap_or(128),
         },
-        embeddings,
+        &mut source,
         centroids,
         seed,
     )
