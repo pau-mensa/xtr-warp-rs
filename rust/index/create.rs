@@ -188,32 +188,6 @@ fn finalize_ivf_and_compact(
     phase2_out: &encode::Phase2Out,
     centroids: &Tensor,
 ) -> Result<()> {
-    let chk_emb_offsets: Vec<usize> = phase2_out
-        .chunk_stats
-        .iter()
-        .map(|s| s.embedding_offset)
-        .collect();
-
-    let total_num_embs: usize = phase2_out
-        .total_embeddings
-        .try_into()
-        .map_err(|_| anyhow!("total embeddings overflow: {}", phase2_out.total_embeddings))?;
-
-    let path_str = config
-        .index_path
-        .as_path()
-        .to_str()
-        .ok_or_else(|| anyhow!("index_path is not valid UTF-8"))?;
-
-    ivf::build_ivf(
-        &chk_emb_offsets,
-        plan.est_total_embs,
-        total_num_embs,
-        plan.num_chunks,
-        path_str,
-        config.device,
-    )?;
-
     let final_meta_fpath = config.index_path.join("metadata.json");
     let final_avg_doclen = if plan.n_docs > 0 {
         phase2_out.total_embeddings as f64 / plan.n_docs as f64
@@ -238,13 +212,14 @@ fn finalize_ivf_and_compact(
     let writer = BufWriter::new(meta_file);
     serde_json::to_writer_pretty(writer, &final_meta_json)?;
 
-    compact::compact_index(
+    compact::compact_index_counting_sort(
         &config.index_path,
         plan.num_chunks,
         centroids.size()[0] as usize,
         config.embedding_dim as usize,
         plan.nbits as usize,
         config.device,
+        &phase2_out.global_centroid_counts,
     )?;
 
     Ok(())
