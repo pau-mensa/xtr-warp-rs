@@ -83,11 +83,11 @@ def set_pyproject_torch_req(pyproject_toml: Path, torch_req: str, *, dry_run: bo
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare repo versions for release builds.")
-    parser.add_argument("--version", required=True, help="PEP 440 version (e.g. 0.0.1.290)")
+    parser.add_argument("--version", required=True, help="PEP 440 version (e.g. 0.0.2.290)")
     parser.add_argument(
         "--cargo-version",
         default=None,
-        help='Cargo package version (SemVer, e.g. "0.0.1"). Defaults to the first 3 components of --version.',
+        help='Cargo package version (SemVer, e.g. "0.0.2"). Defaults to the first 3 components of --version.',
     )
     parser.add_argument(
         "--torch-req",
