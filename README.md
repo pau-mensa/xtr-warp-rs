@@ -28,7 +28,7 @@ Compared to the current SOTA (FastPlaid), xtr-warp-rs focuses on doing less work
 The engine achieves a speedup of **3-10x** on CUDA and of **4-70x** on CPU (depending on the dataset and number of threads used) vs FastPlaid. Check the [benchmark section](#benchmarks) for a detailed comparison.
 
 > [!IMPORTANT]  
-> While the package is usable today, it is worth noting that the index creation algorithm and memory management in general use very naive approaches, resulting in 10X slower indexing times than FastPlaid and around 20% more memory usage. This is under active development and contributions are welcome!
+> While the package is usable today, it is worth noting that memory management is very naive, resulting in around 20% more memory usage than FastPlaid. This is under active development and contributions are welcome!
 
 &nbsp;
 
@@ -118,35 +118,35 @@ The output will be a list of lists, where each inner list contains tuples of (do
 | Dataset (Size) | Metric | fast-plaid | xtr-warp-rs |
 |----------------|--------|------------|-------------|
 | arguana (8,674) | qps | 110.26 | 1008.69 (+814.8%) |
-|  | indexing | 1.67s | 15.27s |
+|  | indexing | 1.67s | 1.595s |
 |  | ndcg@10 | 0.47 | 0.49 |
 |  | recall@10 | 0.73 | 0.75 |
 | fiqa (57,638) | qps | 87.16 | 943.08 (+982.0%) |
-|  | indexing | 4.90s | 70.28s |
+|  | indexing | 4.90s | 5.51s |
 |  | ndcg@10 | 0.41 | 0.36 |
 |  | recall@10 | 0.48 | 0.42 |
 | nfcorpus (3,633) | qps | 123.87 | 1155.00 (+832.4%) |
-|  | indexing | 0.90s | 8.71s |
+|  | indexing | 0.90s | 0.965s |
 |  | ndcg@10 | 0.37 | 0.36 |
 |  | recall@10 | 0.18 | 0.17 |
 | quora (522,931) | qps | 217.47 | 927.92 (+326.7%) |
-|  | indexing | 10.51s | 79.30s |
+|  | indexing | 10.51s | 11.44s |
 |  | ndcg@10 | 0.88 | 0.86 |
 |  | recall@10 | 0.95 | 0.94 |
 | scidocs (25,657) | qps | 97.49 | 861.50 (+783.7%) |
-|  | indexing | 3.93s | 42.95s |
+|  | indexing | 3.93s | 4.17s |
 |  | ndcg@10 | 0.19 | 0.18 |
 |  | recall@10 | 0.19 | 0.19 |
 | scifact (5,183) | qps | 112.30 | 1133.98 (+909.8%) |
-|  | indexing | 1.42s | 12.61s |
+|  | indexing | 1.42s | 1.47s |
 |  | ndcg@10 | 0.74 | 0.73 |
 |  | recall@10 | 0.86 | 0.85 |
 | trec-covid (171,332) | qps | 43.16 | 282.75 (+555.1%) |
-|  | indexing | 17.44s | 252.40s |
+|  | indexing | 17.44s | 19.47s |
 |  | ndcg@10 | 0.84 | 0.80 |
 |  | recall@10 | 0.02 | 0.02 |
 | webis-touche2020 (300,000) | qps | 67.95 | 637.24 (+837.8%) |
-|  | indexing | 23.44s | 403.23s |
+|  | indexing | 23.44s | 27.74s |
 |  | ndcg@10 | 0.25 | 0.24 |
 |  | recall@10 | 0.18 | 0.18 |
 
