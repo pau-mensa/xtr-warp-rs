@@ -33,7 +33,7 @@ pub struct IndexConfig {
     pub device: Device,
 
     /// Number of bits for residual compression (2 or 4)
-    pub nbits: i64,
+    pub nbits: u8,
 
     /// Embedding dimension
     pub embedding_dim: u32,
@@ -174,6 +174,15 @@ pub struct SearchResult {
     pub scores: Vec<Score>,
     #[pyo3(get)]
     pub query_id: usize,
+}
+
+/// Represents the plan outlined to create an index
+pub struct IndexPlan {
+    pub n_docs: usize,
+    pub num_chunks: usize,
+    pub avg_doc_len: f64,
+    pub est_total_embs: i64,
+    pub nbits: u8,
 }
 
 /// Index metadata stored alongside the index

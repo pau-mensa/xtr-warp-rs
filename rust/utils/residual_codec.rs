@@ -10,7 +10,7 @@ use tch::{Device, Kind, Tensor};
 /// for efficient data transformation.
 pub struct ResidualCodec {
     /// The number of bits used for quantization.
-    pub nbits: i64,
+    pub nbits: u8,
     /// The dimensionality of the vectors.
     pub dim: i64,
     /// The base centroids for quantization.
@@ -49,7 +49,7 @@ impl ResidualCodec {
     ///
     /// A `Result` containing the fully initialized `ResidualCodec` on success.
     pub fn load(
-        nbits_param: i64,
+        nbits_param: u8,
         centroids_tensor_initial: Tensor,
         avg_residual_tensor_initial: Tensor,
         bucket_cutoffs_tensor_initial: Option<Tensor>,
