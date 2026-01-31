@@ -9,9 +9,10 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
-use super::{compact, encode, ivf, source::EmbeddingSource};
+use super::{compact, source::EmbeddingSource};
 use crate::utils::residual_codec::ResidualCodec;
 use crate::utils::types::{IndexConfig, IndexPlan};
+use crate::index::encode::{encode_chunks, compress_into_codes, EncodeResult, CHUNK_SIZE, CODE_BATCH_SIZE};
 
 /// Creates a new WARP index from a collection of document embeddings.
 /// Result containing the index metadata on success
@@ -51,7 +52,7 @@ pub fn create_index(
         &path_str,
     )?;
 
-    let phase2_out = encode::encode_phase_two(
+    let encode_result = encode_chunks(
         &index_plan,
         embeddings_source,
         &centroids,
@@ -60,7 +61,8 @@ pub fn create_index(
         config.device,
         config.embedding_dim,
     )?;
-    phase3(config, &index_plan, &phase2_out, &centroids)?;
+
+    finalize_ivf_and_compact(config, &index_plan, &encode_result, &centroids)?;
 
     Ok(())
 }
@@ -75,7 +77,7 @@ fn plan_and_sample(
         bail!("No embeddings provided");
     }
     let num_chunks =
-        (n_docs as f64 / (encode::CHUNK_SIZE as f64).min(1.0 + n_docs as f64)).ceil() as usize;
+        (n_docs as f64 / (CHUNK_SIZE as f64).min(1.0 + n_docs as f64)).ceil() as usize;
 
     let total_doc_len = if source.get_doc(0).is_some() {
         let mut total: i64 = 0;
@@ -88,7 +90,7 @@ fn plan_and_sample(
         total
     } else {
         let mut total: i64 = 0;
-        let chunk_iter = source.chunk_iter(encode::CHUNK_SIZE)?;
+        let chunk_iter = source.chunk_iter(CHUNK_SIZE)?;
         for chunk in chunk_iter {
             total += chunk.doclens.iter().sum::<i64>();
         }
@@ -156,7 +158,7 @@ fn sample_embeddings(
     let mut sample_pids: Vec<i64> = Vec::with_capacity(k);
     let mut seen: i64 = 0;
     let mut doc_offset: i64 = 0;
-    let chunk_iter = source.chunk_iter(encode::CHUNK_SIZE)?;
+    let chunk_iter = source.chunk_iter(CHUNK_SIZE)?;
     for chunk in chunk_iter {
         for doc in &chunk.embeddings {
             if (seen as usize) < k {
@@ -185,12 +187,12 @@ fn sample_embeddings(
 fn finalize_ivf_and_compact(
     config: &IndexConfig,
     plan: &IndexPlan,
-    phase2_out: &encode::Phase2Out,
+    encode_result: &EncodeResult,
     centroids: &Tensor,
 ) -> Result<()> {
     let final_meta_fpath = config.index_path.join("metadata.json");
     let final_avg_doclen = if plan.n_docs > 0 {
-        phase2_out.total_embeddings as f64 / plan.n_docs as f64
+        encode_result.total_embeddings as f64 / plan.n_docs as f64
     } else {
         0.0
     };
@@ -199,13 +201,12 @@ fn finalize_ivf_and_compact(
         "num_chunks": plan.num_chunks,
         "nbits": plan.nbits,
         "num_partitions": plan.est_total_embs,
-        "num_embeddings": phase2_out.total_embeddings,
+        "num_embeddings": encode_result.total_embeddings,
         "avg_doclen": final_avg_doclen,
         "num_passages": plan.n_docs,
         "num_centroids": centroids.size()[0] as usize,
         "dim": config.embedding_dim,
         "created_at": Utc::now().to_rfc3339(),
-        "index_version": "xtr-warp-1.0"
     });
 
     let meta_file = File::create(final_meta_fpath)?;
@@ -219,104 +220,12 @@ fn finalize_ivf_and_compact(
         config.embedding_dim as usize,
         plan.nbits as usize,
         config.device,
-        &phase2_out.global_centroid_counts,
+        &encode_result.global_centroid_counts,
     )?;
 
     Ok(())
 }
 
-#[allow(dead_code)]
-fn phase_two(
-    plan: &IndexPlan,
-    source: &mut dyn EmbeddingSource,
-    centroids: &Tensor,
-    codec: &ResidualCodec,
-    index_path: &Path,
-    device: Device,
-    embedding_dim: u32,
-) -> Result<encode::Phase2Out> {
-    encode::encode_phase_two(plan, source, centroids, codec, index_path, device, embedding_dim)
-}
-
-pub struct Phase3Out {}
-
-#[allow(dead_code)]
-fn phase3(
-    config: &IndexConfig,
-    plan: &IndexPlan,
-    phase2_out: &encode::Phase2Out,
-    centroids: &Tensor,
-) -> Result<Phase3Out> {
-    finalize_ivf_and_compact(config, plan, phase2_out, centroids)?;
-    Ok(Phase3Out {})
-}
-
-#[allow(dead_code)]
-fn legacy_full_pipeline(
-    config: &IndexConfig,
-    n_docs: usize,
-    num_chunks: usize,
-    est_total_embs: i64,
-    document_embeddings: &Vec<Tensor>,
-    codec: &ResidualCodec,
-    path_str: &str,
-    centroids: &Tensor,
-) -> Result<()> {
-    let chunk_stats = compress_into_residuals(
-        n_docs,
-        num_chunks,
-        config.nbits,
-        config.embedding_dim as i64,
-        document_embeddings,
-        config.device,
-        path_str,
-        codec,
-    )?;
-
-    let chk_emb_offsets: Vec<usize> = chunk_stats.iter().map(|s| s.embedding_offset).collect();
-    let total_num_embs = chunk_stats
-        .last()
-        .map(|s| s.embedding_offset + s.num_embeddings)
-        .unwrap_or(0);
-    ivf::build_ivf(
-        &chk_emb_offsets,
-        est_total_embs,
-        total_num_embs,
-        num_chunks,
-        path_str,
-        config.device,
-    )?;
-
-    let final_meta_fpath = Path::new(&config.index_path).join("metadata.json");
-    let final_avg_doclen = if n_docs > 0 {
-        total_num_embs as f64 / n_docs as f64
-    } else {
-        0.0
-    };
-
-    let final_meta_json = json!({
-        "num_chunks": num_chunks,
-        "nbits": config.nbits,
-        "num_partitions": est_total_embs,
-        "num_embeddings": total_num_embs,
-        "avg_doclen": final_avg_doclen
-    });
-
-    let meta_file = File::create(final_meta_fpath)?;
-    let writer = BufWriter::new(meta_file);
-    serde_json::to_writer_pretty(writer, &final_meta_json)?;
-
-    compact::compact_index(
-        &config.index_path,
-        num_chunks,
-        centroids.size()[0] as usize,
-        config.embedding_dim as usize,
-        config.nbits as usize,
-        config.device,
-    )?;
-
-    Ok(())
-}
 
 /// Trains the residual codec for quantization.
 /// # Returns
@@ -346,10 +255,10 @@ fn train_residual_codec(
         device,
     )?;
 
-    let heldout_codes = encode::compress_into_codes(&heldout_samples, &initial_codec.centroids);
+    let heldout_codes = compress_into_codes(&heldout_samples, &initial_codec.centroids);
 
     let mut recon_embs_vec = Vec::new();
-    for code_batch_idxs in heldout_codes.split(encode::CODE_BATCH_SIZE, 0) {
+    for code_batch_idxs in heldout_codes.split(CODE_BATCH_SIZE, 0) {
         recon_embs_vec.push(initial_codec.centroids.index_select(0, &code_batch_idxs));
     }
     let heldout_recon_embs = Tensor::cat(&recon_embs_vec, 0);
@@ -399,112 +308,4 @@ fn train_residual_codec(
         .write_npy(&avg_res_fpath)?;
 
     Ok(final_codec)
-}
-
-// Legacy encoder kept for reference; Phase 2 lives in `encode::encode_phase_two`.
-pub fn compress_into_residuals(
-    n_docs: usize,
-    n_chunks: usize,
-    nbits: u8,
-    embedding_dim: i64,
-    document_embeddings: &Vec<Tensor>,
-    device: Device,
-    index_path: &str,
-    codec: &ResidualCodec,
-) -> Result<Vec<encode::ChunkStats>> {
-    let proc_chunk_sz = encode::CHUNK_SIZE.min(1 + n_docs);
-    let mut chunk_stats = Vec::with_capacity(n_chunks);
-    let mut current_emb_offset: usize = 0;
-    let doclens: Vec<i64> = document_embeddings.iter().map(|e| e.size()[0]).collect();
-    let mut _total_embeddings: i64 = 0;
-    let mut _global_centroid_counts: i64 = 0;
-
-    for chk_idx in 0..n_chunks {
-        let chk_offset = chk_idx * proc_chunk_sz;
-        let chk_end_offset = (chk_offset + proc_chunk_sz).min(n_docs);
-
-        let chk_embs_vec: Vec<Tensor> = document_embeddings[chk_offset..chk_end_offset]
-            .iter()
-            .map(|t| t.to_kind(Kind::Half))
-            .collect();
-        // let chk_doclens: Vec<i64> = chk_embs_vec.iter().map(|e| e.size()[0]).collect();
-        let chk_doclens: Vec<i64> = doclens[chk_offset..chk_end_offset].to_vec();
-        let chk_embs_tensor = Tensor::cat(&chk_embs_vec, 0)
-            .to_kind(Kind::Half)
-            .to_device(device);
-        _total_embeddings += chk_embs_tensor.size()[0];
-
-        let mut chk_codes_list: Vec<Tensor> = Vec::new();
-        let mut chk_res_list: Vec<Tensor> = Vec::new();
-
-        for emb_batch in chk_embs_tensor.split(encode::EMB_BATCH_SIZE, 0) {
-            let code_batch = encode::compress_into_codes(&emb_batch, &codec.centroids);
-            chk_codes_list.push(code_batch.shallow_clone());
-
-            let mut recon_centroids_batches: Vec<Tensor> = Vec::new();
-            for sub_code_batch in code_batch.split(encode::CODE_BATCH_SIZE, 0) {
-                recon_centroids_batches.push(codec.centroids.index_select(0, &sub_code_batch));
-            }
-            let recon_centroids = Tensor::cat(&recon_centroids_batches, 0);
-
-            let mut res_batch = &emb_batch - &recon_centroids;
-
-            let bucket_cutoffs = codec.bucket_cutoffs.as_ref().unwrap().contiguous();
-            res_batch = Tensor::bucketize(&res_batch, &bucket_cutoffs, true, false);
-
-            let mut res_shape = res_batch.size();
-            res_shape.push(nbits as i64);
-            res_batch = res_batch.unsqueeze(-1).expand(&res_shape, false);
-            res_batch = res_batch.bitwise_right_shift(&codec.arange_bits);
-            let ones = Tensor::ones_like(&res_batch).to_device(device);
-            res_batch = res_batch.bitwise_and_tensor(&ones);
-
-            let res_flat = res_batch.flatten(0, -1);
-
-            let res_packed = encode::packbits(&res_flat);
-
-            let shape = [res_batch.size()[0], embedding_dim / 8 * (nbits as i64)];
-            chk_res_list.push(res_packed.reshape(&shape));
-        }
-
-        let chk_codes = Tensor::cat(&chk_codes_list, 0);
-        let chk_residuals = Tensor::cat(&chk_res_list, 0);
-        let chunk_num_embeddings = chk_codes.size()[0] as usize;
-
-        let chk_codes_fpath = Path::new(&index_path).join(&format!("{}.codes.npy", chk_idx));
-        chk_codes
-            .to_device(Device::Cpu)
-            .write_npy(&chk_codes_fpath)?;
-
-        let chk_res_fpath = Path::new(&index_path).join(&format!("{}.residuals.npy", chk_idx));
-        chk_residuals
-            .to_device(Device::Cpu)
-            .write_npy(&chk_res_fpath)?;
-
-        let chk_doclens_npy_path = Path::new(&index_path).join(format!("doclens.{}.npy", chk_idx));
-        Tensor::from_slice(&chk_doclens).write_npy(chk_doclens_npy_path)?;
-
-        let chk_doclens_path = Path::new(&index_path).join(format!("doclens.{}.json", chk_idx));
-        let dl_file = File::create(chk_doclens_path)?;
-        let buf_writer = BufWriter::new(dl_file);
-        serde_json::to_writer(buf_writer, &chk_doclens)?;
-
-        let chk_meta = json!({
-            "passage_offset": chk_offset,
-            "num_passages": chk_doclens.len(),
-            "num_embeddings": chunk_num_embeddings,
-            "embedding_offset": current_emb_offset,
-        });
-        let chk_meta_fpath = Path::new(&index_path).join(format!("{}.metadata.json", chk_idx));
-        let meta_f_w = File::create(chk_meta_fpath)?;
-        let buf_writer_meta = BufWriter::new(meta_f_w);
-        serde_json::to_writer(buf_writer_meta, &chk_meta)?;
-
-        chunk_stats.push(encode::ChunkStats {
-            embedding_offset: current_emb_offset,
-            num_embeddings: chunk_num_embeddings,
-        });
-        current_emb_offset += chunk_num_embeddings;
-    }
-    Ok(chunk_stats)
 }

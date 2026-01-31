@@ -15,7 +15,7 @@ pub const CODE_BATCH_SIZE: i64 = 1 << 20;
 
 const BIT_WEIGHTS: [i64; 8] = [128, 64, 32, 16, 8, 4, 2, 1];
 
-pub struct Phase2Out {
+pub struct EncodeResult {
     pub chunk_stats: Vec<ChunkStats>,
     pub total_embeddings: i64,
     pub global_centroid_counts: Tensor,
@@ -26,7 +26,7 @@ pub struct ChunkStats {
     pub num_embeddings: usize,
 }
 
-pub fn encode_phase_two(
+pub fn encode_chunks(
     plan: &IndexPlan,
     source: &mut dyn EmbeddingSource,
     centroids: &Tensor,
@@ -34,7 +34,7 @@ pub fn encode_phase_two(
     index_path: &Path,
     device: Device,
     embedding_dim: u32,
-) -> Result<Phase2Out> {
+) -> Result<EncodeResult> {
     let num_centroids = centroids.size()[0] as usize;
     let mut chunk_stats = Vec::with_capacity(plan.num_chunks);
     let mut current_emb_offset: usize = 0;
@@ -131,7 +131,7 @@ pub fn encode_phase_two(
         passage_offset += chk_doclens.len();
     }
 
-    Ok(Phase2Out {
+    Ok(EncodeResult {
         chunk_stats,
         total_embeddings,
         global_centroid_counts: global_counts,
