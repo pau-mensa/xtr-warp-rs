@@ -6,8 +6,8 @@ import logging
 import math
 import os
 import random
-from typing import Literal
 
+import numpy as np
 import torch
 import torch.multiprocessing as mp
 from fastkmeans import FastKMeans
@@ -118,6 +118,61 @@ def compute_kmeans(  # noqa: PLR0913
     )
 
 
+def _doclens_path_for(emb_path: str) -> str | None:
+    stem, _ = os.path.splitext(emb_path)
+    npy_path = f"{stem}.doclens.npy"
+    if os.path.exists(npy_path):
+        return npy_path
+    return None
+
+
+def _load_doclens(path: str) -> torch.Tensor:
+    doclens_np = np.load(path)
+    return torch.from_numpy(doclens_np).to(dtype=torch.long, device="cpu")
+
+
+def _split_embeddings_tensor(
+    embeddings: torch.Tensor,
+    doclens: torch.Tensor,
+    path: str,
+) -> list[torch.Tensor]:
+    doclens_list = doclens.tolist()
+    total = embeddings.shape[0]
+    offset = 0
+    docs = []
+    for doc_len in doclens_list:
+        docs.append(embeddings[offset : offset + doc_len])
+        offset += doc_len
+    if offset != total:
+        raise ValueError(
+            f"Doclens sum {offset} does not match embeddings count {total} in {path}"
+        )
+    return docs
+
+
+def _load_embeddings_from_path(embeddings_path: str) -> list[torch.Tensor]:
+    if os.path.isfile(embeddings_path):
+        files = [embeddings_path]
+    else:
+        npy_files = glob.glob(os.path.join(embeddings_path, "*.npy"))
+        files = sorted(
+            [path for path in npy_files if not path.endswith(".doclens.npy")]
+        )
+    if not files:
+        raise FileNotFoundError(f"No embedding .npy files found in {embeddings_path}")
+
+    documents_embeddings: list[torch.Tensor] = []
+    for emb_file in files:
+        batch = torch.from_numpy(np.load(emb_file)).to(device="cpu")
+        doclens_path = _doclens_path_for(emb_file)
+        if not doclens_path:
+            raise TypeError(f"Could not find a doclens sidecar")
+        doclens = _load_doclens(doclens_path)
+        documents_embeddings.extend(_split_embeddings_tensor(batch, doclens, emb_file))
+
+    return documents_embeddings
+
+
 def search_on_device(
     search_config,
     queries_embeddings: torch.Tensor,
@@ -147,6 +202,7 @@ class XTRWarp:
     ----
     index:
         Path to the directory where the index is stored or will be stored.
+
     """
 
     def __init__(
@@ -183,7 +239,7 @@ class XTRWarp:
 
     def create(  # noqa: PLR0913
         self,
-        documents_embeddings: list[torch.Tensor] | torch.Tensor,
+        embeddings_source: list[torch.Tensor] | torch.Tensor | str,
         device: str,
         kmeans_niters: int = 4,
         max_points_per_centroid: int = 256,
@@ -191,13 +247,21 @@ class XTRWarp:
         n_samples_kmeans: int | None = None,
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
+        stream: bool = False,
     ) -> "XTRWarp":
         """Create and saves the XTRWarp index.
 
         Args:
         ----
-        documents_embeddings:
-            A list of document embedding tensors to be indexed.
+        embeddings_source:
+            A list of document embeddings or the path to a folder where the embeddings
+            are stored. The stored embeddings must be in `.pt` or `.npy` format, either
+            as a 3D tensor `[num_docs, max_len, dim]` or a 2D tensor `[total_len, dim]`
+            with a matching `.doclens.pt` or `.doclens.npy` sidecar.
+        stream:
+            Whether to stream embeddings from disk during index creation. If True,
+            `embeddings_source` must be a str and embeddings will be read from disk
+            during encoding.
         device:
             The device to use for the indexing (eg. cpu, cuda, mps, etc.)
         kmeans_niters:
@@ -217,19 +281,26 @@ class XTRWarp:
 
         """
         torch_path = self._ensure_torch_initialized(device)
-        if isinstance(documents_embeddings, torch.Tensor):
+
+        embeddings_path = None
+        if isinstance(embeddings_source, str):
+            embeddings_path = embeddings_source
+            documents_embeddings = _load_embeddings_from_path(embeddings_source)
+        elif isinstance(embeddings_source, torch.Tensor):
             documents_embeddings = [
-                documents_embeddings[i] for i in range(documents_embeddings.shape[0])
+                embeddings_source[i] for i in range(embeddings_source.shape[0])
             ]
+        else:
+            documents_embeddings = embeddings_source
 
         documents_embeddings = [
             embedding.squeeze(0) if embedding.dim() == 3 else embedding
             for embedding in documents_embeddings
         ]
 
-        self._prepare_index_directory(index_path=self.index)
-
         dim = documents_embeddings[0].shape[-1]
+
+        self._prepare_index_directory(index_path=self.index)
 
         centroids = compute_kmeans(
             documents_embeddings=documents_embeddings,
@@ -242,15 +313,19 @@ class XTRWarp:
             use_triton_kmeans=use_triton_kmeans,
         )
 
+        if stream and embeddings_path is None:
+            raise ValueError("stream=True requires embeddings_source to be a path.")
+
         xtr_warp_rs.create(
             index=self.index,
             torch_path=torch_path,
             device=device,
             nbits=nbits,
-            embeddings=documents_embeddings,
             centroids=centroids,
+            embeddings=embeddings_path if stream else documents_embeddings,
             embedding_dim=dim,
             seed=seed,
+            stream=stream,
         )
 
         return self

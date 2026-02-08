@@ -44,6 +44,7 @@ pub fn encode_chunks(
 
     let chunk_iter = source.chunk_iter(CHUNK_SIZE)?;
     for (chk_idx, chunk) in chunk_iter.enumerate() {
+        let chunk = chunk?;
         let chk_doclens = chunk.doclens;
         let chk_embs_vec = chunk.embeddings;
         let chk_embs_tensor = Tensor::cat(&chk_embs_vec, 0)
