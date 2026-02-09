@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 from fastkmeans import FastKMeans
+from torch._prims import item
 
 from . import xtr_warp_rs
 
@@ -55,37 +56,77 @@ def _load_torch_path(device: str) -> str:
 
 
 def compute_kmeans(  # noqa: PLR0913
-    documents_embeddings: list[torch.Tensor],
-    dim: int,
+    embeddings_source: list[torch.Tensor] | str,
     device: str,
     kmeans_niters: int,
     max_points_per_centroid: int,
     seed: int,
     n_samples_kmeans: int | None = None,
     use_triton_kmeans: bool | None = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, int]:
     """Compute K-means centroids for document embeddings."""
-    num_passages = len(documents_embeddings)
+    num_passages = 0
+    samples: list[torch.Tensor] = []
+    if isinstance(embeddings_source, list):
+        num_passages = len(embeddings_source)
 
-    if n_samples_kmeans is None:
-        n_samples_kmeans = min(
-            1 + int(16 * math.sqrt(120 * num_passages)),
-            num_passages,
+        if n_samples_kmeans is None:
+            n_samples_kmeans = min(
+                1 + int(16 * math.sqrt(120 * num_passages)),
+                num_passages,
+            )
+
+        n_samples_kmeans = min(num_passages, n_samples_kmeans)
+
+        sampled_pids = random.sample(
+            population=range(n_samples_kmeans),
+            k=n_samples_kmeans,
         )
 
-    n_samples_kmeans = min(num_passages, n_samples_kmeans)
+        samples = [embeddings_source[pid] for pid in set(sampled_pids)]
+    else:
+        files = _get_all_embedding_files(embeddings_source)
+        for file in files:
+            doclens_file = _doclens_path_for(file)
+            if not doclens_file:
+                raise ValueError(
+                    f"The {file} embeddings file is missing its sidecar: {doclens_file}"
+                )
+            sidecar = np.load(doclens_file)
+            num_passages += len(sidecar)
 
-    sampled_pids = random.sample(
-        population=range(n_samples_kmeans),
-        k=n_samples_kmeans,
-    )
+        if n_samples_kmeans is None:
+            n_samples_kmeans = min(
+                1 + int(16 * math.sqrt(120 * num_passages)),
+                num_passages,
+            )
 
-    samples: list[torch.Tensor] = [
-        documents_embeddings[pid] for pid in set(sampled_pids)
-    ]
+        n_samples_kmeans = min(num_passages, n_samples_kmeans)
 
+        idx = 0
+        for file in files:
+            doclens_file = _doclens_path_for(file)
+            if not doclens_file:
+                raise ValueError(
+                    f"The {file} embeddings file is missing its sidecar: {doclens_file}"
+                )
+            data = torch.from_numpy(np.load(file))
+            sidecar = torch.from_numpy(np.load(doclens_file))
+            embeddings = _split_embeddings_tensor(data, sidecar, file)
+            for doc in embeddings:
+                if len(samples) < n_samples_kmeans:
+                    samples.append(doc)
+                else:
+                    j = random.randint(0, idx)
+                    if j < n_samples_kmeans:
+                        samples[j] = doc
+                idx += 1
+            del data
+            del sidecar
+
+    dim = samples[0].size(-1)
     total_tokens = sum([sample.shape[0] for sample in samples])
-    num_partitions = (total_tokens / len(samples)) * len(documents_embeddings)
+    num_partitions = (total_tokens / len(samples)) * num_passages
     num_partitions = int(2 ** math.floor(math.log2(16 * math.sqrt(num_partitions))))
 
     tensors = torch.cat(tensors=samples)
@@ -115,7 +156,7 @@ def compute_kmeans(  # noqa: PLR0913
     return torch.nn.functional.normalize(
         input=centroids,
         dim=-1,
-    )
+    ), dim
 
 
 def _doclens_path_for(emb_path: str) -> str | None:
@@ -124,11 +165,6 @@ def _doclens_path_for(emb_path: str) -> str | None:
     if os.path.exists(npy_path):
         return npy_path
     return None
-
-
-def _load_doclens(path: str) -> torch.Tensor:
-    doclens_np = np.load(path)
-    return torch.from_numpy(doclens_np).to(dtype=torch.long, device="cpu")
 
 
 def _split_embeddings_tensor(
@@ -150,27 +186,31 @@ def _split_embeddings_tensor(
     return docs
 
 
-def _load_embeddings_from_path(embeddings_path: str) -> list[torch.Tensor]:
+def _get_all_embedding_files(embeddings_path: str) -> list[str]:
     if os.path.isfile(embeddings_path):
         files = [embeddings_path]
     else:
         npy_files = glob.glob(os.path.join(embeddings_path, "*.npy"))
         files = sorted(
-            [path for path in npy_files if not path.endswith(".doclens.npy")]
+            [path for path in npy_files if not path.endswith(".doclens.npy")],
+            key=_embedding_chunk_sort_key,
         )
     if not files:
         raise FileNotFoundError(f"No embedding .npy files found in {embeddings_path}")
 
-    documents_embeddings: list[torch.Tensor] = []
-    for emb_file in files:
-        batch = torch.from_numpy(np.load(emb_file)).to(device="cpu")
-        doclens_path = _doclens_path_for(emb_file)
-        if not doclens_path:
-            raise TypeError(f"Could not find a doclens sidecar")
-        doclens = _load_doclens(doclens_path)
-        documents_embeddings.extend(_split_embeddings_tensor(batch, doclens, emb_file))
+    return files
 
-    return documents_embeddings
+
+def _embedding_chunk_sort_key(path: str) -> tuple[int, int | str]:
+    name = os.path.basename(path)
+    if name.endswith(".doclens.npy"):
+        name = name[: -len(".doclens.npy")]
+    elif name.endswith(".npy"):
+        name = name[: -len(".npy")]
+    parts = name.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return (0, int(parts[1]))
+    return (1, name)
 
 
 def search_on_device(
@@ -247,7 +287,6 @@ class XTRWarp:
         n_samples_kmeans: int | None = None,
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
-        stream: bool = False,
     ) -> "XTRWarp":
         """Create and saves the XTRWarp index.
 
@@ -283,28 +322,30 @@ class XTRWarp:
         torch_path = self._ensure_torch_initialized(device)
 
         embeddings_path = None
-        if isinstance(embeddings_source, str):
-            embeddings_path = embeddings_source
-            documents_embeddings = _load_embeddings_from_path(embeddings_source)
-        elif isinstance(embeddings_source, torch.Tensor):
+        documents_embeddings = None
+
+        if not isinstance(embeddings_source, str):
+            if isinstance(embeddings_source, torch.Tensor):
+                documents_embeddings = [
+                    embeddings_source[i] for i in range(embeddings_source.shape[0])
+                ]
+            elif isinstance(embeddings_source, list):
+                documents_embeddings = embeddings_source
+
             documents_embeddings = [
-                embeddings_source[i] for i in range(embeddings_source.shape[0])
+                embedding.squeeze(0) if embedding.dim() == 3 else embedding
+                for embedding in documents_embeddings
             ]
         else:
-            documents_embeddings = embeddings_source
-
-        documents_embeddings = [
-            embedding.squeeze(0) if embedding.dim() == 3 else embedding
-            for embedding in documents_embeddings
-        ]
-
-        dim = documents_embeddings[0].shape[-1]
+            embeddings_path = embeddings_source
+            logger.info(
+                "Stream is set to True but the embeddings source is not a str. Disabling stream mode..."
+            )
 
         self._prepare_index_directory(index_path=self.index)
 
-        centroids = compute_kmeans(
-            documents_embeddings=documents_embeddings,
-            dim=dim,
+        centroids, dim = compute_kmeans(
+            embeddings_source=embeddings_path or documents_embeddings,
             kmeans_niters=kmeans_niters,
             device=device,
             max_points_per_centroid=max_points_per_centroid,
@@ -313,19 +354,15 @@ class XTRWarp:
             use_triton_kmeans=use_triton_kmeans,
         )
 
-        if stream and embeddings_path is None:
-            raise ValueError("stream=True requires embeddings_source to be a path.")
-
         xtr_warp_rs.create(
             index=self.index,
             torch_path=torch_path,
             device=device,
             nbits=nbits,
             centroids=centroids,
-            embeddings=embeddings_path if stream else documents_embeddings,
+            embeddings=embeddings_path or documents_embeddings,
             embedding_dim=dim,
             seed=seed,
-            stream=stream,
         )
 
         return self
