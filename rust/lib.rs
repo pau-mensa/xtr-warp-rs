@@ -22,7 +22,6 @@ pub mod utils;
 
 // Re-exports for convenience
 use crate::index::create::create_index;
-use crate::index::encode::CHUNK_SIZE;
 use crate::index::source::{DiskEmbeddingSource, EmbeddingSource, InMemoryEmbeddingSource};
 use search::{IndexLoader, Searcher};
 use utils::types::{IndexConfig, Query, ReadOnlyIndex, SearchConfig, SearchResult};
@@ -226,26 +225,15 @@ impl<'source> FromPyObject<'source> for EmbeddingsInput {
 }
 
 impl EmbeddingsInput {
-    fn into_source(self, stream: bool) -> Result<Box<dyn EmbeddingSource>> {
+    fn into_source(self) -> Result<Box<dyn EmbeddingSource>> {
         match self {
             EmbeddingsInput::Direct(embeddings) => {
                 let embeddings: Vec<_> = embeddings.into_iter().map(|tensor| tensor.0).collect();
                 Ok(Box::new(InMemoryEmbeddingSource::new(embeddings)))
-            }
+            },
             EmbeddingsInput::FromPath(path) => {
-                if stream {
-                    Ok(Box::new(DiskEmbeddingSource::new(Path::new(&path))?))
-                } else {
-                    let mut disk_source = DiskEmbeddingSource::new(Path::new(&path))?;
-                    let mut all_embeddings = Vec::with_capacity(disk_source.num_docs());
-                    let chunk_iter = disk_source.chunk_iter(CHUNK_SIZE)?;
-                    for chunk in chunk_iter {
-                        let chunk = chunk?;
-                        all_embeddings.extend(chunk.embeddings);
-                    }
-                    Ok(Box::new(InMemoryEmbeddingSource::new(all_embeddings)))
-                }
-            }
+                Ok(Box::new(DiskEmbeddingSource::new(Path::new(&path))?))
+            },
         }
     }
 }
@@ -262,7 +250,6 @@ impl EmbeddingsInput {
 ///     centroids (torch.Tensor): A 2D tensor of shape `[num_centroids, embedding_dim]`.
 ///     embedding_dim (int): The dimensionality of the embeddings.
 ///     seed (int, optional): Optional seed for the random number generator.
-///     stream (bool): Whether to stream embeddings from disk during index creation.
 #[pyfunction]
 #[pyo3(signature = (
     index,
@@ -273,7 +260,6 @@ impl EmbeddingsInput {
     embeddings,
     embedding_dim=None,
     seed=None,
-    stream=false,
 ))]
 fn create(
     _py: Python<'_>,
@@ -285,7 +271,6 @@ fn create(
     embeddings: EmbeddingsInput,
     embedding_dim: Option<u32>,
     seed: Option<u64>,
-    stream: bool,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -297,7 +282,7 @@ fn create(
     let centroids = centroids.to_device(device);
 
     let mut source = embeddings
-        .into_source(stream)
+        .into_source()
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to read embeddings: {}", e)))?;
 
     create_index(
