@@ -11,6 +11,7 @@
 
 import argparse
 import gc
+import glob
 import json
 import os
 import shutil
@@ -152,13 +153,25 @@ QUERY_LENGTH = {
 }
 
 
+def _embedding_chunk_sort_key(path: str) -> tuple[int, int | str]:
+    name = os.path.basename(path)
+    if name.endswith(".doclens.npy"):
+        name = name[: -len(".doclens.npy")]
+    elif name.endswith(".npy"):
+        name = name[: -len(".npy")]
+    parts = name.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return (0, int(parts[1]))
+    return (1, name)
+
+
 def run_xtr_warp(
     config,
     documents,
     queries,
     qrels,
     documents_ids,
-    documents_embeddings,
+    embeddings_source,
     queries_embeddings,
     dataset_name,
 ):
@@ -171,7 +184,7 @@ def run_xtr_warp(
     index = XTRWarp(index=index_dir)
 
     print(f"🏗️  Building index for {dataset_name}...")
-    print(f"Document shape: {documents_embeddings[0].shape}")
+    # print(f"Document shape: {documents_embeddings[0].shape}")
 
     index_monitor = MemoryMonitor(pre_operation_baseline=pre_index_memory)
     index_monitor.start()
@@ -179,7 +192,9 @@ def run_xtr_warp(
     start_index = time.time()
     if config["device"] == "cuda":
         index.create(
-            documents_embeddings=documents_embeddings,
+            embeddings_source=embeddings_source,  # embeddings_path,
+            # if embeddings_path
+            # else documents_embeddings,
             kmeans_niters=4,
             max_points_per_centroid=256,
             nbits=4,
@@ -558,6 +573,18 @@ def main():
         default=None,
         help="Limit the number of queries to test (useful for testing before full evaluation).",
     )
+    parser.add_argument(
+        "--docs-per-file",
+        type=int,
+        default=None,
+        help="How many docs per tensor we want to split the dataset to. Ignored if the embeddings are already cached.",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        default=False,
+        help="Whether to use streaming for efficient memory usage if possible",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -627,19 +654,41 @@ def main():
     print("-" * 150)
     print(f"📊 Processing {len(documents)} documents and {len(queries)} queries")
 
-    embeddings_dir = Path("embeddings")
+    embeddings_dir = Path(f"embeddings/{dataset_name}")
     embeddings_dir.mkdir(exist_ok=True)
-    docs_emb_path = embeddings_dir / f"documents_embeddings_{dataset_name}.pt"
+    docs_emb_path = embeddings_dir / f"documents_embeddings_{dataset_name}.npy"
+    first_chunk_path = embeddings_dir / f"documents_embeddings_{dataset_name}_0.npy"
     queries_emb_path = embeddings_dir / f"queries_embeddings_{dataset_name}.pt"
+    documents_embeddings = None
 
-    if docs_emb_path.exists() and queries_emb_path.exists():
-        print(f"📂 Loading cached embeddings from {embeddings_dir}")
-        # documents_embeddings = np.array([[]]) # placeholder for vram issues
-        documents_embeddings = torch.load(docs_emb_path)
+    if first_chunk_path.exists() and queries_emb_path.exists():
+        if framework != "xtr-warp" or (framework == "xtr-warp" and not args.stream):
+            print(f"📂 Loading cached embeddings from {embeddings_dir}")
+            counter = 0
+            it = 1
+            documents_embeddings = []
+            npy_files = glob.glob(os.path.join(docs_emb_path.parents[0], "*.npy"))
+            embd_files = sorted(
+                [path for path in npy_files if "doclens" not in path],
+                key=_embedding_chunk_sort_key,
+            )
+            doclens_files = sorted(
+                [path for path in npy_files if "doclens" in path],
+                key=_embedding_chunk_sort_key,
+            )
+            for embd_f, doclen_f in zip(embd_files, doclens_files):
+                flat = torch.from_numpy(np.load(embd_f))
+                sidecar = torch.from_numpy(np.load(doclen_f))
+                counter = 0
+                for doc_len in sidecar:
+                    documents_embeddings.append(flat[counter : counter + doc_len])
+                    counter += doc_len
+            embeddings_source = documents_embeddings
+        elif framework == "xtr-warp" and args.stream:
+            print("Skipping embeddings load, stream mode enabled")
+            embeddings_source = str(docs_emb_path.parents[0])
+
         queries_embeddings = torch.load(queries_emb_path)
-        if args.n_docs is not None:
-            # documents_embeddings = np.array([[]]) # placeholder for vram issues
-            documents_embeddings = documents_embeddings[: args.n_docs]
         if args.n_queries is not None:
             queries_embeddings = queries_embeddings[: args.n_queries]
     else:
@@ -663,10 +712,37 @@ def main():
         documents_embeddings = [
             torch.tensor(doc_emb) for doc_emb in documents_embeddings
         ]
+        embeddings_source = documents_embeddings
         queries_embeddings = torch.cat(tensors=[queries_embeddings], dim=0)
 
-        torch.save(documents_embeddings, docs_emb_path)
         torch.save(queries_embeddings, queries_emb_path)
+        if args.docs_per_file is None:
+            flat = torch.cat(documents_embeddings, dim=0)
+            np.save(first_chunk_path, flat.numpy())
+            doclens = torch.tensor(
+                [d.shape[0] for d in documents_embeddings], dtype=torch.long
+            )
+            doclens_path = str(docs_emb_path).replace(".npy", "_0.doclens.npy")
+            np.save(doclens_path, doclens.numpy())
+        else:
+            total_docs = len(documents_embeddings)
+            counter = 0
+            it = 0
+            while counter < total_docs:
+                batch_embeddings = documents_embeddings[
+                    counter : counter + args.docs_per_file
+                ]
+                flat = torch.cat(batch_embeddings, dim=0)
+                doclens = torch.tensor(
+                    [d.shape[0] for d in batch_embeddings], dtype=torch.long
+                )
+                np.save(str(docs_emb_path).replace(".npy", f"_{it}.npy"), flat.numpy())
+                np.save(
+                    str(docs_emb_path).replace(".npy", f"_{it}.doclens.npy"),
+                    doclens.numpy(),
+                )
+                counter += args.docs_per_file
+                it += 1
         print(f"💾 Saved embeddings to {embeddings_dir}")
 
     if framework == "xtr-warp":
@@ -676,7 +752,7 @@ def main():
             queries,
             qrels,
             documents_ids,
-            documents_embeddings,
+            embeddings_source,
             queries_embeddings,
             dataset_name,
         )
