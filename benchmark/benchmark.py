@@ -165,6 +165,27 @@ def _embedding_chunk_sort_key(path: str) -> tuple[int, int | str]:
     return (1, name)
 
 
+def _load_documents_embeddings(embeddings_dir: Path) -> list[torch.Tensor]:
+    documents_embeddings = []
+    npy_files = glob.glob(os.path.join(embeddings_dir, "*.npy"))
+    embd_files = sorted(
+        [path for path in npy_files if "doclens" not in path],
+        key=_embedding_chunk_sort_key,
+    )
+    doclens_files = sorted(
+        [path for path in npy_files if "doclens" in path],
+        key=_embedding_chunk_sort_key,
+    )
+    for embd_f, doclen_f in zip(embd_files, doclens_files):
+        flat = torch.from_numpy(np.load(embd_f))
+        sidecar = torch.from_numpy(np.load(doclen_f))
+        counter = 0
+        for doc_len in sidecar:
+            documents_embeddings.append(flat[counter : counter + doc_len])
+            counter += doc_len
+    return documents_embeddings
+
+
 def run_xtr_warp(
     config,
     documents,
@@ -664,25 +685,7 @@ def main():
     if first_chunk_path.exists() and queries_emb_path.exists():
         if framework != "xtr-warp" or (framework == "xtr-warp" and not args.stream):
             print(f"📂 Loading cached embeddings from {embeddings_dir}")
-            counter = 0
-            it = 1
-            documents_embeddings = []
-            npy_files = glob.glob(os.path.join(docs_emb_path.parents[0], "*.npy"))
-            embd_files = sorted(
-                [path for path in npy_files if "doclens" not in path],
-                key=_embedding_chunk_sort_key,
-            )
-            doclens_files = sorted(
-                [path for path in npy_files if "doclens" in path],
-                key=_embedding_chunk_sort_key,
-            )
-            for embd_f, doclen_f in zip(embd_files, doclens_files):
-                flat = torch.from_numpy(np.load(embd_f))
-                sidecar = torch.from_numpy(np.load(doclen_f))
-                counter = 0
-                for doc_len in sidecar:
-                    documents_embeddings.append(flat[counter : counter + doc_len])
-                    counter += doc_len
+            documents_embeddings = _load_documents_embeddings(embeddings_dir)
             embeddings_source = documents_embeddings
         elif framework == "xtr-warp" and args.stream:
             print("Skipping embeddings load, stream mode enabled")
@@ -692,14 +695,6 @@ def main():
         if args.n_queries is not None:
             queries_embeddings = queries_embeddings[: args.n_queries]
     else:
-        print(f"🧠 Encoding documents for {dataset_name}...")
-        documents_embeddings = model.encode(
-            [document["text"] for document in documents],
-            batch_size=256,
-            show_progress_bar=True,
-            is_query=False,
-        )
-
         print(f"🧠 Encoding queries for {dataset_name}...")
         queries_embeddings = model.encode(
             list(queries.values()),
@@ -709,14 +704,22 @@ def main():
         )
 
         queries_embeddings = torch.Tensor(np.array(queries_embeddings))
-        documents_embeddings = [
-            torch.tensor(doc_emb) for doc_emb in documents_embeddings
-        ]
-        embeddings_source = documents_embeddings
         queries_embeddings = torch.cat(tensors=[queries_embeddings], dim=0)
 
         torch.save(queries_embeddings, queries_emb_path)
+
+        print(f"🧠 Encoding documents for {dataset_name}...")
         if args.docs_per_file is None:
+            documents_embeddings = model.encode(
+                [document["text"] for document in documents],
+                batch_size=256,
+                show_progress_bar=True,
+                is_query=False,
+            )
+            documents_embeddings = [
+                torch.tensor(doc_emb) for doc_emb in documents_embeddings
+            ]
+            embeddings_source = documents_embeddings
             flat = torch.cat(documents_embeddings, dim=0)
             np.save(first_chunk_path, flat.numpy())
             doclens = torch.tensor(
@@ -725,24 +728,42 @@ def main():
             doclens_path = str(docs_emb_path).replace(".npy", "_0.doclens.npy")
             np.save(doclens_path, doclens.numpy())
         else:
-            total_docs = len(documents_embeddings)
+            total_docs = len(documents)
             counter = 0
             it = 0
             while counter < total_docs:
-                batch_embeddings = documents_embeddings[
-                    counter : counter + args.docs_per_file
+                batch_docs = documents[counter : counter + args.docs_per_file]
+                batch_embeddings = model.encode(
+                    [document["text"] for document in batch_docs],
+                    batch_size=256,
+                    show_progress_bar=True,
+                    is_query=False,
+                )
+                batch_embeddings = [
+                    torch.tensor(doc_emb) for doc_emb in batch_embeddings
                 ]
                 flat = torch.cat(batch_embeddings, dim=0)
                 doclens = torch.tensor(
                     [d.shape[0] for d in batch_embeddings], dtype=torch.long
                 )
-                np.save(str(docs_emb_path).replace(".npy", f"_{it}.npy"), flat.numpy())
+                np.save(
+                    str(docs_emb_path).replace(".npy", f"_{it}.npy"),
+                    flat.numpy(),
+                )
                 np.save(
                     str(docs_emb_path).replace(".npy", f"_{it}.doclens.npy"),
                     doclens.numpy(),
                 )
                 counter += args.docs_per_file
                 it += 1
+
+            if framework != "xtr-warp" or (framework == "xtr-warp" and not args.stream):
+                print(f"📂 Loading cached embeddings from {embeddings_dir}")
+                documents_embeddings = _load_documents_embeddings(embeddings_dir)
+                embeddings_source = documents_embeddings
+            else:
+                print("Skipping embeddings load, stream mode enabled")
+                embeddings_source = str(docs_emb_path.parents[0])
         print(f"💾 Saved embeddings to {embeddings_dir}")
 
     if framework == "xtr-warp":
