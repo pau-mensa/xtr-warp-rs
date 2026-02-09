@@ -208,13 +208,28 @@ fn list_embedding_files(path: &Path) -> Result<Vec<PathBuf>> {
         .filter(|entry| !is_doclens_file(entry))
         .collect();
 
-    files.sort();
+    files.sort_by(|a, b| match (numeric_suffix(a), numeric_suffix(b)) {
+        (Some(ia), Some(ib)) => ia.cmp(&ib).then_with(|| a.cmp(b)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.cmp(b),
+    });
 
     if files.is_empty() {
         bail!("no embedding .npy files found in {}", path.display());
     }
 
     Ok(files)
+}
+
+fn numeric_suffix(path: &Path) -> Option<u64> {
+    let stem = path.file_stem()?.to_str()?;
+    let mut parts = stem.rsplitn(2, '_');
+    let suffix = parts.next()?;
+    if parts.next().is_none() {
+        return None;
+    }
+    suffix.parse::<u64>().ok()
 }
 
 fn is_doclens_file(path: &Path) -> bool {
