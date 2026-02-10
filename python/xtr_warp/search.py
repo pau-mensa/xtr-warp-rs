@@ -83,8 +83,8 @@ class InMemorySource:
 
 
 @dataclass
-class FileSource:
-    """Source for embeddings stored in files."""
+class DiskSource:
+    """Source for embeddings stored in disk."""
 
     path: str
     _files_and_doclens: list[tuple[str, list[int]]] | None = None
@@ -159,7 +159,7 @@ def _create_source(embeddings_source: list[torch.Tensor] | str) -> EmbeddingSour
     """Create appropriate source."""
     if isinstance(embeddings_source, list):
         return InMemorySource(embeddings_source)
-    return FileSource(embeddings_source)
+    return DiskSource(embeddings_source)
 
 
 def compute_kmeans(  # noqa: PLR0913
