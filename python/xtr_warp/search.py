@@ -54,39 +54,38 @@ def _load_torch_path(device: str) -> str:
     raise TorchWithCudaNotFoundError(error) from IndexError
 
 
-def compute_kmeans(  # noqa: PLR0913
+def _prepare_sampling(
     embeddings_source: list[torch.Tensor] | str,
-    device: str,
-    kmeans_niters: int,
-    max_points_per_centroid: int,
+) -> tuple[int, list[tuple[str, str]] | None, list[int] | None]:
+    """Prepare the sampling phase by getting the necessary information."""
+    if isinstance(embeddings_source, list):
+        num_passages = len(embeddings_source)
+        return num_passages, None, None
+
+    num_passages: int = 0
+    files = _get_all_embedding_files(embeddings_source)
+    doclens_all: list[int] = []
+    combined = list(zip(files, [_doclens_path_for(file) for file in files]))
+    for _, doclens_file in combined:
+        sidecar = np.load(doclens_file)
+        num_passages += len(sidecar)
+        doclens_all.extend(sidecar.tolist())
+
+    return num_passages, combined, doclens_all
+
+
+def _sample_source(  # noqa: PLR0913
+    embeddings_source: list[torch.Tensor] | str,
+    num_passages: int,
+    n_samples_kmeans: int,
+    doclens_all: list[int] | None,
+    combined: list[tuple[str, str]] | None,
     seed: int,
-    n_samples_kmeans: int | None = None,
-    use_triton_kmeans: bool | None = None,
-) -> tuple[torch.Tensor, int]:
-    """Compute K-means centroids for document embeddings."""
-    num_passages = 0
-    samples: list[torch.Tensor] = []
+) -> tuple[torch.Tensor, int, int]:
+    """Sample embeddings from the source in order to build the centroids."""
     tensors: torch.Tensor | None = None
     rng = random.Random(seed)
 
-    if isinstance(embeddings_source, list):
-        num_passages = len(embeddings_source)
-    else:
-        files = _get_all_embedding_files(embeddings_source)
-        doclens_all: list[int] = []
-        combined = list(zip(files, [_doclens_path_for(file) for file in files]))
-        for _, doclens_file in combined:
-            sidecar = np.load(doclens_file)
-            num_passages += len(sidecar)
-            doclens_all.extend(sidecar.tolist())
-
-    if n_samples_kmeans is None:
-        n_samples_kmeans = min(
-            1 + int(16 * math.sqrt(120 * num_passages)),
-            num_passages,
-        )
-
-    n_samples_kmeans = min(num_passages, n_samples_kmeans)
     sampled_pids = rng.sample(
         population=range(num_passages),
         k=n_samples_kmeans,
@@ -100,7 +99,6 @@ def compute_kmeans(  # noqa: PLR0913
         tensors = torch.cat(tensors=samples)
     else:
         total_tokens = int(sum(doclens_all[pid] for pid in sampled_pids))
-        del doclens_all
 
         write_offset = 0
         doc_offset = 0
@@ -126,6 +124,37 @@ def compute_kmeans(  # noqa: PLR0913
             del data
             if remaining == 0:
                 break
+
+    if tensors is None:
+        raise ValueError("Could not sample embeddings from source")
+
+    return tensors, total_tokens, dim
+
+
+def compute_kmeans(  # noqa: PLR0913
+    embeddings_source: list[torch.Tensor] | str,
+    device: str,
+    kmeans_niters: int,
+    max_points_per_centroid: int,
+    seed: int,
+    n_samples_kmeans: int | None = None,
+    use_triton_kmeans: bool | None = None,
+) -> tuple[torch.Tensor, int]:
+    """Compute K-means centroids for document embeddings."""
+    # I really don't like how i coded this,
+    #  but I can't think of anything simpler for now...
+
+    num_passages, combined, doclens_all = _prepare_sampling(embeddings_source)
+
+    if n_samples_kmeans is None:
+        n_samples_kmeans = min(
+            1 + int(16 * math.sqrt(120 * num_passages)),
+            num_passages,
+        )
+
+    tensors, total_tokens, dim = _sample_source(
+        embeddings_source, num_passages, n_samples_kmeans, doclens_all, combined, seed
+    )
 
     num_partitions = (total_tokens / n_samples_kmeans) * num_passages
     num_partitions = int(2 ** math.floor(math.log2(16 * math.sqrt(num_partitions))))
