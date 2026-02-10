@@ -11,7 +11,6 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 from fastkmeans import FastKMeans
-from torch._prims import item
 
 from . import xtr_warp_rs
 
@@ -67,71 +66,77 @@ def compute_kmeans(  # noqa: PLR0913
     """Compute K-means centroids for document embeddings."""
     num_passages = 0
     samples: list[torch.Tensor] = []
+    tensors: torch.Tensor | None = None
+    rng = random.Random(seed)
+
     if isinstance(embeddings_source, list):
         num_passages = len(embeddings_source)
-
-        if n_samples_kmeans is None:
-            n_samples_kmeans = min(
-                1 + int(16 * math.sqrt(120 * num_passages)),
-                num_passages,
-            )
-
-        n_samples_kmeans = min(num_passages, n_samples_kmeans)
-
-        sampled_pids = random.sample(
-            population=range(n_samples_kmeans),
-            k=n_samples_kmeans,
-        )
-
-        samples = [embeddings_source[pid] for pid in set(sampled_pids)]
     else:
         files = _get_all_embedding_files(embeddings_source)
-        for file in files:
-            doclens_file = _doclens_path_for(file)
-            if not doclens_file:
-                raise ValueError(
-                    f"The {file} embeddings file is missing its sidecar: {doclens_file}"
-                )
+        doclens_all: list[int] = []
+        combined = list(zip(files, [_doclens_path_for(file) for file in files]))
+        for _, doclens_file in combined:
             sidecar = np.load(doclens_file)
             num_passages += len(sidecar)
+            doclens_all.extend(sidecar.tolist())
 
-        if n_samples_kmeans is None:
-            n_samples_kmeans = min(
-                1 + int(16 * math.sqrt(120 * num_passages)),
-                num_passages,
-            )
+    if n_samples_kmeans is None:
+        n_samples_kmeans = min(
+            1 + int(16 * math.sqrt(120 * num_passages)),
+            num_passages,
+        )
 
-        n_samples_kmeans = min(num_passages, n_samples_kmeans)
+    n_samples_kmeans = min(num_passages, n_samples_kmeans)
+    sampled_pids = rng.sample(
+        population=range(num_passages),
+        k=n_samples_kmeans,
+    )
+    sampled_pid_set = set(sampled_pids)
 
-        idx = 0
-        for file in files:
-            doclens_file = _doclens_path_for(file)
-            if not doclens_file:
-                raise ValueError(
-                    f"The {file} embeddings file is missing its sidecar: {doclens_file}"
-                )
+    if isinstance(embeddings_source, list):
+        samples = [embeddings_source[pid] for pid in sampled_pids]
+        dim = samples[0].size(-1)
+        total_tokens = sum(sample.shape[0] for sample in samples)
+        tensors = torch.cat(tensors=samples)
+    else:
+        total_tokens = int(sum(doclens_all[pid] for pid in sampled_pids))
+        del doclens_all
+
+        write_offset = 0
+        doc_offset = 0
+        remaining = len(sampled_pid_set)
+        for file, doclens_file in combined:
             data = torch.from_numpy(np.load(file))
-            sidecar = torch.from_numpy(np.load(doclens_file))
-            embeddings = _split_embeddings_tensor(data, sidecar, file)
-            for doc in embeddings:
-                if len(samples) < n_samples_kmeans:
-                    samples.append(doc)
-                else:
-                    j = random.randint(0, idx)
-                    if j < n_samples_kmeans:
-                        samples[j] = doc
-                idx += 1
+            sidecar = np.load(doclens_file)
+            if tensors is None:
+                dim = data.size(-1)
+                tensors = torch.empty((total_tokens, dim), dtype=data.dtype)
+            offset = 0
+            for doc_len in sidecar:
+                if doc_offset in sampled_pid_set:
+                    doc = data[offset : offset + doc_len]
+                    tensors[write_offset : write_offset + doc_len].copy_(doc)
+                    write_offset += doc_len
+                    sampled_pid_set.remove(doc_offset)
+                    remaining -= 1
+                    if remaining == 0:
+                        break
+                offset += doc_len
+                doc_offset += 1
             del data
-            del sidecar
+            if remaining == 0:
+                break
 
-    dim = samples[0].size(-1)
-    total_tokens = sum([sample.shape[0] for sample in samples])
-    num_partitions = (total_tokens / len(samples)) * num_passages
+    num_partitions = (total_tokens / n_samples_kmeans) * num_passages
     num_partitions = int(2 ** math.floor(math.log2(16 * math.sqrt(num_partitions))))
 
-    tensors = torch.cat(tensors=samples)
+    # I don't want any surprises here
     if tensors.is_cuda:
-        tensors = tensors.to(device="cpu", dtype=torch.float32)
+        tensors = tensors.to(device="cpu")
+    if tensors.dtype != torch.float32:
+        tensors = tensors.to(dtype=torch.float32)
+    if not tensors.is_contiguous():
+        tensors = tensors.contiguous()
 
     kmeans = FastKMeans(
         d=dim,
@@ -159,31 +164,14 @@ def compute_kmeans(  # noqa: PLR0913
     ), dim
 
 
-def _doclens_path_for(emb_path: str) -> str | None:
+def _doclens_path_for(emb_path: str) -> str:
     stem, _ = os.path.splitext(emb_path)
     npy_path = f"{stem}.doclens.npy"
     if os.path.exists(npy_path):
         return npy_path
-    return None
-
-
-def _split_embeddings_tensor(
-    embeddings: torch.Tensor,
-    doclens: torch.Tensor,
-    path: str,
-) -> list[torch.Tensor]:
-    doclens_list = doclens.tolist()
-    total = embeddings.shape[0]
-    offset = 0
-    docs = []
-    for doc_len in doclens_list:
-        docs.append(embeddings[offset : offset + doc_len])
-        offset += doc_len
-    if offset != total:
-        raise ValueError(
-            f"Doclens sum {offset} does not match embeddings count {total} in {path}"
-        )
-    return docs
+    raise ValueError(
+        f"The {emb_path} embeddings file is missing its sidecar: {npy_path}"
+    )
 
 
 def _get_all_embedding_files(embeddings_path: str) -> list[str]:
