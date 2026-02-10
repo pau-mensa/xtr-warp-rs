@@ -176,12 +176,12 @@ fn sample_embeddings_streaming(
         total_doc_len += chunk.doclens.iter().sum::<i64>();
         for doc in &chunk.embeddings {
             if (seen as usize) < k {
-                sample_tensors.push(doc.shallow_clone());
+                sample_tensors.push(doc.copy());
                 sample_pids.push(doc_offset);
             } else {
                 let j = (rng.next_u64() % (seen as u64 + 1)) as usize;
                 if j < k {
-                    sample_tensors[j] = doc.shallow_clone();
+                    sample_tensors[j] = doc.copy();
                     sample_pids[j] = doc_offset;
                 }
             }
