@@ -6,6 +6,8 @@ import logging
 import math
 import os
 import random
+from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 import torch
@@ -54,61 +56,82 @@ def _load_torch_path(device: str) -> str:
     raise TorchWithCudaNotFoundError(error) from IndexError
 
 
-def _prepare_sampling(
-    embeddings_source: list[torch.Tensor] | str,
-) -> tuple[int, list[tuple[str, str]] | None, list[int] | None]:
-    """Prepare the sampling phase by getting the necessary information."""
-    if isinstance(embeddings_source, list):
-        num_passages = len(embeddings_source)
-        return num_passages, None, None
+class EmbeddingSource(Protocol):
+    """Protocol for embedding sources."""
 
-    num_passages: int = 0
-    files = _get_all_embedding_files(embeddings_source)
-    doclens_all: list[int] = []
-    combined = list(zip(files, [_doclens_path_for(file) for file in files]))
-    for _, doclens_file in combined:
-        sidecar = np.load(doclens_file)
-        num_passages += len(sidecar)
-        doclens_all.extend(sidecar.tolist())
-
-    return num_passages, combined, doclens_all
+    def get_num_passages(self) -> int: ...
+    def sample_embeddings(self, pids: list[int]) -> tuple[torch.Tensor, int, int]: ...
 
 
-def _sample_source(  # noqa: PLR0913
-    embeddings_source: list[torch.Tensor] | str,
-    num_passages: int,
-    n_samples_kmeans: int,
-    doclens_all: list[int] | None,
-    combined: list[tuple[str, str]] | None,
-    seed: int,
-) -> tuple[torch.Tensor, int, int]:
-    """Sample embeddings from the source in order to build the centroids."""
-    tensors: torch.Tensor | None = None
-    rng = random.Random(seed)
+@dataclass
+class InMemorySource:
+    """Source for embeddings already in memory."""
 
-    sampled_pids = rng.sample(
-        population=range(num_passages),
-        k=n_samples_kmeans,
-    )
-    sampled_pid_set = set(sampled_pids)
+    embeddings: list[torch.Tensor]
 
-    if isinstance(embeddings_source, list):
-        samples = [embeddings_source[pid] for pid in sampled_pids]
+    def get_num_passages(self) -> int:
+        """Get the number of passages."""
+        return len(self.embeddings)
+
+    def sample_embeddings(self, pids: list[int]) -> tuple[torch.Tensor, int, int]:
+        """Sample the embeddings based on the pids."""
+        samples = [self.embeddings[pid] for pid in pids]
         dim = samples[0].size(-1)
         total_tokens = sum(sample.shape[0] for sample in samples)
         tensors = torch.cat(tensors=samples)
-    else:
-        total_tokens = int(sum(doclens_all[pid] for pid in sampled_pids))
+        return tensors, total_tokens, dim
 
+
+@dataclass
+class FileSource:
+    """Source for embeddings stored in files."""
+
+    path: str
+    _files_and_doclens: list[tuple[str, list[int]]] | None = None
+    _doclens: list[int] | None = None
+    _num_passages: int = 0
+
+    def _load_metadata(self) -> None:
+        if self._files_and_doclens is not None:
+            return
+
+        files = _get_all_embedding_files(self.path)
+        self._doclens = []
+        self._files_and_doclens = []
+
+        for file in files:
+            doclens_file = _doclens_path_for(file)
+            sidecar = np.load(doclens_file)
+            self._num_passages += len(sidecar)
+            sidecar_list = sidecar.tolist()
+            self._doclens.extend(sidecar_list)
+            self._files_and_doclens.append((file, sidecar_list))
+
+    def get_num_passages(self) -> int:
+        """Get the number of passages."""
+        self._load_metadata()
+        return self._num_passages
+
+    def sample_embeddings(self, pids: list[int]) -> tuple[torch.Tensor, int, int]:
+        """Sample the embeddings based on the pids."""
+        self._load_metadata()
+
+        sampled_pid_set = set(pids)
+        total_tokens = sum(self._doclens[pid] for pid in pids)
+
+        tensors = None
+        dim = None
         write_offset = 0
         doc_offset = 0
         remaining = len(sampled_pid_set)
-        for file, doclens_file in combined:
+
+        for file, sidecar in self._files_and_doclens:
             data = torch.from_numpy(np.load(file))
-            sidecar = np.load(doclens_file)
+
             if tensors is None:
                 dim = data.size(-1)
                 tensors = torch.empty((total_tokens, dim), dtype=data.dtype)
+
             offset = 0
             for doc_len in sidecar:
                 if doc_offset in sampled_pid_set:
@@ -121,14 +144,22 @@ def _sample_source(  # noqa: PLR0913
                         break
                 offset += doc_len
                 doc_offset += 1
+
             del data
             if remaining == 0:
                 break
 
-    if tensors is None:
-        raise ValueError("Could not sample embeddings from source")
+        if tensors is None or dim is None:
+            raise ValueError("Could not sample embeddings from source")
 
-    return tensors, total_tokens, dim
+        return tensors, total_tokens, dim
+
+
+def _create_source(embeddings_source: list[torch.Tensor] | str) -> EmbeddingSource:
+    """Create appropriate source."""
+    if isinstance(embeddings_source, list):
+        return InMemorySource(embeddings_source)
+    return FileSource(embeddings_source)
 
 
 def compute_kmeans(  # noqa: PLR0913
@@ -141,10 +172,8 @@ def compute_kmeans(  # noqa: PLR0913
     use_triton_kmeans: bool | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Compute K-means centroids for document embeddings."""
-    # I really don't like how i coded this,
-    #  but I can't think of anything simpler for now...
-
-    num_passages, combined, doclens_all = _prepare_sampling(embeddings_source)
+    source = _create_source(embeddings_source)
+    num_passages = source.get_num_passages()
 
     if n_samples_kmeans is None:
         n_samples_kmeans = min(
@@ -152,9 +181,11 @@ def compute_kmeans(  # noqa: PLR0913
             num_passages,
         )
 
-    tensors, total_tokens, dim = _sample_source(
-        embeddings_source, num_passages, n_samples_kmeans, doclens_all, combined, seed
-    )
+    # Sample passages
+    rng = random.Random(seed)
+    sampled_pids = rng.sample(range(num_passages), k=n_samples_kmeans)
+
+    tensors, total_tokens, dim = source.sample_embeddings(sampled_pids)
 
     num_partitions = (total_tokens / n_samples_kmeans) * num_passages
     num_partitions = int(2 ** math.floor(math.log2(16 * math.sqrt(num_partitions))))
