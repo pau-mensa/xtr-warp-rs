@@ -4,8 +4,11 @@
 
 Run all benchmarks across all datasets and configurations:
 ```bash
-uv run benchmark/run_benchmark.py
+uv run benchmark/run_benchmark.py --docs-per-file 25000 --stream
 ```
+
+- Both the docs per file and stream args will get passed to the benchmark call, remove them at your will
+- Docs per file will only be used if the embeddings are not cached
 
 Run a specific experiment for a single dataset:
 ```bash
