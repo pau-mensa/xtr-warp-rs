@@ -7,6 +7,7 @@ import math
 import os
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 import numpy as np
@@ -86,8 +87,8 @@ class InMemorySource:
 class DiskSource:
     """Source for embeddings stored in disk."""
 
-    path: str
-    _files_and_doclens: list[tuple[str, list[int]]] | None = None
+    path: Path
+    _files_and_doclens: list[tuple[Path, list[int]]] | None = None
     _doclens: list[int] | None = None
     _num_passages: int = 0
 
@@ -155,7 +156,7 @@ class DiskSource:
         return tensors, total_tokens, dim
 
 
-def _create_source(embeddings_source: list[torch.Tensor] | str) -> EmbeddingSource:
+def _create_source(embeddings_source: list[torch.Tensor] | Path) -> EmbeddingSource:
     """Create appropriate source."""
     if isinstance(embeddings_source, list):
         return InMemorySource(embeddings_source)
@@ -163,7 +164,7 @@ def _create_source(embeddings_source: list[torch.Tensor] | str) -> EmbeddingSour
 
 
 def compute_kmeans(  # noqa: PLR0913
-    embeddings_source: list[torch.Tensor] | str,
+    embeddings_source: list[torch.Tensor] | Path,
     device: str,
     kmeans_niters: int,
     max_points_per_centroid: int,
@@ -224,23 +225,22 @@ def compute_kmeans(  # noqa: PLR0913
     ), dim
 
 
-def _doclens_path_for(emb_path: str) -> str:
-    stem, _ = os.path.splitext(emb_path)
-    npy_path = f"{stem}.doclens.npy"
-    if os.path.exists(npy_path):
+def _doclens_path_for(emb_path: Path) -> Path:
+    npy_path = emb_path.with_suffix(".doclens.npy")
+    if npy_path.exists():
         return npy_path
     raise ValueError(
         f"The {emb_path} embeddings file is missing its sidecar: {npy_path}"
     )
 
 
-def _get_all_embedding_files(embeddings_path: str) -> list[str]:
-    if os.path.isfile(embeddings_path):
+def _get_all_embedding_files(embeddings_path: Path) -> list[Path]:
+    if embeddings_path.is_file():
         files = [embeddings_path]
     else:
-        npy_files = glob.glob(os.path.join(embeddings_path, "*.npy"))
+        npy_files = list(embeddings_path.glob("*.npy"))
         files = sorted(
-            [path for path in npy_files if not path.endswith(".doclens.npy")],
+            [path for path in npy_files if not path.name.endswith(".doclens.npy")],
             key=_embedding_chunk_sort_key,
         )
     if not files:
@@ -249,12 +249,13 @@ def _get_all_embedding_files(embeddings_path: str) -> list[str]:
     return files
 
 
-def _embedding_chunk_sort_key(path: str) -> tuple[int, int | str]:
-    name = os.path.basename(path)
-    if name.endswith(".doclens.npy"):
-        name = name[: -len(".doclens.npy")]
-    elif name.endswith(".npy"):
-        name = name[: -len(".npy")]
+def _embedding_chunk_sort_key(path: Path) -> tuple[int, int | str]:
+    name = path.stem
+
+    # (double extension for doclens)
+    if path.name.endswith(".doclens.npy"):
+        name = path.name[: -len(".doclens.npy")]
+
     parts = name.rsplit("_", 1)
     if len(parts) == 2 and parts[1].isdigit():
         return (0, int(parts[1]))
@@ -327,7 +328,7 @@ class XTRWarp:
 
     def create(  # noqa: PLR0913
         self,
-        embeddings_source: list[torch.Tensor] | torch.Tensor | str,
+        embeddings_source: list[torch.Tensor] | torch.Tensor | str | Path,
         device: str,
         kmeans_niters: int = 4,
         max_points_per_centroid: int = 256,
@@ -342,9 +343,8 @@ class XTRWarp:
         ----
         embeddings_source:
             A list of document embeddings or the path to a folder where the embeddings
-            are stored. The stored embeddings must be in `.pt` or `.npy` format, either
-            as a 3D tensor `[num_docs, max_len, dim]` or a 2D tensor `[total_len, dim]`
-            with a matching `.doclens.pt` or `.doclens.npy` sidecar.
+            are stored. The stored embeddings must be in `.npy` format,
+            in a 2D tensor `[total_len, dim]` with a matching `.doclens.npy` sidecar.
         stream:
             Whether to stream embeddings from disk during index creation. If True,
             `embeddings_source` must be a str and embeddings will be read from disk
@@ -372,7 +372,7 @@ class XTRWarp:
         embeddings_path = None
         documents_embeddings = None
 
-        if not isinstance(embeddings_source, str):
+        if isinstance(embeddings_source, (list, torch.Tensor)):
             if isinstance(embeddings_source, torch.Tensor):
                 documents_embeddings = [
                     embeddings_source[i] for i in range(embeddings_source.shape[0])
@@ -385,10 +385,7 @@ class XTRWarp:
                 for embedding in documents_embeddings
             ]
         else:
-            embeddings_path = embeddings_source
-            logger.info(
-                "Stream is set to True but the embeddings source is not a str. Disabling stream mode..."
-            )
+            embeddings_path = Path(embeddings_source)
 
         self._prepare_index_directory(index_path=self.index)
 
@@ -408,7 +405,7 @@ class XTRWarp:
             device=device,
             nbits=nbits,
             centroids=centroids,
-            embeddings=embeddings_path or documents_embeddings,
+            embeddings=documents_embeddings or str(embeddings_path),
             embedding_dim=dim,
             seed=seed,
         )
