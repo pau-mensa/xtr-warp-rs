@@ -37,7 +37,9 @@ def _set_section_key_version(path: Path, section: str, key: str, version: str) -
         if not match:
             continue
         if changed:
-            raise SystemExit(f"{path}: found multiple '{key} = ...' entries in [{section}]")
+            raise SystemExit(
+                f"{path}: found multiple '{key} = ...' entries in [{section}]"
+            )
         lines[i] = f'{match.group(1)}"{version}"{match.group(2)}{line_ending}'
         changed = True
 
@@ -58,7 +60,9 @@ def set_pyproject_version(pyproject_toml: Path, version: str, *, dry_run: bool) 
         pyproject_toml.write_text(updated, encoding="utf-8")
 
 
-def set_pyproject_torch_req(pyproject_toml: Path, torch_req: str, *, dry_run: bool) -> None:
+def set_pyproject_torch_req(
+    pyproject_toml: Path, torch_req: str, *, dry_run: bool
+) -> None:
     text = pyproject_toml.read_text(encoding="utf-8")
     patterns = [
         r'^(\s*)"torch\s*>=\s*[0-9.]+[^"]*"(\s*,?\s*)$',
@@ -76,18 +80,24 @@ def set_pyproject_torch_req(pyproject_toml: Path, torch_req: str, *, dry_run: bo
             replaced_any = True
             text = updated
     if not replaced_any:
-        raise SystemExit(f"{pyproject_toml}: did not find a torch requirement to replace")
+        raise SystemExit(
+            f"{pyproject_toml}: did not find a torch requirement to replace"
+        )
     if not dry_run:
         pyproject_toml.write_text(text, encoding="utf-8")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Prepare repo versions for release builds.")
-    parser.add_argument("--version", required=True, help="PEP 440 version (e.g. 0.0.2.290)")
+    parser = argparse.ArgumentParser(
+        description="Prepare repo versions for release builds."
+    )
+    parser.add_argument(
+        "--version", required=True, help="PEP 440 version (e.g. 0.1.290)"
+    )
     parser.add_argument(
         "--cargo-version",
         default=None,
-        help='Cargo package version (SemVer, e.g. "0.0.2"). Defaults to the first 3 components of --version.',
+        help='Cargo package version (SemVer, e.g. "0.1"). Defaults to the first 3 components of --version.',
     )
     parser.add_argument(
         "--torch-req",
@@ -109,7 +119,9 @@ def main() -> int:
     if cargo_version is None:
         parts = args.version.split(".")
         if len(parts) < 3:
-            raise SystemExit("--version must have at least 3 numeric components to derive --cargo-version")
+            raise SystemExit(
+                "--version must have at least 3 numeric components to derive --cargo-version"
+            )
         cargo_version = ".".join(parts[:3])
 
     set_cargo_version(cargo_toml, cargo_version, dry_run=args.dry_run)

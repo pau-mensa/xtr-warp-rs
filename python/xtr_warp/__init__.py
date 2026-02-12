@@ -8,7 +8,8 @@ from .evaluation import evaluate, load_beir
 from .search import XTRWarp
 
 try:
-    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
 except ImportError:  # pragma: no cover (py<3.8)
     PackageNotFoundError = Exception  # type: ignore[misc,assignment]
     _pkg_version = None  # type: ignore[assignment]
@@ -30,7 +31,7 @@ except ImportError:
         xtr_warp_rs = None
 
 try:
-    __version__ = _pkg_version("xtr-warp-rs") if _pkg_version else "0.0.0"
+    __version__ = _pkg_version("xtr-warp-rs") if _pkg_version else "0.1"
 except PackageNotFoundError:
-    __version__ = "0.0.0"
+    __version__ = "0.1"
 __all__ = ["XTRWarp", "xtr_warp_rs", "evaluate", "load_beir"]
