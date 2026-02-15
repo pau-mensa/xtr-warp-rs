@@ -282,7 +282,7 @@ use_triton_kmeans          None        Whether to use Triton-based K-means
 > Highly recommended to build the index using `cuda` devices. For a large corpus using `cpu` or even `mps` can take forever.
 
 > [!NOTE]
-> When using path-based inputs, embeddings files must be 2D tensors (not 3D padded tensors) with accompanying `.doclens.npy` sidecars. See [Quick Start](#quick-start) for format details.
+> When using path-based inputs, embeddings files must be 2D tensors (not 3D padded tensors) with accompanying `.doclens.npy` sidecars. See [Quick Start](#%EF%B8%8F-quick-start) for format details.
 
 ### Loading
 
