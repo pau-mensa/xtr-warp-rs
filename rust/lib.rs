@@ -22,7 +22,7 @@ pub mod utils;
 
 // Re-exports for convenience
 use crate::index::create::create_index;
-use crate::index::source::InMemoryEmbeddingSource;
+use crate::index::source::{DiskEmbeddingSource, EmbeddingSource, InMemoryEmbeddingSource};
 use search::{IndexLoader, Searcher};
 use utils::types::{IndexConfig, Query, ReadOnlyIndex, SearchConfig, SearchResult};
 
@@ -205,32 +205,70 @@ fn initialize_torch(_py: Python<'_>, torch_path: String) -> PyResult<()> {
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to initialize Torch: {}", e)))
 }
 
-/// Creates and saves a new xtr-warp index to disk.
-///
-/// This function processes document embeddings, clusters them using the provided
-/// centroids, calculates quantization residuals, and serializes the complete
-/// index structure to the specified directory.
+enum EmbeddingsInput {
+    Direct(Vec<PyTensor>),
+    FromPath(String),
+}
+
+impl<'source> FromPyObject<'source> for EmbeddingsInput {
+    fn extract_bound(ob: &Bound<'source, PyAny>) -> PyResult<Self> {
+        if let Ok(path) = ob.extract::<String>() {
+            return Ok(EmbeddingsInput::FromPath(path));
+        }
+        if let Ok(embeddings) = ob.extract::<Vec<PyTensor>>() {
+            return Ok(EmbeddingsInput::Direct(embeddings));
+        }
+        Err(PyValueError::new_err(
+            "embeddings must be a list of torch.Tensor or a string path",
+        ))
+    }
+}
+
+impl EmbeddingsInput {
+    fn into_source(self) -> Result<Box<dyn EmbeddingSource>> {
+        match self {
+            EmbeddingsInput::Direct(embeddings) => {
+                let embeddings: Vec<_> = embeddings.into_iter().map(|tensor| tensor.0).collect();
+                Ok(Box::new(InMemoryEmbeddingSource::new(embeddings)))
+            },
+            EmbeddingsInput::FromPath(path) => {
+                Ok(Box::new(DiskEmbeddingSource::new(Path::new(&path))?))
+            },
+        }
+    }
+}
+
+/// Creates and saves a new xtr-warp index.
 ///
 /// Args:
 ///     index (str): The directory path where the new index will be saved.
 ///     torch_path (str): Path to the Torch shared library (e.g., `libtorch.so`).
 ///     device (str): The compute device to use for index creation (e.g., "cpu", "cuda:0").
 ///     nbits (int): The number of bits to use for residual quantization.
-///     embeddings (list[torch.Tensor]): A list of 2D tensors, where each tensor
-///         is a batch of document embeddings.
-///     centroids (torch.Tensor): A 2D tensor of shape `[num_centroids, embedding_dim]`
-///         used for vector quantization.
+///     embeddings (list[torch.Tensor] | str): List of 2D tensors, one per document,
+///         or a path to batched embedding files.
+///     centroids (torch.Tensor): A 2D tensor of shape `[num_centroids, embedding_dim]`.
 ///     embedding_dim (int): The dimensionality of the embeddings.
 ///     seed (int, optional): Optional seed for the random number generator.
 #[pyfunction]
+#[pyo3(signature = (
+    index,
+    torch_path,
+    device,
+    nbits,
+    centroids,
+    embeddings,
+    embedding_dim=None,
+    seed=None,
+))]
 fn create(
     _py: Python<'_>,
     index: String,
     torch_path: String,
     device: String,
     nbits: i64,
-    embeddings: Vec<PyTensor>,
     centroids: PyTensor,
+    embeddings: EmbeddingsInput,
     embedding_dim: Option<u32>,
     seed: Option<u64>,
 ) -> PyResult<()> {
@@ -243,21 +281,18 @@ fn create(
         .map_err(|_| PyValueError::new_err("nbits must be in 0..=255"))?;
     let centroids = centroids.to_device(device);
 
-    let embeddings: Vec<_> = embeddings
-        .into_iter()
-        .map(|tensor| tensor.to_device(device))
-        .collect();
+    let mut source = embeddings
+        .into_source()
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to read embeddings: {}", e)))?;
 
-    let mut source = InMemoryEmbeddingSource::new(embeddings);
     create_index(
         &IndexConfig {
             index_path: Path::new(&index).to_path_buf(),
             device,
-            // load_with_mmap: false,
             nbits,
             embedding_dim: embedding_dim.unwrap_or(128),
         },
-        &mut source,
+        source.as_mut(),
         centroids,
         seed,
     )

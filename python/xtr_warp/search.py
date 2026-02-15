@@ -6,8 +6,11 @@ import logging
 import math
 import os
 import random
-from typing import Literal
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol
 
+import numpy as np
 import torch
 import torch.multiprocessing as mp
 from fastkmeans import FastKMeans
@@ -54,18 +57,124 @@ def _load_torch_path(device: str) -> str:
     raise TorchWithCudaNotFoundError(error) from IndexError
 
 
+class EmbeddingSource(Protocol):
+    """Protocol for embedding sources."""
+
+    def get_num_passages(self) -> int: ...
+    def sample_embeddings(self, pids: list[int]) -> tuple[torch.Tensor, int, int]: ...
+
+
+@dataclass
+class InMemorySource:
+    """Source for embeddings already in memory."""
+
+    embeddings: list[torch.Tensor]
+
+    def get_num_passages(self) -> int:
+        """Get the number of passages."""
+        return len(self.embeddings)
+
+    def sample_embeddings(self, pids: list[int]) -> tuple[torch.Tensor, int, int]:
+        """Sample the embeddings based on the pids."""
+        samples = [self.embeddings[pid] for pid in pids]
+        dim = samples[0].size(-1)
+        total_tokens = sum(sample.shape[0] for sample in samples)
+        tensors = torch.cat(tensors=samples)
+        return tensors, total_tokens, dim
+
+
+@dataclass
+class DiskSource:
+    """Source for embeddings stored in disk."""
+
+    path: Path
+    _files_and_doclens: list[tuple[Path, list[int]]] | None = None
+    _doclens: list[int] | None = None
+    _num_passages: int = 0
+
+    def _load_metadata(self) -> None:
+        if self._files_and_doclens is not None:
+            return
+
+        files = _get_all_embedding_files(self.path)
+        self._doclens = []
+        self._files_and_doclens = []
+
+        for file in files:
+            doclens_file = _doclens_path_for(file)
+            sidecar = np.load(doclens_file)
+            self._num_passages += len(sidecar)
+            sidecar_list = sidecar.tolist()
+            self._doclens.extend(sidecar_list)
+            self._files_and_doclens.append((file, sidecar_list))
+
+    def get_num_passages(self) -> int:
+        """Get the number of passages."""
+        self._load_metadata()
+        return self._num_passages
+
+    def sample_embeddings(self, pids: list[int]) -> tuple[torch.Tensor, int, int]:
+        """Sample the embeddings based on the pids."""
+        self._load_metadata()
+
+        sampled_pid_set = set(pids)
+        total_tokens = sum(self._doclens[pid] for pid in pids)
+
+        tensors = None
+        dim = None
+        write_offset = 0
+        doc_offset = 0
+        remaining = len(sampled_pid_set)
+
+        for file, sidecar in self._files_and_doclens:
+            data = torch.from_numpy(np.load(file))
+
+            if tensors is None:
+                dim = data.size(-1)
+                tensors = torch.empty((total_tokens, dim), dtype=data.dtype)
+
+            offset = 0
+            for doc_len in sidecar:
+                if doc_offset in sampled_pid_set:
+                    doc = data[offset : offset + doc_len]
+                    tensors[write_offset : write_offset + doc_len].copy_(doc)
+                    write_offset += doc_len
+                    sampled_pid_set.remove(doc_offset)
+                    remaining -= 1
+                    if remaining == 0:
+                        break
+                offset += doc_len
+                doc_offset += 1
+
+            del data
+            if remaining == 0:
+                break
+
+        if tensors is None or dim is None:
+            raise ValueError("Could not sample embeddings from source")
+
+        return tensors, total_tokens, dim
+
+
+def _create_source(embeddings_source: list[torch.Tensor] | Path) -> EmbeddingSource:
+    """Create appropriate source."""
+    if isinstance(embeddings_source, list):
+        return InMemorySource(embeddings_source)
+    return DiskSource(embeddings_source)
+
+
 def compute_kmeans(  # noqa: PLR0913
-    documents_embeddings: list[torch.Tensor],
-    dim: int,
+    embeddings_source: list[torch.Tensor] | Path,
     device: str,
     kmeans_niters: int,
     max_points_per_centroid: int,
     seed: int,
     n_samples_kmeans: int | None = None,
     use_triton_kmeans: bool | None = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, int]:
     """Compute K-means centroids for document embeddings."""
-    num_passages = len(documents_embeddings)
+    source = _create_source(embeddings_source)
+    num_passages = source.get_num_passages()
 
     if n_samples_kmeans is None:
         n_samples_kmeans = min(
@@ -73,24 +182,22 @@ def compute_kmeans(  # noqa: PLR0913
             num_passages,
         )
 
-    n_samples_kmeans = min(num_passages, n_samples_kmeans)
+    # Sample passages
+    rng = random.Random(seed)
+    sampled_pids = rng.sample(range(num_passages), k=n_samples_kmeans)
 
-    sampled_pids = random.sample(
-        population=range(n_samples_kmeans),
-        k=n_samples_kmeans,
-    )
+    tensors, total_tokens, dim = source.sample_embeddings(sampled_pids)
 
-    samples: list[torch.Tensor] = [
-        documents_embeddings[pid] for pid in set(sampled_pids)
-    ]
-
-    total_tokens = sum([sample.shape[0] for sample in samples])
-    num_partitions = (total_tokens / len(samples)) * len(documents_embeddings)
+    num_partitions = (total_tokens / n_samples_kmeans) * num_passages
     num_partitions = int(2 ** math.floor(math.log2(16 * math.sqrt(num_partitions))))
 
-    tensors = torch.cat(tensors=samples)
+    # I don't want any surprises here
     if tensors.is_cuda:
-        tensors = tensors.to(device="cpu", dtype=torch.float32)
+        tensors = tensors.to(device="cpu")
+    if tensors.dtype != torch.float32:
+        tensors = tensors.to(dtype=torch.float32)
+    if not tensors.is_contiguous():
+        tensors = tensors.contiguous()
 
     kmeans = FastKMeans(
         d=dim,
@@ -115,7 +222,44 @@ def compute_kmeans(  # noqa: PLR0913
     return torch.nn.functional.normalize(
         input=centroids,
         dim=-1,
+    ), dim
+
+
+def _doclens_path_for(emb_path: Path) -> Path:
+    npy_path = emb_path.with_suffix(".doclens.npy")
+    if npy_path.exists():
+        return npy_path
+    raise ValueError(
+        f"The {emb_path} embeddings file is missing its sidecar: {npy_path}"
     )
+
+
+def _get_all_embedding_files(embeddings_path: Path) -> list[Path]:
+    if embeddings_path.is_file():
+        files = [embeddings_path]
+    else:
+        npy_files = list(embeddings_path.glob("*.npy"))
+        files = sorted(
+            [path for path in npy_files if not path.name.endswith(".doclens.npy")],
+            key=_embedding_chunk_sort_key,
+        )
+    if not files:
+        raise FileNotFoundError(f"No embedding .npy files found in {embeddings_path}")
+
+    return files
+
+
+def _embedding_chunk_sort_key(path: Path) -> tuple[int, int | str]:
+    name = path.stem
+
+    # (double extension for doclens)
+    if path.name.endswith(".doclens.npy"):
+        name = path.name[: -len(".doclens.npy")]
+
+    parts = name.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return (0, int(parts[1]))
+    return (1, name)
 
 
 def search_on_device(
@@ -147,6 +291,7 @@ class XTRWarp:
     ----
     index:
         Path to the directory where the index is stored or will be stored.
+
     """
 
     def __init__(
@@ -183,7 +328,7 @@ class XTRWarp:
 
     def create(  # noqa: PLR0913
         self,
-        documents_embeddings: list[torch.Tensor] | torch.Tensor,
+        embeddings_source: list[torch.Tensor] | torch.Tensor | str | Path,
         device: str,
         kmeans_niters: int = 4,
         max_points_per_centroid: int = 256,
@@ -196,8 +341,14 @@ class XTRWarp:
 
         Args:
         ----
-        documents_embeddings:
-            A list of document embedding tensors to be indexed.
+        embeddings_source:
+            A list of document embeddings or the path to a folder where the embeddings
+            are stored. The stored embeddings must be in `.npy` format,
+            in a 2D tensor `[total_len, dim]` with a matching `.doclens.npy` sidecar.
+        stream:
+            Whether to stream embeddings from disk during index creation. If True,
+            `embeddings_source` must be a str and embeddings will be read from disk
+            during encoding.
         device:
             The device to use for the indexing (eg. cpu, cuda, mps, etc.)
         kmeans_niters:
@@ -217,23 +368,29 @@ class XTRWarp:
 
         """
         torch_path = self._ensure_torch_initialized(device)
-        if isinstance(documents_embeddings, torch.Tensor):
-            documents_embeddings = [
-                documents_embeddings[i] for i in range(documents_embeddings.shape[0])
-            ]
 
-        documents_embeddings = [
-            embedding.squeeze(0) if embedding.dim() == 3 else embedding
-            for embedding in documents_embeddings
-        ]
+        embeddings_path = None
+        documents_embeddings = None
+
+        if isinstance(embeddings_source, (list, torch.Tensor)):
+            if isinstance(embeddings_source, torch.Tensor):
+                documents_embeddings = [
+                    embeddings_source[i] for i in range(embeddings_source.shape[0])
+                ]
+            elif isinstance(embeddings_source, list):
+                documents_embeddings = embeddings_source
+
+            documents_embeddings = [
+                embedding.squeeze(0) if embedding.dim() == 3 else embedding
+                for embedding in documents_embeddings
+            ]
+        else:
+            embeddings_path = Path(embeddings_source)
 
         self._prepare_index_directory(index_path=self.index)
 
-        dim = documents_embeddings[0].shape[-1]
-
-        centroids = compute_kmeans(
-            documents_embeddings=documents_embeddings,
-            dim=dim,
+        centroids, dim = compute_kmeans(
+            embeddings_source=embeddings_path or documents_embeddings,
             kmeans_niters=kmeans_niters,
             device=device,
             max_points_per_centroid=max_points_per_centroid,
@@ -247,8 +404,8 @@ class XTRWarp:
             torch_path=torch_path,
             device=device,
             nbits=nbits,
-            embeddings=documents_embeddings,
             centroids=centroids,
+            embeddings=documents_embeddings or str(embeddings_path),
             embedding_dim=dim,
             seed=seed,
         )

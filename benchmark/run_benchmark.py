@@ -9,6 +9,7 @@
 # ]
 # ///
 
+import argparse
 import subprocess
 import sys
 import time
@@ -32,7 +33,7 @@ def get_yaml_files(experiments_dir):
     return sorted(yaml_files)
 
 
-def run_benchmark(config_path, dataset):
+def run_benchmark(config_path, dataset, docs_per_file=None, stream=False):
     cmd = [
         "uv",
         "run",
@@ -41,6 +42,12 @@ def run_benchmark(config_path, dataset):
         "--dataset",
         dataset,
     ]
+
+    if docs_per_file is not None:
+        cmd.extend(["--docs-per-file", str(docs_per_file)])
+
+    if stream:
+        cmd.append("--stream")
 
     print(f"\n{'=' * 80}")
     print(f"Dataset: {dataset}")
@@ -106,6 +113,23 @@ def print_progress(
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Run benchmark experiments across multiple datasets and configurations."
+    )
+    parser.add_argument(
+        "--docs-per-file",
+        type=int,
+        default=None,
+        help="How many docs per tensor to split the dataset to. Passed to benchmark.py subprocess.",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        default=False,
+        help="Enable streaming mode for memory-efficient processing. Passed to benchmark.py subprocess.",
+    )
+    args = parser.parse_args()
+
     script_dir = Path(__file__).parent.resolve()
     experiments_dir = script_dir / "experiments"
 
@@ -130,6 +154,9 @@ def main():
     print(f"Datasets: {DATASETS}")
     print(f"Configs:  {len(yaml_files)}")
     print(f"Total experiments: {total_experiments}")
+    if args.docs_per_file:
+        print(f"Docs per file: {args.docs_per_file}")
+    print(f"Stream mode: {'enabled' if args.stream else 'disabled'}")
     print(f"{'=' * 80}\n")
 
     for dataset in DATASETS:
@@ -151,7 +178,12 @@ def main():
             )
 
             exp_start = time.time()
-            elapsed, success = run_benchmark(config_path, dataset)
+            elapsed, success = run_benchmark(
+                config_path,
+                dataset,
+                docs_per_file=args.docs_per_file,
+                stream=args.stream,
+            )
             exp_time = time.time() - exp_start
 
             if not success:

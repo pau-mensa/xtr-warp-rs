@@ -79,7 +79,12 @@ fn plan_and_sample(
     let num_chunks =
         (n_docs as f64 / (CHUNK_SIZE as f64).min(1.0 + n_docs as f64)).ceil() as usize;
 
-    let total_doc_len = if source.get_doc(0).is_some() {
+    let mut rng = if let Some(seed_value) = seed {
+        Box::new(StdRng::seed_from_u64(seed_value)) as Box<dyn RngCore>
+    } else {
+        Box::new(rand::rng()) as Box<dyn RngCore>
+    };
+    let (total_doc_len, sample_pids, sampled_embeddings) = if source.get_doc(0).is_some() {
         let mut total: i64 = 0;
         for idx in 0..n_docs {
             let doc = source
@@ -87,14 +92,18 @@ fn plan_and_sample(
                 .ok_or_else(|| anyhow!("Missing embedding at index {}", idx))?;
             total += doc.size()[0];
         }
-        total
+        let (pids, embeddings) =
+            sample_embeddings_in_memory(source, n_docs, config.embedding_dim, &mut *rng, config.device)?;
+        (total, pids, embeddings)
     } else {
-        let mut total: i64 = 0;
-        let chunk_iter = source.chunk_iter(CHUNK_SIZE)?;
-        for chunk in chunk_iter {
-            total += chunk.doclens.iter().sum::<i64>();
-        }
-        total
+        let (pids, embeddings, total) = sample_embeddings_streaming(
+            source,
+            n_docs,
+            config.embedding_dim,
+            &mut *rng,
+            config.device,
+        )?;
+        (total, pids, embeddings)
     };
 
     let avg_doc_len = total_doc_len as f64 / n_docs as f64;
@@ -110,18 +119,10 @@ fn plan_and_sample(
         nbits: config.nbits,
     };
 
-    let mut rng = if let Some(seed_value) = seed {
-        Box::new(StdRng::seed_from_u64(seed_value)) as Box<dyn RngCore>
-    } else {
-        Box::new(rand::rng()) as Box<dyn RngCore>
-    };
-    let (sample_pids, sampled_embeddings) =
-        sample_embeddings(source, n_docs, config.embedding_dim, &mut *rng, config.device)?;
-
     Ok((index_plan, sample_pids, sampled_embeddings))
 }
 
-fn sample_embeddings(
+fn sample_embeddings_in_memory(
     source: &mut dyn EmbeddingSource,
     n_docs: usize,
     embedding_dim: u32,
@@ -135,39 +136,52 @@ fn sample_embeddings(
         return Ok((Vec::new(), empty));
     }
 
-    if source.get_doc(0).is_some() {
-        let mut passage_indices: Vec<i64> = (0..n_docs as i64).collect();
-        passage_indices.shuffle(rng);
-        let sample_pids: Vec<i64> = passage_indices.into_iter().take(k).collect();
+    let mut passage_indices: Vec<i64> = (0..n_docs as i64).collect();
+    passage_indices.shuffle(rng);
+    let sample_pids: Vec<i64> = passage_indices.into_iter().take(k).collect();
 
-        let mut sample_tensors_vec: Vec<&Tensor> = Vec::with_capacity(k);
-        for &pid in &sample_pids {
-            let doc = source
-                .get_doc(pid as usize)
-                .ok_or_else(|| anyhow!("Missing embedding at index {}", pid))?;
-            sample_tensors_vec.push(doc);
-        }
-
-        let sampled_embeddings = Tensor::cat(&sample_tensors_vec, 0)
-            .to_kind(Kind::Half)
-            .to_device(device);
-        return Ok((sample_pids, sampled_embeddings));
+    let mut sample_tensors_vec: Vec<&Tensor> = Vec::with_capacity(k);
+    for &pid in &sample_pids {
+        let doc = source
+            .get_doc(pid as usize)
+            .ok_or_else(|| anyhow!("Missing embedding at index {}", pid))?;
+        sample_tensors_vec.push(doc);
     }
+
+    let sampled_embeddings = Tensor::cat(&sample_tensors_vec, 0)
+        .to_kind(Kind::Half)
+        .to_device(device);
+    Ok((sample_pids, sampled_embeddings))
+}
+
+fn sample_embeddings_streaming(
+    source: &mut dyn EmbeddingSource,
+    n_docs: usize,
+    embedding_dim: u32,
+    rng: &mut dyn RngCore,
+    device: Device,
+) -> Result<(Vec<i64>, Tensor, i64)> {
+    let sample_k_float = 16.0 * (120.0 * n_docs as f64).sqrt();
+    let k = (1.0 + sample_k_float).min(n_docs as f64) as usize;
 
     let mut sample_tensors: Vec<Tensor> = Vec::with_capacity(k);
     let mut sample_pids: Vec<i64> = Vec::with_capacity(k);
+    let mut total_doc_len: i64 = 0;
     let mut seen: i64 = 0;
     let mut doc_offset: i64 = 0;
+
     let chunk_iter = source.chunk_iter(CHUNK_SIZE)?;
     for chunk in chunk_iter {
+        let chunk = chunk?;
+        total_doc_len += chunk.doclens.iter().sum::<i64>();
         for doc in &chunk.embeddings {
             if (seen as usize) < k {
-                sample_tensors.push(doc.shallow_clone());
+                sample_tensors.push(doc.copy());
                 sample_pids.push(doc_offset);
             } else {
                 let j = (rng.next_u64() % (seen as u64 + 1)) as usize;
                 if j < k {
-                    sample_tensors[j] = doc.shallow_clone();
+                    sample_tensors[j] = doc.copy();
                     sample_pids[j] = doc_offset;
                 }
             }
@@ -176,12 +190,16 @@ fn sample_embeddings(
         }
     }
 
+    if k == 0 {
+        let empty = Tensor::zeros(&[0, embedding_dim as i64], (Kind::Half, device));
+        return Ok((Vec::new(), empty, total_doc_len));
+    }
+
     let sample_refs: Vec<&Tensor> = sample_tensors.iter().collect();
     let sampled_embeddings = Tensor::cat(&sample_refs, 0)
         .to_kind(Kind::Half)
         .to_device(device);
-
-    Ok((sample_pids, sampled_embeddings))
+    Ok((sample_pids, sampled_embeddings, total_doc_len))
 }
 
 fn finalize_ivf_and_compact(

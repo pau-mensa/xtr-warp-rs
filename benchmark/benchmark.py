@@ -11,9 +11,12 @@
 
 import argparse
 import gc
+import glob
 import json
+import math
 import os
 import shutil
+import statistics
 import sys
 import threading
 import time
@@ -37,10 +40,23 @@ from pylate import models
 from xtr_warp.evaluation import evaluate, load_beir
 from xtr_warp.search import XTRWarp
 
+_PROCESS = psutil.Process(os.getpid())
+
+
+def _iter_process_tree():
+    yield _PROCESS
+    for child in _PROCESS.children(recursive=True):
+        yield child
+
 
 def get_cpu_memory_mb():
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / 1024 / 1024
+    total = 0
+    for proc in _iter_process_tree():
+        try:
+            total += proc.memory_info().rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return total / 1024 / 1024
 
 
 def get_gpu_memory_mb():
@@ -69,14 +85,16 @@ def get_stable_baseline():
     for _ in range(10):
         readings.append(get_cpu_memory_mb())
         time.sleep(0.02)
-    return sum(readings) / len(readings)
+    return statistics.median(readings)
 
 
 class MemoryMonitor:
-    def __init__(self, pre_operation_baseline=None):
-        self.cpu_baseline = pre_operation_baseline if pre_operation_baseline else 0
+    def __init__(self, sample_interval=0.005):
+        self.cpu_baseline = None
         self.cpu_peak = 0
         self.gpu_peak = 0
+        self.cpu_samples = []
+        self.sample_interval = sample_interval
         self.monitoring = False
         self.monitor_thread = None
         self.start_time = None
@@ -86,12 +104,20 @@ class MemoryMonitor:
             current_cpu = get_cpu_memory_mb()
             current_gpu = get_gpu_memory_mb()
 
+            self.cpu_samples.append(current_cpu)
             if current_cpu > self.cpu_peak:
                 self.cpu_peak = current_cpu
             if current_gpu > self.gpu_peak:
                 self.gpu_peak = current_gpu
 
-            time.sleep(0.005)
+            time.sleep(self.sample_interval)
+
+    def _sample_baseline(self, samples=5):
+        readings = []
+        for _ in range(samples):
+            readings.append(get_cpu_memory_mb())
+            time.sleep(self.sample_interval)
+        return statistics.median(readings) if readings else 0
 
     def start(self):
         gc.collect()
@@ -99,17 +125,23 @@ class MemoryMonitor:
             torch.cuda.empty_cache()
             reset_gpu_peak()
 
-        time.sleep(0.05)
+        self.cpu_baseline = self._sample_baseline()
+        self.cpu_peak = self.cpu_baseline
         self.monitoring = True
         self.monitor_thread = threading.Thread(target=self._monitor, daemon=True)
         self.monitor_thread.start()
-        time.sleep(0.05)
+        time.sleep(self.sample_interval)
         self.start_time = time.time()
 
     def stop(self):
         self.monitoring = False
         if self.monitor_thread:
             self.monitor_thread.join(timeout=2.0)
+
+        current_cpu = get_cpu_memory_mb()
+        self.cpu_samples.append(current_cpu)
+        if current_cpu > self.cpu_peak:
+            self.cpu_peak = current_cpu
 
         gc.collect()
         if torch.cuda.is_available():
@@ -121,17 +153,38 @@ class MemoryMonitor:
         torch_gpu_peak = get_gpu_peak_mb()
         final_gpu_peak = max(final_gpu_peak, torch_gpu_peak)
 
-        cpu_increase = final_cpu_peak - self.cpu_baseline if self.cpu_baseline else 0
+        cpu_baseline = self.cpu_baseline if self.cpu_baseline is not None else 0
+        cpu_p95 = _percentile(self.cpu_samples, 0.95)
+        cpu_increase = max(0, cpu_p95 - cpu_baseline)
+        cpu_peak_increase = max(0, final_cpu_peak - cpu_baseline)
 
         duration = time.time() - self.start_time if self.start_time else 0
 
         return {
             "cpu_peak_mb": round(final_cpu_peak, 2),
+            "cpu_p95_mb": round(cpu_p95, 2),
+            "cpu_increase_peak_mb": round(cpu_peak_increase, 2),
             "cpu_increase_mb": round(cpu_increase, 2),
             "gpu_peak_mb": round(final_gpu_peak, 2),
             "gpu_increase_mb": round(final_gpu_peak, 2),
             "duration_seconds": round(duration, 3),
         }
+
+
+def _percentile(values, percentile):
+    if not values:
+        return 0
+    if percentile <= 0:
+        return min(values)
+    if percentile >= 1:
+        return max(values)
+    sorted_vals = sorted(values)
+    k = (len(sorted_vals) - 1) * percentile
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return sorted_vals[int(k)]
+    return sorted_vals[f] * (c - k) + sorted_vals[c] * (k - f)
 
 
 QUERY_LENGTH = {
@@ -152,13 +205,46 @@ QUERY_LENGTH = {
 }
 
 
+def _embedding_chunk_sort_key(path: str) -> tuple[int, int | str]:
+    name = os.path.basename(path)
+    if name.endswith(".doclens.npy"):
+        name = name[: -len(".doclens.npy")]
+    elif name.endswith(".npy"):
+        name = name[: -len(".npy")]
+    parts = name.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return (0, int(parts[1]))
+    return (1, name)
+
+
+def _load_documents_embeddings(embeddings_dir: Path) -> list[torch.Tensor]:
+    documents_embeddings = []
+    npy_files = glob.glob(os.path.join(embeddings_dir, "*.npy"))
+    embd_files = sorted(
+        [path for path in npy_files if "doclens" not in path],
+        key=_embedding_chunk_sort_key,
+    )
+    doclens_files = sorted(
+        [path for path in npy_files if "doclens" in path],
+        key=_embedding_chunk_sort_key,
+    )
+    for embd_f, doclen_f in zip(embd_files, doclens_files):
+        flat = torch.from_numpy(np.load(embd_f))
+        sidecar = torch.from_numpy(np.load(doclen_f))
+        counter = 0
+        for doc_len in sidecar:
+            documents_embeddings.append(flat[counter : counter + doc_len])
+            counter += doc_len
+    return documents_embeddings
+
+
 def run_xtr_warp(
     config,
     documents,
     queries,
     qrels,
     documents_ids,
-    documents_embeddings,
+    embeddings_source,
     queries_embeddings,
     dataset_name,
 ):
@@ -171,16 +257,19 @@ def run_xtr_warp(
     index = XTRWarp(index=index_dir)
 
     print(f"🏗️  Building index for {dataset_name}...")
-    print(f"Document shape: {documents_embeddings[0].shape}")
+    # print(f"Document shape: {documents_embeddings[0].shape}")
 
-    index_monitor = MemoryMonitor(pre_operation_baseline=pre_index_memory)
+    index_monitor = MemoryMonitor()
     index_monitor.start()
 
     start_index = time.time()
     if config["device"] == "cuda":
         index.create(
-            documents_embeddings=documents_embeddings,
+            embeddings_source=embeddings_source,  # embeddings_path,
+            # if embeddings_path
+            # else documents_embeddings,
             kmeans_niters=4,
+            # n_samples_kmeans=10_000,
             max_points_per_centroid=256,
             nbits=4,
             seed=42,
@@ -193,7 +282,9 @@ def run_xtr_warp(
 
     print(f"\t✅ {dataset_name} indexing: {indexing_time:.2f} seconds")
     print(
-        f"🧠 Indexing memory - CPU: +{index_memory['cpu_increase_mb']:.2f} MB, GPU: +{index_memory['gpu_increase_mb']:.2f} MB"
+        f"🧠 Indexing memory - CPU (p95): +{index_memory['cpu_increase_mb']:.2f} MB, "
+        f"CPU peak: +{index_memory['cpu_increase_peak_mb']:.2f} MB, "
+        f"GPU: +{index_memory['gpu_increase_mb']:.2f} MB"
     )
 
     print(f"🔍 Searching on {dataset_name}...")
@@ -201,7 +292,7 @@ def run_xtr_warp(
     precision_dtype = getattr(torch, config["precision"])
     index.load(config["device"], dtype=precision_dtype)
 
-    search_monitor = MemoryMonitor(pre_operation_baseline=pre_index_memory)
+    search_monitor = MemoryMonitor()
     search_monitor.start()
 
     start_search = time.time()
@@ -221,7 +312,9 @@ def run_xtr_warp(
 
     search_memory = search_monitor.stop()
     print(
-        f"🧠 Search memory - CPU: +{search_memory['cpu_increase_mb']:.2f} MB, GPU: +{search_memory['gpu_increase_mb']:.2f} MB"
+        f"🧠 Search memory - CPU (p95): +{search_memory['cpu_increase_mb']:.2f} MB, "
+        f"CPU peak: +{search_memory['cpu_increase_peak_mb']:.2f} MB, "
+        f"GPU: +{search_memory['gpu_increase_mb']:.2f} MB"
     )
 
     large_queries_embeddings = torch.cat(
@@ -283,10 +376,16 @@ def run_xtr_warp(
         "memory": {
             "indexing": {
                 "cpu_increase_mb": index_memory["cpu_increase_mb"],
+                "cpu_increase_peak_mb": index_memory["cpu_increase_peak_mb"],
+                "cpu_peak_mb": index_memory["cpu_peak_mb"],
+                "cpu_p95_mb": index_memory["cpu_p95_mb"],
                 "gpu_increase_mb": index_memory["gpu_increase_mb"],
             },
             "search": {
                 "cpu_increase_mb": search_memory["cpu_increase_mb"],
+                "cpu_increase_peak_mb": search_memory["cpu_increase_peak_mb"],
+                "cpu_peak_mb": search_memory["cpu_peak_mb"],
+                "cpu_p95_mb": search_memory["cpu_p95_mb"],
                 "gpu_increase_mb": search_memory["gpu_increase_mb"],
             },
         },
@@ -324,7 +423,7 @@ def run_pylate(
 
     retriever = retrieve.ColBERT(index=index)
 
-    index_monitor = MemoryMonitor(pre_operation_baseline=pre_index_memory)
+    index_monitor = MemoryMonitor()
     index_monitor.start()
 
     start = time.time()
@@ -339,10 +438,12 @@ def run_pylate(
 
     print(f"\t✅ {dataset_name} indexing: {indexing_time:.2f} seconds")
     print(
-        f"🧠 Indexing memory - CPU: +{index_memory['cpu_increase_mb']:.2f} MB, GPU: +{index_memory['gpu_increase_mb']:.2f} MB"
+        f"🧠 Indexing memory - CPU (p95): +{index_memory['cpu_increase_mb']:.2f} MB, "
+        f"CPU peak: +{index_memory['cpu_increase_peak_mb']:.2f} MB, "
+        f"GPU: +{index_memory['gpu_increase_mb']:.2f} MB"
     )
 
-    search_monitor = MemoryMonitor(pre_operation_baseline=pre_index_memory)
+    search_monitor = MemoryMonitor()
     search_monitor.start()
 
     start = time.time()
@@ -355,7 +456,9 @@ def run_pylate(
     search_memory = search_monitor.stop()
     print(f"🔍 Pylate search on {dataset_name}: {search_time:.2f} seconds")
     print(
-        f"🧠 Search memory - CPU: +{search_memory['cpu_increase_mb']:.2f} MB, GPU: +{search_memory['gpu_increase_mb']:.2f} MB"
+        f"🧠 Search memory - CPU (p95): +{search_memory['cpu_increase_mb']:.2f} MB, "
+        f"CPU peak: +{search_memory['cpu_increase_peak_mb']:.2f} MB, "
+        f"GPU: +{search_memory['gpu_increase_mb']:.2f} MB"
     )
 
     large_queries_embeddings = torch.cat(
@@ -398,10 +501,16 @@ def run_pylate(
         "memory": {
             "indexing": {
                 "cpu_increase_mb": index_memory["cpu_increase_mb"],
+                "cpu_increase_peak_mb": index_memory["cpu_increase_peak_mb"],
+                "cpu_peak_mb": index_memory["cpu_peak_mb"],
+                "cpu_p95_mb": index_memory["cpu_p95_mb"],
                 "gpu_increase_mb": index_memory["gpu_increase_mb"],
             },
             "search": {
                 "cpu_increase_mb": search_memory["cpu_increase_mb"],
+                "cpu_increase_peak_mb": search_memory["cpu_increase_peak_mb"],
+                "cpu_peak_mb": search_memory["cpu_peak_mb"],
+                "cpu_p95_mb": search_memory["cpu_p95_mb"],
                 "gpu_increase_mb": search_memory["gpu_increase_mb"],
             },
         },
@@ -431,7 +540,7 @@ def run_fast_plaid(
 
     print(f"🏗️  Building index for {dataset_name}...")
 
-    index_monitor = MemoryMonitor(pre_operation_baseline=pre_index_memory)
+    index_monitor = MemoryMonitor()
     index_monitor.start()
 
     start_index = time.time()
@@ -444,12 +553,14 @@ def run_fast_plaid(
 
     print(f"\t✅ {dataset_name} indexing: {indexing_time:.2f} seconds")
     print(
-        f"🧠 Indexing memory - CPU: +{index_memory['cpu_increase_mb']:.2f} MB, GPU: +{index_memory['gpu_increase_mb']:.2f} MB"
+        f"🧠 Indexing memory - CPU (p95): +{index_memory['cpu_increase_mb']:.2f} MB, "
+        f"CPU peak: +{index_memory['cpu_increase_peak_mb']:.2f} MB, "
+        f"GPU: +{index_memory['gpu_increase_mb']:.2f} MB"
     )
 
     print(f"🔍 Searching on {dataset_name}...")
 
-    search_monitor = MemoryMonitor(pre_operation_baseline=pre_index_memory)
+    search_monitor = MemoryMonitor()
     search_monitor.start()
 
     start_search = time.time()
@@ -464,7 +575,9 @@ def run_fast_plaid(
 
     search_memory = search_monitor.stop()
     print(
-        f"🧠 Search memory - CPU: +{search_memory['cpu_increase_mb']:.2f} MB, GPU: +{search_memory['gpu_increase_mb']:.2f} MB"
+        f"🧠 Search memory - CPU (p95): +{search_memory['cpu_increase_mb']:.2f} MB, "
+        f"CPU peak: +{search_memory['cpu_increase_peak_mb']:.2f} MB, "
+        f"GPU: +{search_memory['gpu_increase_mb']:.2f} MB"
     )
 
     large_queries_embeddings = torch.cat(
@@ -519,10 +632,16 @@ def run_fast_plaid(
         "memory": {
             "indexing": {
                 "cpu_increase_mb": index_memory["cpu_increase_mb"],
+                "cpu_increase_peak_mb": index_memory["cpu_increase_peak_mb"],
+                "cpu_peak_mb": index_memory["cpu_peak_mb"],
+                "cpu_p95_mb": index_memory["cpu_p95_mb"],
                 "gpu_increase_mb": index_memory["gpu_increase_mb"],
             },
             "search": {
                 "cpu_increase_mb": search_memory["cpu_increase_mb"],
+                "cpu_increase_peak_mb": search_memory["cpu_increase_peak_mb"],
+                "cpu_peak_mb": search_memory["cpu_peak_mb"],
+                "cpu_p95_mb": search_memory["cpu_p95_mb"],
                 "gpu_increase_mb": search_memory["gpu_increase_mb"],
             },
         },
@@ -557,6 +676,18 @@ def main():
         type=int,
         default=None,
         help="Limit the number of queries to test (useful for testing before full evaluation).",
+    )
+    parser.add_argument(
+        "--docs-per-file",
+        type=int,
+        default=None,
+        help="How many docs per tensor we want to split the dataset to. Ignored if the embeddings are already cached.",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        default=False,
+        help="Whether to use streaming for efficient memory usage if possible",
     )
     args = parser.parse_args()
 
@@ -627,30 +758,26 @@ def main():
     print("-" * 150)
     print(f"📊 Processing {len(documents)} documents and {len(queries)} queries")
 
-    embeddings_dir = Path("embeddings")
+    embeddings_dir = Path(f"embeddings/{dataset_name}")
     embeddings_dir.mkdir(exist_ok=True)
-    docs_emb_path = embeddings_dir / f"documents_embeddings_{dataset_name}.pt"
+    docs_emb_path = embeddings_dir / f"documents_embeddings_{dataset_name}.npy"
+    first_chunk_path = embeddings_dir / f"documents_embeddings_{dataset_name}_0.npy"
     queries_emb_path = embeddings_dir / f"queries_embeddings_{dataset_name}.pt"
+    documents_embeddings = None
 
-    if docs_emb_path.exists() and queries_emb_path.exists():
-        print(f"📂 Loading cached embeddings from {embeddings_dir}")
-        # documents_embeddings = np.array([[]]) # placeholder for vram issues
-        documents_embeddings = torch.load(docs_emb_path)
+    if first_chunk_path.exists() and queries_emb_path.exists():
+        if framework != "xtr-warp" or (framework == "xtr-warp" and not args.stream):
+            print(f"📂 Loading cached embeddings from {embeddings_dir}")
+            documents_embeddings = _load_documents_embeddings(embeddings_dir)
+            embeddings_source = documents_embeddings
+        elif framework == "xtr-warp" and args.stream:
+            print("Skipping embeddings load, stream mode enabled")
+            embeddings_source = str(docs_emb_path.parents[0])
+
         queries_embeddings = torch.load(queries_emb_path)
-        if args.n_docs is not None:
-            # documents_embeddings = np.array([[]]) # placeholder for vram issues
-            documents_embeddings = documents_embeddings[: args.n_docs]
         if args.n_queries is not None:
             queries_embeddings = queries_embeddings[: args.n_queries]
     else:
-        print(f"🧠 Encoding documents for {dataset_name}...")
-        documents_embeddings = model.encode(
-            [document["text"] for document in documents],
-            batch_size=256,
-            show_progress_bar=True,
-            is_query=False,
-        )
-
         print(f"🧠 Encoding queries for {dataset_name}...")
         queries_embeddings = model.encode(
             list(queries.values()),
@@ -660,13 +787,66 @@ def main():
         )
 
         queries_embeddings = torch.Tensor(np.array(queries_embeddings))
-        documents_embeddings = [
-            torch.tensor(doc_emb) for doc_emb in documents_embeddings
-        ]
         queries_embeddings = torch.cat(tensors=[queries_embeddings], dim=0)
 
-        torch.save(documents_embeddings, docs_emb_path)
         torch.save(queries_embeddings, queries_emb_path)
+
+        print(f"🧠 Encoding documents for {dataset_name}...")
+        if args.docs_per_file is None:
+            documents_embeddings = model.encode(
+                [document["text"] for document in documents],
+                batch_size=256,
+                show_progress_bar=True,
+                is_query=False,
+            )
+            documents_embeddings = [
+                torch.tensor(doc_emb) for doc_emb in documents_embeddings
+            ]
+            embeddings_source = documents_embeddings
+            flat = torch.cat(documents_embeddings, dim=0)
+            np.save(first_chunk_path, flat.numpy())
+            doclens = torch.tensor(
+                [d.shape[0] for d in documents_embeddings], dtype=torch.long
+            )
+            doclens_path = str(docs_emb_path).replace(".npy", "_0.doclens.npy")
+            np.save(doclens_path, doclens.numpy())
+        else:
+            total_docs = len(documents)
+            counter = 0
+            it = 0
+            while counter < total_docs:
+                batch_docs = documents[counter : counter + args.docs_per_file]
+                batch_embeddings = model.encode(
+                    [document["text"] for document in batch_docs],
+                    batch_size=256,
+                    show_progress_bar=True,
+                    is_query=False,
+                )
+                batch_embeddings = [
+                    torch.tensor(doc_emb) for doc_emb in batch_embeddings
+                ]
+                flat = torch.cat(batch_embeddings, dim=0)
+                doclens = torch.tensor(
+                    [d.shape[0] for d in batch_embeddings], dtype=torch.long
+                )
+                np.save(
+                    str(docs_emb_path).replace(".npy", f"_{it}.npy"),
+                    flat.numpy(),
+                )
+                np.save(
+                    str(docs_emb_path).replace(".npy", f"_{it}.doclens.npy"),
+                    doclens.numpy(),
+                )
+                counter += args.docs_per_file
+                it += 1
+
+            if framework != "xtr-warp" or (framework == "xtr-warp" and not args.stream):
+                print(f"📂 Loading cached embeddings from {embeddings_dir}")
+                documents_embeddings = _load_documents_embeddings(embeddings_dir)
+                embeddings_source = documents_embeddings
+            else:
+                print("Skipping embeddings load, stream mode enabled")
+                embeddings_source = str(docs_emb_path.parents[0])
         print(f"💾 Saved embeddings to {embeddings_dir}")
 
     if framework == "xtr-warp":
@@ -676,7 +856,7 @@ def main():
             queries,
             qrels,
             documents_ids,
-            documents_embeddings,
+            embeddings_source,
             queries_embeddings,
             dataset_name,
         )
