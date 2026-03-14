@@ -463,6 +463,8 @@ class XTRWarp:
         self,
         device: str | list[str] = "auto",
         dtype: torch.dtype = torch.float32,
+        mode: str = "memory",
+        cache_mb: int | None = None,
     ) -> "XTRWarp":
         """Load an index to a specific device with the specified precision.
 
@@ -476,12 +478,29 @@ class XTRWarp:
         dtype:
             valid torch dtype
 
+        mode:
+            'memory' (default) or 'stream' for CPU-only streaming.
+        cache_mb:
+            Optional cache size in MB for streaming mode.
+
         """
         if self._loaded_searchers is not None:
             logger.warning(
                 "Index is already loaded, use free() before calling load() again."
             )
             return self
+
+        if mode not in {"memory", "stream"}:
+            raise ValueError("mode must be 'memory' or 'stream'")
+
+        if mode == "stream":
+            if isinstance(device, list):
+                raise ValueError("Streaming load only supports a single cpu device.")
+            return self.load_streaming(
+                device=device,
+                dtype=dtype,
+                cache_mb=cache_mb,
+            )
 
         devices = [device] if isinstance(device, str) else device
         dtype_str = str(dtype).split(".")[1]
@@ -508,6 +527,48 @@ class XTRWarp:
             searcher = xtr_warp_rs.LoadedSearcher(self.index, d, dtype_str)
             searcher.load()
             self._loaded_searchers.append(searcher)
+
+        return self
+
+    def load_streaming(
+        self,
+        device: str = "cpu",
+        dtype: torch.dtype = torch.float32,
+        cache_mb: int | None = None,
+    ) -> "XTRWarp":
+        """Load an index in streaming mode (CPU-only).
+
+        Args:
+        ----
+        device:
+            Must be 'cpu'. 'auto' resolves to 'cpu' for streaming mode.
+        dtype:
+            valid torch dtype.
+        cache_mb:
+            Optional cache size in MB for centroid chunks. Defaults to no cache.
+
+        """
+        if self._loaded_searchers is not None:
+            logger.warning(
+                "Index is already loaded, use free() before calling load_streaming() again."
+            )
+            return self
+
+        if device == "auto":
+            device = "cpu"
+
+        if device != "cpu":
+            raise ValueError("Streaming search is CPU-only; use device='cpu'.")
+
+        dtype_str = str(dtype).split(".")[1]
+        self.dtype = dtype
+        _ = self._load_metadata()
+        self.devices = [device]
+
+        _ = self._ensure_torch_initialized(device)
+        searcher = xtr_warp_rs.LoadedSearcher(self.index, device, dtype_str)
+        searcher.load_streaming(cache_mb=cache_mb)
+        self._loaded_searchers = [searcher]
 
         return self
 

@@ -3,6 +3,7 @@
 // - ID types for passages, centroids, embeddings
 // - Query and result representations
 // - Index components structure
+use anyhow::{anyhow, Result};
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -256,6 +257,60 @@ unsafe impl Sync for ReadOnlyIndex {}
 impl Clone for ReadOnlyIndex {
     fn clone(&self) -> Self {
         ReadOnlyIndex(self.0.clone())
+    }
+}
+
+impl ReadOnlyIndex {
+    pub fn read_codes_range(&self, start: i64, len: i64) -> Result<Vec<i64>> {
+        if start < 0 || len < 0 {
+            return Err(anyhow!("Invalid range start={} len={}", start, len));
+        }
+        let total = self.codes_compacted.size()[0];
+        if start + len > total {
+            return Err(anyhow!(
+                "Range out of bounds for codes: start={} len={} total={}",
+                start,
+                len,
+                total
+            ));
+        }
+        let slice = self
+            .codes_compacted
+            .narrow(0, start, len)
+            .to_kind(Kind::Int64)
+            .to_device(Device::Cpu);
+        let vec: Vec<i64> = slice.try_into()?;
+        Ok(vec)
+    }
+
+    pub fn read_residuals_range(&self, start: i64, len: i64) -> Result<Vec<u8>> {
+        if start < 0 || len < 0 {
+            return Err(anyhow!("Invalid range start={} len={}", start, len));
+        }
+        let total = self.residuals_compacted.size()[0];
+        if start + len > total {
+            return Err(anyhow!(
+                "Range out of bounds for residuals: start={} len={} total={}",
+                start,
+                len,
+                total
+            ));
+        }
+        let slice = self
+            .residuals_compacted
+            .narrow(0, start, len)
+            .to_kind(Kind::Uint8)
+            .contiguous()
+            .view([-1])
+            .to_device(Device::Cpu);
+        let vec: Vec<u8> = slice.try_into()?;
+        Ok(vec)
+    }
+
+    pub fn read_centroid_chunk(&self, start: i64, len: i64) -> Result<(Vec<i64>, Vec<u8>)> {
+        let pids = self.read_codes_range(start, len)?;
+        let residuals = self.read_residuals_range(start, len)?;
+        Ok((pids, residuals))
     }
 }
 

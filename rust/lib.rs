@@ -23,8 +23,8 @@ pub mod utils;
 // Re-exports for convenience
 use crate::index::create::create_index;
 use crate::index::source::{DiskEmbeddingSource, EmbeddingSource, InMemoryEmbeddingSource};
-use search::{IndexLoader, Searcher};
-use utils::types::{IndexConfig, Query, ReadOnlyIndex, SearchConfig, SearchResult};
+use search::{IndexHandle, IndexLoader, Searcher};
+use utils::types::{IndexConfig, Query, SearchConfig, SearchResult};
 
 /// Dynamically loads the native Torch shared library (e.g., `libtorch.so` or `torch.dll`).
 ///
@@ -116,7 +116,7 @@ fn get_dtype(dtype: &str) -> Result<Kind, PyErr> {
 /// Represents a loaded index
 #[pyclass(unsendable)]
 struct LoadedSearcher {
-    loaded_index: Option<Arc<ReadOnlyIndex>>,
+    loaded_index: Option<IndexHandle>,
     index_path: String,
     device: Device,
     dtype: Kind,
@@ -144,10 +144,23 @@ impl LoadedSearcher {
         let loaded_index = Arc::new(
             index_loader
                 .load()
-                .map(ReadOnlyIndex)
+                .map(crate::utils::types::ReadOnlyIndex)
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to load index: {}", e)))?,
         );
-        self.loaded_index = Some(loaded_index);
+        self.loaded_index = Some(IndexHandle::InMemory(loaded_index));
+        Ok(())
+    }
+
+    /// Load the index in streaming mode (CPU-only)
+    #[pyo3(signature = (cache_mb=None,))]
+    fn load_streaming(&mut self, cache_mb: Option<usize>) -> PyResult<()> {
+        let index_loader = IndexLoader::new(&self.index_path, self.device, self.dtype)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create loader: {}", e)))?;
+        let cache_bytes = cache_mb.unwrap_or(0) * 1024 * 1024;
+        let streaming_index = index_loader
+            .load_streaming(cache_bytes)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load index: {}", e)))?;
+        self.loaded_index = Some(IndexHandle::Streaming(Arc::new(streaming_index)));
         Ok(())
     }
 

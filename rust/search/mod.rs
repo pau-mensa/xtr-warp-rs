@@ -2,21 +2,24 @@
 
 pub mod centroid_selector;
 pub mod decompressor;
+pub mod index_handle;
 pub mod loader;
 pub mod merger;
 pub mod scorer;
-use std::sync::Arc;
+pub mod streaming;
 
 // Re-export main types for convenience
 pub use centroid_selector::CentroidSelector;
 pub use decompressor::CentroidDecompressor;
+pub use index_handle::{IndexAccessMode, IndexHandle};
 pub use loader::IndexLoader;
 pub use merger::ResultMerger;
 pub use scorer::WARPScorer;
+pub use streaming::StreamingIndex;
 
 use anyhow::Result;
 
-use crate::utils::types::{Query, ReadOnlyIndex, SearchConfig, SearchResult};
+use crate::utils::types::{Query, SearchConfig, SearchResult};
 
 /// Main search interface combining all components
 pub struct Searcher {
@@ -25,7 +28,7 @@ pub struct Searcher {
 
 impl Searcher {
     /// Create a new searcher with loaded index
-    pub fn new(index: &Arc<ReadOnlyIndex>, config: &SearchConfig) -> Result<Self> {
+    pub fn new(index: &IndexHandle, config: &SearchConfig) -> Result<Self> {
         // Initialize the WARP scorer which integrates all phase 1 components
         let scorer = WARPScorer::new(index, config.clone())?;
 

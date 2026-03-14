@@ -5,9 +5,10 @@ use tch::{Device, IndexOp, Kind, Tensor};
 
 use crate::search::centroid_selector::CentroidSelector;
 use crate::search::decompressor::CentroidDecompressor;
+use crate::search::index_handle::IndexHandle;
 use crate::search::merger::{MergerConfig, ResultMerger};
 use crate::utils::types::{
-    parse_device, parse_dtype, Query, ReadOnlyIndex, ReadOnlyTensor, SearchConfig, SearchResult,
+    parse_device, parse_dtype, Query, ReadOnlyTensor, SearchConfig, SearchResult,
 };
 
 /// Main scorer struct that handles WARP scoring operations
@@ -15,7 +16,7 @@ use crate::utils::types::{
 /// with the ranking pipeline
 pub struct WARPScorer {
     /// Shared reference to the loaded index
-    index: Arc<ReadOnlyIndex>,
+    index: IndexHandle,
 
     /// Centroid selector component from phase 1
     centroid_selector: CentroidSelector,
@@ -40,14 +41,19 @@ pub struct WARPScorer {
 }
 
 impl WARPScorer {
-    pub fn new(index: &Arc<ReadOnlyIndex>, config: SearchConfig) -> Result<Self> {
+    pub fn new(index: &IndexHandle, config: SearchConfig) -> Result<Self> {
         // Initialize centroid selector from phase 1
         let device = parse_device(&config.device)?;
         let batch_size = config.batch_size;
+        if index.is_streaming() && device != Device::Cpu {
+            anyhow::bail!(
+                "Streaming search currently supports CPU only; set device='cpu'"
+            );
+        }
         let centroid_selector = CentroidSelector::new(
             &config,
-            index.metadata.num_embeddings,
-            index.metadata.num_centroids,
+            index.metadata().num_embeddings,
+            index.metadata().num_centroids,
         );
         let dtype = parse_dtype(&config.dtype)?;
 
@@ -60,8 +66,8 @@ impl WARPScorer {
 
         // Initialize decompressor from phase 1
         let decompressor = CentroidDecompressor::new(
-            index.metadata.nbits,
-            index.metadata.dim,
+            index.metadata().nbits,
+            index.metadata().dim,
             device,
             dtype,
             Arc::clone(&thread_pool),
@@ -77,7 +83,7 @@ impl WARPScorer {
         let merger = ResultMerger::new(merger_config);
 
         Ok(Self {
-            index: Arc::clone(index),
+            index: index.clone(),
             centroid_selector,
             decompressor,
             merger,
@@ -101,8 +107,8 @@ impl WARPScorer {
         let selected = self.centroid_selector.select_centroids(
             &query_mask.to_device(self.device),
             &centroid_scores,
-            &self.index.sizes_compacted,
-            self.index.kdummy_centroid,
+            self.index.sizes_compacted(),
+            self.index.kdummy_centroid(),
             k,
         )?;
         let decompressed = self.decompressor.decompress_centroids(
@@ -157,7 +163,7 @@ impl WARPScorer {
             let centroid_selector = self.centroid_selector.clone();
             let decompressor = self.decompressor.clone();
             let merger = self.merger.clone();
-            let index = Arc::clone(&self.index);
+            let index = self.index.clone();
             let nprobe = self.config.nprobe as usize;
             let device = self.device;
 
@@ -168,13 +174,13 @@ impl WARPScorer {
                     .map(|(idx, query_embeddings)| {
                         let query_mask = masks.i(idx as i64);
                         let centroid_scores =
-                            query_embeddings.matmul(&index.centroids.transpose(0, 1));
+                            query_embeddings.matmul(&index.centroids().transpose(0, 1));
 
                         let selected = centroid_selector.select_centroids(
                             &query_mask.to_device(device),
                             &centroid_scores,
-                            &index.sizes_compacted,
-                            index.kdummy_centroid,
+                            index.sizes_compacted(),
+                            index.kdummy_centroid(),
                             k,
                         )?;
 
@@ -215,7 +221,7 @@ impl WARPScorer {
 
                 let centroid_scores = Tensor::einsum(
                     "btd,cd->btc",
-                    &[&batch_queries, &self.index.centroids],
+                    &[&batch_queries, self.index.centroids()],
                     None::<&[i64]>,
                 );
 

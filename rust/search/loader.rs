@@ -5,6 +5,10 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use tch::{Device, Kind, Tensor};
 
+use crate::search::streaming::{
+    ensure_cpu_device, ensure_cpu_dtype, open_codes_reader, open_residuals_reader,
+    StreamingIndex,
+};
 use crate::utils::types::{CentroidId, IndexMetadata, LoadedIndex};
 
 /// Index loader responsible for loading WARP index components from disk
@@ -118,6 +122,94 @@ impl IndexLoader {
             kdummy_centroid,
             metadata,
         })
+    }
+
+    /// Load the index in streaming mode (CPU-only).
+    pub fn load_streaming(&self, cache_bytes: usize) -> Result<StreamingIndex> {
+        ensure_cpu_device(self.device)?;
+        ensure_cpu_dtype(self.dtype)?;
+
+        let index_path = self.index_path.as_path();
+
+        // Load bucket weights (for scoring)
+        let bucket_weights = self
+            .load_torch_tensor(index_path.join("bucket_weights.npy"))
+            .unwrap()
+            .to_dtype(self.dtype, false, false);
+
+        // Load centroids
+        let centroids = self
+            .load_torch_tensor(index_path.join("centroids.npy"))
+            .unwrap()
+            .to_dtype(self.dtype, false, false);
+
+        // Load compacted sizes per centroid
+        let sizes_compacted = self.load_torch_tensor(index_path.join("sizes.compacted.npy"))?;
+
+        // Open compacted codes/residuals readers
+        let codes_reader = open_codes_reader(&index_path.join("codes.compacted.npy"))?;
+        let residuals_path = if index_path.join("residuals.repacked.compacted.npy").exists() {
+            index_path.join("residuals.repacked.compacted.npy")
+        } else {
+            index_path.join("residuals.compacted.npy")
+        };
+        let residuals_reader = open_residuals_reader(&residuals_path)?;
+
+        // Validate dimensions
+        let num_centroids = centroids.size()[0];
+        assert_eq!(
+            sizes_compacted.size()[0],
+            num_centroids,
+            "Sizes tensor must have same length as number of centroids"
+        );
+
+        let num_embeddings = residuals_reader.num_rows() as i64;
+        let sizes_sum: i64 = sizes_compacted.sum(Kind::Int64).int64_value(&[]);
+        assert_eq!(
+            sizes_sum, num_embeddings,
+            "Sum of sizes must equal number of embeddings"
+        );
+        assert_eq!(
+            codes_reader.num_rows() as i64,
+            num_embeddings,
+            "Codes must have same length as residuals"
+        );
+
+        // Compute offsets from sizes using cumulative sum
+        let offsets_compacted = self.compute_offsets(&sizes_compacted)?;
+
+        // Find kdummy_centroid (the centroid with smallest size)
+        let kdummy_centroid = self.find_kdummy_centroid(&sizes_compacted)?;
+
+        // Get metadata
+        let dim = centroids
+            .size()
+            .get(1)
+            .copied()
+            .ok_or_else(|| anyhow!("Centroids tensor must be 2D"))? as usize;
+        let metadata_fallback = IndexMetadata {
+            num_passages: 0,
+            num_embeddings: num_embeddings as usize,
+            num_centroids: num_centroids as usize,
+            dim,
+            nbits: 2,
+            created_at: Utc::now().to_rfc3339(),
+            index_version: "xtr-warp-1.0".to_string(),
+        };
+
+        let metadata = self.load_metadata(index_path, metadata_fallback)?;
+
+        StreamingIndex::new(
+            centroids,
+            bucket_weights,
+            sizes_compacted,
+            offsets_compacted,
+            kdummy_centroid,
+            metadata,
+            codes_reader,
+            residuals_reader,
+            cache_bytes,
+        )
     }
 
     /// Load a PyTorch tensor file

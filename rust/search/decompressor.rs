@@ -3,7 +3,9 @@ use rayon::{prelude::*, ThreadPool};
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
-use crate::utils::types::{DecompressedCentroidsOutput, ReadOnlyIndex};
+use crate::search::index_handle::IndexHandle;
+use crate::search::streaming::StreamingIndex;
+use crate::utils::types::{CentroidId, DecompressedCentroidsOutput};
 
 /// Centroid decompressor for efficient residual decompression
 #[derive(Clone)]
@@ -70,14 +72,15 @@ impl CentroidDecompressor {
         &self,
         centroid_ids: &Tensor,
         centroid_scores: &Tensor,
-        index: &Arc<ReadOnlyIndex>,
+        index: &IndexHandle,
         query_embeddings: &Tensor, // [num_tokens, dim]
         nprobe: usize,
     ) -> Result<DecompressedCentroidsOutput> {
         let centroid_ids = centroid_ids.to_kind(Kind::Int64);
         let num_cells = centroid_ids.size()[0] as usize;
 
-        let num_total_centroids = index.offsets_compacted.size()[0] - 1;
+        let offsets_compacted = index.offsets_compacted();
+        let num_total_centroids = offsets_compacted.size()[0] - 1;
         let max_centroid_id = centroid_ids.max().int64_value(&[]);
 
         if max_centroid_id >= num_total_centroids {
@@ -89,8 +92,9 @@ impl CentroidDecompressor {
         }
 
         // Gather begin/end offsets and capacities for every requested centroid
-        let begins = index.offsets_compacted.index_select(0, &centroid_ids);
-        let ends = index.offsets_compacted.index_select(0, &(centroid_ids + 1));
+        let begins = offsets_compacted.index_select(0, &centroid_ids);
+        let centroid_ids_plus_one = centroid_ids.shallow_clone() + 1;
+        let ends = offsets_compacted.index_select(0, &centroid_ids_plus_one);
         let capacities = &ends - &begins;
 
         // Early exit when there is nothing to process
@@ -121,18 +125,37 @@ impl CentroidDecompressor {
             "Expected at least one query token for decompression"
         );
 
-        if self.device.is_cuda() {
-            return self.decompress_centroids_cuda_ops(
+        if index.is_streaming() {
+            let streaming_index = index
+                .as_streaming()
+                .ok_or_else(|| anyhow!("Streaming index handle missing"))?;
+            return self.decompress_centroids_streaming(
+                &centroid_ids,
+                centroid_scores,
+                streaming_index,
                 &begins,
                 &capacities,
-                centroid_scores,
-                index,
                 &query_embeddings,
                 nprobe,
             );
         }
 
-        let bucket_weights = index.bucket_weights.to_kind(self.dtype);
+        let in_memory_index = index
+            .as_in_memory()
+            .ok_or_else(|| anyhow!("In-memory index handle missing"))?;
+
+        if self.device.is_cuda() {
+            return self.decompress_centroids_cuda_ops(
+                &begins,
+                &capacities,
+                centroid_scores,
+                in_memory_index,
+                &query_embeddings,
+                nprobe,
+            );
+        }
+
+        let bucket_weights = in_memory_index.bucket_weights.to_kind(self.dtype);
         let vt_bucket_scores =
             (query_embeddings.unsqueeze(2) * &bucket_weights.unsqueeze(0)).contiguous();
 
@@ -185,10 +208,14 @@ impl CentroidDecompressor {
         }
 
         let (all_pids_vec, all_residuals_data) = if !all_indices.is_empty() {
-            let indices_tensor =
-                Tensor::from_slice(&all_indices).to_device(index.codes_compacted.device());
-            let batch_pids = index.codes_compacted.index_select(0, &indices_tensor);
-            let batch_residuals = index.residuals_compacted.index_select(0, &indices_tensor);
+            let indices_tensor = Tensor::from_slice(&all_indices)
+                .to_device(in_memory_index.codes_compacted.device());
+            let batch_pids = in_memory_index
+                .codes_compacted
+                .index_select(0, &indices_tensor);
+            let batch_residuals = in_memory_index
+                .residuals_compacted
+                .index_select(0, &indices_tensor);
 
             // transfer to cpu
             let pids_vec: Vec<i64> = batch_pids.try_into()?;
@@ -335,12 +362,173 @@ impl CentroidDecompressor {
         })
     }
 
+    fn decompress_centroids_streaming(
+        &self,
+        centroid_ids: &Tensor,
+        centroid_scores: &Tensor,
+        index: &Arc<StreamingIndex>,
+        begins: &Tensor,
+        capacities: &Tensor,
+        query_embeddings: &Tensor,
+        nprobe: usize,
+    ) -> Result<DecompressedCentroidsOutput> {
+        let num_cells = centroid_ids.size()[0] as usize;
+        if num_cells == 0 {
+            let empty = Tensor::zeros(&[0], (Kind::Int, self.device));
+            return Ok(DecompressedCentroidsOutput {
+                capacities: capacities.shallow_clone(),
+                sizes: empty.to_kind(Kind::Int),
+                passage_ids: Tensor::zeros(&[0], (Kind::Int64, self.device)),
+                scores: Tensor::zeros(&[0], (self.dtype, self.device)),
+                offsets: Tensor::zeros(&[1], (Kind::Int64, self.device)),
+            });
+        }
+
+        anyhow::ensure!(nprobe > 0, "nprobe must be greater than zero");
+
+        let bucket_weights = index.bucket_weights().to_kind(self.dtype);
+        let vt_bucket_scores =
+            (query_embeddings.unsqueeze(2) * &bucket_weights.unsqueeze(0)).contiguous();
+
+        let bucket_scores_flat: Vec<f32> = vt_bucket_scores.flatten(0, -1).try_into()?;
+        let centroid_scores_vec: Vec<f32> = centroid_scores.flatten(0, -1).try_into()?;
+        let centroid_ids_vec: Vec<i64> = centroid_ids.try_into()?;
+
+        anyhow::ensure!(
+            centroid_scores_vec.len() == num_cells,
+            "Centroid score count ({}) does not match number of cells ({})",
+            centroid_scores_vec.len(),
+            num_cells
+        );
+
+        let total_capacity = capacities.sum(Kind::Int64).int64_value(&[]).max(0) as usize;
+        let mut candidate_sizes = vec![0i32; num_cells];
+        let mut candidate_pids = Vec::with_capacity(total_capacity);
+        let mut candidate_scores = Vec::with_capacity(total_capacity);
+        let mut offsets = Vec::with_capacity(num_cells + 1);
+        offsets.push(0i64);
+
+        let num_buckets = 1usize << (self.nbits as usize);
+        let bucket_dim_shift = self.nbits as usize;
+        let bucket_score_stride = self.dim * num_buckets;
+        let packed_vals_per_byte = 8usize / self.nbits as usize;
+        let residual_bytes_per_embedding = self.dim / packed_vals_per_byte;
+
+        let capacities_vec: Vec<i64> = capacities.shallow_clone().try_into()?;
+        let begins_vec: Vec<i64> = begins.try_into()?;
+
+        let num_tokens = query_embeddings.size()[0] as usize;
+
+        for cell_idx in 0..num_cells {
+            let capacity = capacities_vec[cell_idx] as usize;
+            if capacity == 0 {
+                offsets.push(*offsets.last().unwrap());
+                continue;
+            }
+
+            let centroid_score = centroid_scores_vec[cell_idx];
+            let token_idx = (cell_idx / nprobe).min(num_tokens - 1);
+            let bucket_scores_offset = token_idx * bucket_score_stride;
+            let token_bucket_scores = &bucket_scores_flat
+                [bucket_scores_offset..bucket_scores_offset + bucket_score_stride];
+
+            let centroid_id = centroid_ids_vec[cell_idx] as CentroidId;
+            let begin = begins_vec[cell_idx];
+            let (pids_vec, residuals_data) =
+                index.read_centroid_chunk(centroid_id, begin, capacity as i64)?;
+            if pids_vec.len() != capacity {
+                return Err(anyhow!(
+                    "Codes length mismatch for centroid {}: expected {}, got {}",
+                    centroid_id,
+                    capacity,
+                    pids_vec.len()
+                ));
+            }
+            if residuals_data.len() != capacity * residual_bytes_per_embedding {
+                return Err(anyhow!(
+                    "Residual length mismatch for centroid {}: expected {}, got {}",
+                    centroid_id,
+                    capacity * residual_bytes_per_embedding,
+                    residuals_data.len()
+                ));
+            }
+
+            let mut size = 0i32;
+            let mut prev_pid: Option<i64> = None;
+
+            for local_idx in 0..capacity {
+                let pid = pids_vec[local_idx];
+                let residual_start = local_idx * residual_bytes_per_embedding;
+                let residual_end = residual_start + residual_bytes_per_embedding;
+                let residual_bytes = &residuals_data[residual_start..residual_end];
+
+                let residual_score = if self.nbits == 2 {
+                    Self::decompress_residual_2bit(
+                        residual_bytes,
+                        &self.reversed_bit_map,
+                        token_bucket_scores,
+                        bucket_dim_shift,
+                    )
+                } else {
+                    Self::decompress_residual_4bit(
+                        residual_bytes,
+                        &self.reversed_bit_map,
+                        token_bucket_scores,
+                        bucket_dim_shift,
+                    )
+                };
+
+                let total_score = centroid_score + residual_score;
+
+                match prev_pid {
+                    Some(prev) if prev == pid => {
+                        let last_idx = candidate_scores.len() - 1;
+                        if total_score > candidate_scores[last_idx] {
+                            candidate_scores[last_idx] = total_score;
+                        }
+                    }
+                    _ => {
+                        candidate_pids.push(pid);
+                        candidate_scores.push(total_score);
+                        size += 1;
+                        prev_pid = Some(pid);
+                    }
+                }
+            }
+
+            candidate_sizes[cell_idx] = size;
+            let next_offset = offsets.last().copied().unwrap_or(0) + size as i64;
+            offsets.push(next_offset);
+        }
+
+        let sizes_tensor = Tensor::from_slice(&candidate_sizes)
+            .to_device(self.device)
+            .to_kind(Kind::Int);
+        let pids_tensor = Tensor::from_slice(&candidate_pids)
+            .to_device(self.device)
+            .to_kind(Kind::Int64);
+        let scores_tensor = Tensor::from_slice(&candidate_scores)
+            .to_device(self.device)
+            .to_kind(self.dtype);
+        let offsets_tensor = Tensor::from_slice(&offsets)
+            .to_device(self.device)
+            .to_kind(Kind::Int64);
+
+        Ok(DecompressedCentroidsOutput {
+            capacities: capacities.shallow_clone(),
+            sizes: sizes_tensor,
+            passage_ids: pids_tensor,
+            scores: scores_tensor,
+            offsets: offsets_tensor,
+        })
+    }
+
     fn decompress_centroids_cuda_ops(
         &self,
         begins: &Tensor,
         capacities: &Tensor,
         centroid_scores: &Tensor,
-        index: &Arc<ReadOnlyIndex>,
+        index: &Arc<crate::utils::types::ReadOnlyIndex>,
         query_embeddings: &Tensor, // [num_tokens, dim]
         nprobe: usize,
     ) -> Result<DecompressedCentroidsOutput> {

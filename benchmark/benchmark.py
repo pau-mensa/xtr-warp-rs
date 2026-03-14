@@ -290,7 +290,7 @@ def run_xtr_warp(
     print(f"🔍 Searching on {dataset_name}...")
 
     precision_dtype = getattr(torch, config["precision"])
-    index.load(config["device"], dtype=precision_dtype)
+    index.load(config["device"], dtype=precision_dtype, mode="stream")
 
     search_monitor = MemoryMonitor()
     search_monitor.start()
