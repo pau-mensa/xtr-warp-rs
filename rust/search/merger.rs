@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::collections::BTreeMap;
 use tch::{no_grad, Device, Kind, Tensor};
 
 use crate::utils::types::{PassageId, Score};
@@ -294,43 +293,20 @@ impl ResultMerger {
             let mse_vec: Vec<f32> = mse_estimates.try_into()?;
 
             // Create strided views into the data (each view represents one centroid's candidates)
+            // Data arrives already sorted by pid and deduped from the decompressor
             let mut views = Vec::new();
             let mut offset = 0;
-            let mut total_dedup_size = 0usize;
             for i in 0..num_cells {
                 let size = sizes_vec[i] as usize;
-
-                // Use size instead of capacity since the data is deduplicated and compacted
                 let end = (offset + size).min(num_candidates);
-                let mut pid_score_map: BTreeMap<PassageId, Score> = BTreeMap::new();
 
-                for idx in offset..end {
-                    let pid = pids_vec[idx];
-                    let score = scores_vec[idx];
-                    pid_score_map
-                        .entry(pid)
-                        .and_modify(|existing| {
-                            if score > *existing {
-                                *existing = score;
-                            }
-                        })
-                        .or_insert(score);
-                }
-
-                let dedup_size = pid_score_map.len();
-                total_dedup_size += dedup_size;
-
-                let mut dedup_pids = Vec::with_capacity(dedup_size);
-                let mut dedup_scores = Vec::with_capacity(dedup_size);
-                for (pid, score) in pid_score_map {
-                    dedup_pids.push(pid);
-                    dedup_scores.push(score);
-                }
+                let cell_pids = pids_vec[offset..end].to_vec();
+                let cell_scores = scores_vec[offset..end].to_vec();
 
                 views.push(AnnotatedStrideView::from_data(
-                    dedup_pids,
-                    dedup_scores,
-                    dedup_size,
+                    cell_pids,
+                    cell_scores,
+                    size,
                 ));
                 offset += size;
             }
@@ -339,12 +315,9 @@ impl ResultMerger {
             // We need to create views that can handle the worst-case merge scenario
             // When merging in a tree-like fashion, the maximum size at any level
             // is the sum of all individual sizes
-            let max_merged_size = total_dedup_size.max(1);
             let mut views_buffer = Vec::new();
             for _ in 0..num_cells {
-                // Each buffer view needs enough capacity to hold the fully merged result
-                // in the worst case (no deduplication during merge)
-                views_buffer.push(AnnotatedStrideView::with_capacity(max_merged_size));
+                views_buffer.push(AnnotatedStrideView::with_capacity(0));
             }
 
             // Merge candidates for each token
