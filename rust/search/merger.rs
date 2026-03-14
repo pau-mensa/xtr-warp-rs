@@ -256,6 +256,125 @@ impl ResultMerger {
         pid_idx
     }
 
+    /// Merge a set of nprobe cell views using max-reduction (tree-based).
+    /// Takes ownership of the views and returns a single merged view.
+    pub fn merge_nprobe_views(cell_views: Vec<AnnotatedStrideView>) -> AnnotatedStrideView {
+        let n = cell_views.len();
+        if n == 0 {
+            return AnnotatedStrideView::from_data(vec![], vec![], 0);
+        }
+        if n == 1 {
+            return cell_views.into_iter().next().unwrap();
+        }
+
+        let mut buf1 = cell_views;
+        let mut buf2: Vec<AnnotatedStrideView> = (0..n)
+            .map(|_| AnnotatedStrideView::with_capacity(0))
+            .collect();
+
+        let combiner = ReduceMaxCombiner;
+        let mut step_size = 1;
+
+        while step_size < n {
+            for lhs in (0..n).step_by(step_size * 2) {
+                let rhs = lhs + step_size;
+                if rhs < n {
+                    Self::merge_candidate_strides_with_combiner(
+                        &buf1[lhs],
+                        &buf1[rhs],
+                        &mut buf2[lhs],
+                        &combiner,
+                    );
+                } else {
+                    Self::copy_candidate_stride(&buf1[lhs], &mut buf2[lhs]);
+                }
+            }
+            std::mem::swap(&mut buf1, &mut buf2);
+            step_size <<= 1;
+        }
+
+        buf1.swap_remove(0)
+    }
+
+    /// Merge per-token views using sum-reduction with MSE correction (tree-based).
+    /// Takes ownership of the views and returns a single merged view.
+    pub fn merge_token_views(
+        token_views: Vec<AnnotatedStrideView>,
+        mse_estimates: &[f32],
+    ) -> AnnotatedStrideView {
+        let num_tokens = token_views.len();
+        if num_tokens == 0 {
+            return AnnotatedStrideView::from_data(vec![], vec![], 0);
+        }
+        if num_tokens == 1 {
+            return token_views.into_iter().next().unwrap();
+        }
+
+        let mut mse_prefix = vec![0.0f32; num_tokens + 1];
+        for i in 0..num_tokens {
+            mse_prefix[i + 1] = mse_prefix[i] + mse_estimates.get(i).unwrap_or(&0.0);
+        }
+
+        let mut buf1 = token_views;
+        let mut buf2: Vec<AnnotatedStrideView> = (0..num_tokens)
+            .map(|_| AnnotatedStrideView::with_capacity(0))
+            .collect();
+
+        let mut step_size = 1;
+        while step_size < num_tokens {
+            for lhs in (0..num_tokens).step_by(step_size * 2) {
+                let rhs = lhs + step_size;
+                if rhs < num_tokens {
+                    let lhs_mse = mse_prefix[rhs] - mse_prefix[lhs];
+                    let rhs_mse =
+                        mse_prefix[(rhs + step_size).min(num_tokens)] - mse_prefix[rhs];
+                    let combiner = ReduceSumMseCombiner::new(lhs_mse, rhs_mse);
+                    Self::merge_candidate_strides_with_combiner(
+                        &buf1[lhs],
+                        &buf1[rhs],
+                        &mut buf2[lhs],
+                        &combiner,
+                    );
+                } else {
+                    Self::copy_candidate_stride(&buf1[lhs], &mut buf2[lhs]);
+                }
+            }
+            std::mem::swap(&mut buf1, &mut buf2);
+            step_size <<= 1;
+        }
+
+        buf1.swap_remove(0)
+    }
+
+    /// Get top-k results from a final merged view
+    pub fn top_k_results(
+        stride: &AnnotatedStrideView,
+        max_candidates: usize,
+        k: usize,
+    ) -> (Vec<PassageId>, Vec<Score>) {
+        if stride.size == 0 {
+            return (vec![], vec![]);
+        }
+
+        let budget = max_candidates.min(stride.size).max(k);
+        let top_idx = Self::partial_sort_results(stride, budget);
+
+        let mut result_pids = vec![0i64; budget];
+        let mut result_scores = vec![0.0f32; budget];
+        let limit = top_idx.len();
+
+        for i in 0..budget {
+            if i >= limit {
+                break;
+            }
+            let idx = top_idx[i];
+            result_pids[i] = stride.pids[idx];
+            result_scores[i] = stride.scores[idx];
+        }
+
+        (result_pids, result_scores)
+    }
+
     /// Merges candidate scores from multiple centroids/sources
     pub fn merge_candidate_scores(
         &self,
