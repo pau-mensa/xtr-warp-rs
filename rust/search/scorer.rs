@@ -105,40 +105,22 @@ impl WARPScorer {
             self.index.kdummy_centroid,
             k,
         )?;
-
-        let (pids, scores) = if self.device == Device::Cpu {
-            // Fused CPU path: decompress and merge in a single pass
-            let mse_vec: Vec<f32> = (&selected.mse_estimate).try_into()?;
-            let max_candidates = self.config.max_candidates.unwrap_or(256);
-            self.decompressor.decompress_and_merge(
-                &selected.centroid_ids.to_kind(Kind::Int64),
-                &selected.scores,
-                &self.index,
-                &query_embeddings,
-                self.config.nprobe as usize,
-                &mse_vec,
-                max_candidates,
-                k,
-            )?
-        } else {
-            // CUDA path: separate decompress + merge (tensors needed for GPU ops)
-            let decompressed = self.decompressor.decompress_centroids(
-                &selected.centroid_ids.to_kind(Kind::Int64),
-                &selected.scores,
-                &self.index,
-                &query_embeddings,
-                self.config.nprobe as usize,
-            )?;
-            self.merger.merge_candidate_scores(
-                &decompressed.capacities,
-                &decompressed.sizes,
-                &decompressed.passage_ids,
-                &decompressed.scores,
-                &selected.mse_estimate,
-                self.config.nprobe as usize,
-                k,
-            )?
-        };
+        let decompressed = self.decompressor.decompress_centroids(
+            &selected.centroid_ids.to_kind(Kind::Int64),
+            &selected.scores,
+            &self.index,
+            &query_embeddings,
+            self.config.nprobe as usize,
+        )?;
+        let (pids, scores) = self.merger.merge_candidate_scores(
+            &decompressed.capacities,
+            &decompressed.sizes,
+            &decompressed.passage_ids,
+            &decompressed.scores,
+            &selected.mse_estimate,
+            self.config.nprobe as usize,
+            k,
+        )?;
 
         Ok(SearchResult {
             passage_ids: pids[..k.min(pids.len())].to_vec(),
@@ -174,9 +156,9 @@ impl WARPScorer {
 
             let centroid_selector = self.centroid_selector.clone();
             let decompressor = self.decompressor.clone();
+            let merger = self.merger.clone();
             let index = Arc::clone(&self.index);
             let nprobe = self.config.nprobe as usize;
-            let max_candidates = self.config.max_candidates.unwrap_or(256);
             let device = self.device;
 
             self.thread_pool.install(move || {
@@ -196,15 +178,21 @@ impl WARPScorer {
                             k,
                         )?;
 
-                        let mse_vec: Vec<f32> = (&selected.mse_estimate).try_into()?;
-                        let (pids, scores) = decompressor.decompress_and_merge(
+                        let decompressed = decompressor.decompress_centroids(
                             &selected.centroid_ids.to_kind(Kind::Int64),
                             &selected.scores,
                             &index,
                             &query_embeddings,
                             nprobe,
-                            &mse_vec,
-                            max_candidates,
+                        )?;
+
+                        let (pids, scores) = merger.merge_candidate_scores(
+                            &decompressed.capacities,
+                            &decompressed.sizes,
+                            &decompressed.passage_ids,
+                            &decompressed.scores,
+                            &selected.mse_estimate,
+                            nprobe,
                             k,
                         )?;
 

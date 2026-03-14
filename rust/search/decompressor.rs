@@ -3,8 +3,7 @@ use rayon::{prelude::*, ThreadPool};
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
-use crate::search::merger::{AnnotatedStrideView, ResultMerger};
-use crate::utils::types::{DecompressedCentroidsOutput, PassageId, ReadOnlyIndex, Score};
+use crate::utils::types::{DecompressedCentroidsOutput, ReadOnlyIndex};
 
 /// Centroid decompressor for efficient residual decompression
 #[derive(Clone)]
@@ -247,118 +246,6 @@ impl CentroidDecompressor {
             scores: scores_tensor,
             offsets: offsets_tensor,
         })
-    }
-
-    /// Fused decompress-and-merge for the CPU path.
-    /// Processes tokens one at a time, merging nprobe cells immediately per token,
-    /// then merging across tokens. Avoids materializing all candidates globally.
-    pub fn decompress_and_merge(
-        &self,
-        centroid_ids: &Tensor,
-        centroid_scores: &Tensor,
-        index: &Arc<ReadOnlyIndex>,
-        query_embeddings: &Tensor,
-        nprobe: usize,
-        mse_estimates: &[f32],
-        max_candidates: usize,
-        k: usize,
-    ) -> Result<(Vec<PassageId>, Vec<Score>)> {
-        let centroid_ids = centroid_ids.to_kind(Kind::Int64);
-        let num_cells = centroid_ids.size()[0] as usize;
-
-        if num_cells == 0 {
-            return Ok((vec![], vec![]));
-        }
-
-        anyhow::ensure!(nprobe > 0, "nprobe must be greater than zero");
-
-        let query_embeddings = query_embeddings.to_kind(self.dtype);
-        let num_tokens = query_embeddings.size()[0] as usize;
-        anyhow::ensure!(
-            num_tokens > 0,
-            "Expected at least one query token for decompression"
-        );
-        anyhow::ensure!(
-            query_embeddings.size()[1] == self.dim as i64,
-            "Query embedding dim ({}) does not match index dim ({})",
-            query_embeddings.size()[1],
-            self.dim
-        );
-
-        let num_total_centroids = index.offsets_compacted.size()[0] - 1;
-        let max_centroid_id = centroid_ids.max().int64_value(&[]);
-        if max_centroid_id >= num_total_centroids {
-            return Err(anyhow!(
-                "Centroid ID {} is out of bounds (max valid ID is {})",
-                max_centroid_id,
-                num_total_centroids - 1
-            ));
-        }
-
-        let begins = index.offsets_compacted.index_select(0, &centroid_ids);
-        let ends = index.offsets_compacted.index_select(0, &(centroid_ids + 1));
-        let capacities = &ends - &begins;
-
-        let capacities_vec: Vec<i64> = capacities.shallow_clone().try_into()?;
-        let begins_vec: Vec<i64> = begins.try_into()?;
-
-        let bucket_weights = index.bucket_weights.to_kind(self.dtype);
-        let vt_bucket_scores =
-            (query_embeddings.unsqueeze(2) * &bucket_weights.unsqueeze(0)).contiguous();
-        let bucket_scores_flat: Vec<f32> = vt_bucket_scores.flatten(0, -1).try_into()?;
-        let centroid_scores_vec: Vec<f32> = centroid_scores.flatten(0, -1).try_into()?;
-
-        anyhow::ensure!(
-            centroid_scores_vec.len() == num_cells,
-            "Centroid score count ({}) does not match number of cells ({})",
-            centroid_scores_vec.len(),
-            num_cells
-        );
-
-        let num_buckets = 1usize << (self.nbits as usize);
-        let bucket_dim_shift = self.nbits as usize;
-        let bucket_score_stride = self.dim * num_buckets;
-        let packed_vals_per_byte = 8usize / self.nbits as usize;
-        let residual_bytes_per_embedding = self.dim / packed_vals_per_byte;
-
-        // Process each token: decompress its nprobe cells, merge immediately
-        let mut token_views: Vec<AnnotatedStrideView> = Vec::with_capacity(num_tokens);
-
-        for token_idx in 0..num_tokens {
-            let cell_begin = token_idx * nprobe;
-            let cell_end = (cell_begin + nprobe).min(num_cells);
-            let n_cells_for_token = cell_end - cell_begin;
-
-            let mut cell_views: Vec<AnnotatedStrideView> = Vec::with_capacity(n_cells_for_token);
-            for cell_offset in 0..n_cells_for_token {
-                let cell_idx = cell_begin + cell_offset;
-                let (pids, scores, size) = self.process_cell(
-                    cell_idx,
-                    &capacities_vec,
-                    &begins_vec,
-                    &centroid_scores_vec,
-                    nprobe,
-                    num_tokens,
-                    bucket_score_stride,
-                    &bucket_scores_flat,
-                    index,
-                    residual_bytes_per_embedding,
-                    bucket_dim_shift,
-                );
-                cell_views.push(AnnotatedStrideView::from_data(pids, scores, size as usize));
-            }
-
-            // Merge this token's nprobe cell views (max-reduction)
-            let merged = ResultMerger::merge_nprobe_views(cell_views);
-            token_views.push(merged);
-            // nprobe cell data is dropped here — only merged view survives
-        }
-
-        // Merge across tokens (sum-reduction with MSE correction)
-        let final_view = ResultMerger::merge_token_views(token_views, mse_estimates);
-
-        // Top-k
-        Ok(ResultMerger::top_k_results(&final_view, max_candidates, k))
     }
 
     fn decompress_centroids_cuda_ops(
