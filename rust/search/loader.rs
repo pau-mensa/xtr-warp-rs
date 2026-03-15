@@ -46,7 +46,7 @@ fn parse_npy_header(path: &Path) -> Result<(u64, Vec<i64>, Kind)> {
     let kind = match descr.as_str() {
         "<i4" | "=i4" => Kind::Int,
         "<i8" | "=i8" => Kind::Int64,
-        "|u1" => Kind::Uint8,
+        "|u1" | "<u1" | ">u1" => Kind::Uint8,
         "<f4" | "=f4" => Kind::Float,
         "<f2" | "=f2" => Kind::Half,
         "<f8" | "=f8" => Kind::Double,
