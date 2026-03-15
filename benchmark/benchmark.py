@@ -264,17 +264,18 @@ def run_xtr_warp(
 
     start_index = time.time()
     if config["device"] == "cuda":
-        index.create(
-            embeddings_source=embeddings_source,  # embeddings_path,
-            # if embeddings_path
-            # else documents_embeddings,
-            kmeans_niters=4,
-            # n_samples_kmeans=10_000,
-            max_points_per_centroid=256,
-            nbits=4,
-            seed=42,
-            device=config["device"],
-        )
+        pass
+        # index.create(
+        #    embeddings_source=embeddings_source,  # embeddings_path,
+        # if embeddings_path
+        # else documents_embeddings,
+        #    kmeans_niters=4,
+        # n_samples_kmeans=10_000,
+        #    max_points_per_centroid=256,
+        #    nbits=4,
+        #    seed=42,
+        #    device=config["device"],
+        # )
     end_index = time.time()
 
     index_memory = index_monitor.stop()
@@ -545,7 +546,8 @@ def run_fast_plaid(
 
     start_index = time.time()
     if config["device"] == "cuda":
-        index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+        pass
+        # index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
     end_index = time.time()
 
     index_memory = index_monitor.stop()
@@ -768,7 +770,7 @@ def main():
     if first_chunk_path.exists() and queries_emb_path.exists():
         if framework != "xtr-warp" or (framework == "xtr-warp" and not args.stream):
             print(f"📂 Loading cached embeddings from {embeddings_dir}")
-            documents_embeddings = _load_documents_embeddings(embeddings_dir)
+            documents_embeddings = []  # _load_documents_embeddings(embeddings_dir)
             embeddings_source = documents_embeddings
         elif framework == "xtr-warp" and args.stream:
             print("Skipping embeddings load, stream mode enabled")
@@ -842,7 +844,7 @@ def main():
 
             if framework != "xtr-warp" or (framework == "xtr-warp" and not args.stream):
                 print(f"📂 Loading cached embeddings from {embeddings_dir}")
-                documents_embeddings = _load_documents_embeddings(embeddings_dir)
+                documents_embeddings = []  # _load_documents_embeddings(embeddings_dir)
                 embeddings_source = documents_embeddings
             else:
                 print("Skipping embeddings load, stream mode enabled")

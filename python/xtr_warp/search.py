@@ -463,7 +463,7 @@ class XTRWarp:
         self,
         device: str | list[str] = "auto",
         dtype: torch.dtype = torch.float32,
-        mmap: bool = False,
+        mmap: bool = True,
     ) -> "XTRWarp":
         """Load an index to a specific device with the specified precision.
 
@@ -507,7 +507,10 @@ class XTRWarp:
             self.devices = devices
 
         if mmap and any(d != "cpu" for d in self.devices):
-            raise ValueError("mmap=True is only supported when device='cpu'")
+            logger.warning(
+                "mmap=True is only supported when device='cpu', disabling it"
+            )
+            mmap = False
 
         self._loaded_searchers = []
         for d in self.devices:

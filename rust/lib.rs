@@ -126,7 +126,7 @@ struct LoadedSearcher {
 #[pymethods]
 impl LoadedSearcher {
     #[new]
-    #[pyo3(signature = (index_path, device, dtype, use_mmap=false))]
+    #[pyo3(signature = (index_path, device, dtype, use_mmap=true))]
     fn new(index_path: String, device: String, dtype: String, use_mmap: bool) -> PyResult<Self> {
         let device = get_device(&device)?;
         let dtype = get_dtype(&dtype)?;
@@ -144,9 +144,7 @@ impl LoadedSearcher {
     fn load(&mut self) -> PyResult<()> {
         let index_loader =
             IndexLoader::new(&self.index_path, self.device, self.dtype, self.use_mmap)
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("Failed to create loader: {}", e))
-                })?;
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to create loader: {}", e)))?;
         let loaded_index = Arc::new(
             index_loader
                 .load()
