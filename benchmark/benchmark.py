@@ -266,8 +266,6 @@ def run_xtr_warp(
     if config["device"] == "cuda":
         index.create(
             embeddings_source=embeddings_source,  # embeddings_path,
-            # if embeddings_path
-            # else documents_embeddings,
             kmeans_niters=4,
             # n_samples_kmeans=10_000,
             max_points_per_centroid=256,
@@ -290,7 +288,7 @@ def run_xtr_warp(
     print(f"🔍 Searching on {dataset_name}...")
 
     precision_dtype = getattr(torch, config["precision"])
-    index.load(config["device"], dtype=precision_dtype)
+    index.load(config["device"], dtype=precision_dtype, mmap=config.get("mmap", False))
 
     search_monitor = MemoryMonitor()
     search_monitor.start()

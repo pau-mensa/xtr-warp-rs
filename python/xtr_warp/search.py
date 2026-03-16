@@ -463,6 +463,7 @@ class XTRWarp:
         self,
         device: str | list[str] = "auto",
         dtype: torch.dtype = torch.float32,
+        mmap: bool = True,
     ) -> "XTRWarp":
         """Load an index to a specific device with the specified precision.
 
@@ -475,6 +476,9 @@ class XTRWarp:
                 but run centroid scoring on the accelerator.
         dtype:
             valid torch dtype
+        mmap:
+            If True, memory-map the large index tensors (codes and residuals)
+            instead of loading them into memory. Only supported on CPU.
 
         """
         if self._loaded_searchers is not None:
@@ -502,10 +506,16 @@ class XTRWarp:
         else:
             self.devices = devices
 
+        if mmap and any(d != "cpu" for d in self.devices):
+            logger.warning(
+                "mmap=True is only supported when device='cpu', disabling it"
+            )
+            mmap = False
+
         self._loaded_searchers = []
         for d in self.devices:
             _ = self._ensure_torch_initialized(d)
-            searcher = xtr_warp_rs.LoadedSearcher(self.index, d, dtype_str)
+            searcher = xtr_warp_rs.LoadedSearcher(self.index, d, dtype_str, mmap)
             searcher.load()
             self._loaded_searchers.append(searcher)
 

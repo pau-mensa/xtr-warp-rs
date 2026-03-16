@@ -160,47 +160,8 @@ impl CentroidDecompressor {
         let packed_vals_per_byte = 8usize / self.nbits as usize;
         let residual_bytes_per_embedding = self.dim / packed_vals_per_byte;
 
-        // we need to prefetch all data to cpu, to avoid costly gpu -> cpu transfers
         let capacities_vec: Vec<i64> = capacities.shallow_clone().try_into()?;
         let begins_vec: Vec<i64> = begins.try_into()?;
-
-        // collect all indices
-        let mut all_indices = Vec::new();
-        let mut cell_ranges = Vec::new();
-
-        for cell_idx in 0..num_cells {
-            let capacity = capacities_vec[cell_idx] as usize;
-            if capacity == 0 {
-                cell_ranges.push((0, 0));
-                continue;
-            }
-
-            let begin = begins_vec[cell_idx];
-            let start_idx = all_indices.len();
-            for inner_idx in 0..capacity {
-                all_indices.push(begin + inner_idx as i64);
-            }
-            let end_idx = all_indices.len();
-            cell_ranges.push((start_idx, end_idx));
-        }
-
-        let (all_pids_vec, all_residuals_data) = if !all_indices.is_empty() {
-            let indices_tensor =
-                Tensor::from_slice(&all_indices).to_device(index.codes_compacted.device());
-            let batch_pids = index.codes_compacted.index_select(0, &indices_tensor);
-            let batch_residuals = index.residuals_compacted.index_select(0, &indices_tensor);
-
-            // transfer to cpu
-            let pids_vec: Vec<i64> = batch_pids.try_into()?;
-            let residuals_flat: Vec<u8> = batch_residuals
-                .to_kind(Kind::Uint8)
-                .contiguous()
-                .view([-1])
-                .try_into()?;
-            (pids_vec, residuals_flat)
-        } else {
-            (Vec::new(), Vec::new())
-        };
 
         let use_parallel = self.thread_pool.current_num_threads() > 1 && num_cells > 1;
 
@@ -212,14 +173,13 @@ impl CentroidDecompressor {
                         self.process_cell(
                             cell_idx,
                             &capacities_vec,
+                            &begins_vec,
                             &centroid_scores_vec,
                             nprobe,
                             num_tokens,
                             bucket_score_stride,
                             &bucket_scores_flat,
-                            &cell_ranges,
-                            &all_pids_vec,
-                            &all_residuals_data,
+                            index,
                             residual_bytes_per_embedding,
                             bucket_dim_shift,
                         )
@@ -244,70 +204,23 @@ impl CentroidDecompressor {
         } else {
             // Sequential processing
             for cell_idx in 0..num_cells {
-                let capacity = capacities_vec[cell_idx] as usize;
-                if capacity == 0 {
-                    offsets.push(*offsets.last().unwrap());
-                    continue;
-                }
-                let centroid_score = centroid_scores_vec[cell_idx];
+                let (local_pids, local_scores, size) = self.process_cell(
+                    cell_idx,
+                    &capacities_vec,
+                    &begins_vec,
+                    &centroid_scores_vec,
+                    nprobe,
+                    num_tokens,
+                    bucket_score_stride,
+                    &bucket_scores_flat,
+                    index,
+                    residual_bytes_per_embedding,
+                    bucket_dim_shift,
+                );
 
-                let token_idx = (cell_idx / nprobe).min(num_tokens - 1);
-                let bucket_scores_offset = token_idx * bucket_score_stride;
-                let token_bucket_scores = &bucket_scores_flat
-                    [bucket_scores_offset..bucket_scores_offset + bucket_score_stride];
-                let mut size = 0i32;
-                let mut prev_pid: Option<i64> = None;
-
-                let (start_idx, end_idx) = cell_ranges[cell_idx];
-
-                for local_idx in 0..(end_idx - start_idx) {
-                    let global_idx = start_idx + local_idx;
-                    let pid = all_pids_vec[global_idx];
-
-                    // extract residual bytes for the embedding
-                    let residual_start = global_idx * residual_bytes_per_embedding;
-                    let residual_end = residual_start + residual_bytes_per_embedding;
-                    let residual_bytes = &all_residuals_data[residual_start..residual_end];
-
-                    let residual_score = if self.nbits == 2 {
-                        Self::decompress_residual_2bit(
-                            &residual_bytes,
-                            &self.reversed_bit_map,
-                            token_bucket_scores,
-                            bucket_dim_shift,
-                        )
-                    } else {
-                        Self::decompress_residual_4bit(
-                            &residual_bytes,
-                            &self.reversed_bit_map,
-                            token_bucket_scores,
-                            bucket_dim_shift,
-                        )
-                    };
-
-                    let total_score = centroid_score + residual_score;
-
-                    match prev_pid {
-                        Some(prev) if prev == pid => {
-                            let last_idx = candidate_scores.len() - 1;
-                            if total_score > candidate_scores[last_idx] {
-                                candidate_scores[last_idx] = total_score;
-                            }
-                        },
-                        _ => {
-                            candidate_pids.push(pid);
-                            candidate_scores.push(total_score);
-                            size += 1;
-                            prev_pid = Some(pid);
-                        },
-                    }
-                }
-
-                // ensure size reflects whether any entry was written
-                if size > 0 || prev_pid.is_some() {
-                    candidate_sizes[cell_idx] = size;
-                }
-
+                candidate_sizes[cell_idx] = size;
+                candidate_pids.extend(local_pids);
+                candidate_scores.extend(local_scores);
                 let next_offset = offsets.last().copied().unwrap_or(0) + size as i64;
                 offsets.push(next_offset);
             }
@@ -488,19 +401,18 @@ impl CentroidDecompressor {
         })
     }
 
-    // Helper function to process a single cell
+    // Helper function to process a single cell using narrow (zero-copy view) on compacted data
     fn process_cell(
         &self,
         cell_idx: usize,
         capacities_vec: &[i64],
+        begins_vec: &[i64],
         centroid_scores_vec: &[f32],
         nprobe: usize,
         num_tokens: usize,
         bucket_score_stride: usize,
         bucket_scores_flat: &[f32],
-        cell_ranges: &[(usize, usize)],
-        all_pids_vec: &[i64],
-        all_residuals_data: &[u8],
+        index: &Arc<ReadOnlyIndex>,
         residual_bytes_per_embedding: usize,
         bucket_dim_shift: usize,
     ) -> (Vec<i64>, Vec<f32>, i32) {
@@ -509,63 +421,79 @@ impl CentroidDecompressor {
             return (vec![], vec![], 0i32);
         }
 
+        let begin = begins_vec[cell_idx];
+
+        // Use narrow for zero-copy views into compacted data, then convert to local Vecs
+        let local_pids_raw: Vec<i64> = index
+            .codes_compacted
+            .narrow(0, begin, capacity as i64)
+            .try_into()
+            .unwrap_or_default();
+        let local_residuals_raw: Vec<u8> = index
+            .residuals_compacted
+            .narrow(0, begin, capacity as i64)
+            .to_kind(Kind::Uint8)
+            .contiguous()
+            .view([-1])
+            .try_into()
+            .unwrap_or_default();
+
         let centroid_score = centroid_scores_vec[cell_idx];
         let token_idx = (cell_idx / nprobe).min(num_tokens - 1);
         let bucket_scores_offset = token_idx * bucket_score_stride;
         let token_bucket_scores =
             &bucket_scores_flat[bucket_scores_offset..bucket_scores_offset + bucket_score_stride];
 
-        let mut local_pids = Vec::with_capacity(capacity);
-        let mut local_scores = Vec::with_capacity(capacity);
-        let mut size = 0i32;
-        let mut prev_pid: Option<i64> = None;
-
-        let (start_idx, end_idx) = cell_ranges[cell_idx];
-
-        for local_idx in 0..(end_idx - start_idx) {
-            let global_idx = start_idx + local_idx;
-            let pid = all_pids_vec[global_idx];
-
-            // extract residual bytes for the embedding
-            let residual_start = global_idx * residual_bytes_per_embedding;
+        // Score all embeddings in this cell
+        let mut scored: Vec<(i64, f32)> = Vec::with_capacity(capacity);
+        for i in 0..capacity {
+            let pid = local_pids_raw[i];
+            let residual_start = i * residual_bytes_per_embedding;
             let residual_end = residual_start + residual_bytes_per_embedding;
-            let residual_bytes = &all_residuals_data[residual_start..residual_end];
+            let residual_bytes = &local_residuals_raw[residual_start..residual_end];
 
             let residual_score = if self.nbits == 2 {
                 Self::decompress_residual_2bit(
-                    &residual_bytes,
+                    residual_bytes,
                     &self.reversed_bit_map,
                     token_bucket_scores,
                     bucket_dim_shift,
                 )
             } else {
                 Self::decompress_residual_4bit(
-                    &residual_bytes,
+                    residual_bytes,
                     &self.reversed_bit_map,
                     token_bucket_scores,
                     bucket_dim_shift,
                 )
             };
 
-            let total_score = centroid_score + residual_score;
-
-            match prev_pid {
-                Some(prev) if prev == pid => {
-                    let last_idx = local_scores.len() - 1;
-                    if total_score > local_scores[last_idx] {
-                        local_scores[last_idx] = total_score;
-                    }
-                },
-                _ => {
-                    local_pids.push(pid);
-                    local_scores.push(total_score);
-                    size += 1;
-                    prev_pid = Some(pid);
-                },
-            }
+            scored.push((pid, centroid_score + residual_score));
         }
 
-        (local_pids, local_scores, size)
+        // Sort by pid for dedup and downstream merge compatibility
+        scored.sort_unstable_by_key(|&(pid, _)| pid);
+
+        // Dedup adjacent entries with same pid, keeping max score
+        let mut dedup_pids = Vec::with_capacity(capacity);
+        let mut dedup_scores = Vec::with_capacity(capacity);
+
+        for &(pid, score) in &scored {
+            if let Some(&last_pid) = dedup_pids.last() {
+                if last_pid == pid {
+                    let last_idx = dedup_scores.len() - 1;
+                    if score > dedup_scores[last_idx] {
+                        dedup_scores[last_idx] = score;
+                    }
+                    continue;
+                }
+            }
+            dedup_pids.push(pid);
+            dedup_scores.push(score);
+        }
+
+        let size = dedup_pids.len() as i32;
+        (dedup_pids, dedup_scores, size)
     }
 
     fn decompress_residual_2bit(

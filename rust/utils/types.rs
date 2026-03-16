@@ -3,9 +3,11 @@
 // - ID types for passages, centroids, embeddings
 // - Query and result representations
 // - Index components structure
+use memmap2::Mmap;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
 /// Represents a passage/document ID in the index
@@ -222,6 +224,10 @@ pub struct LoadedIndex {
 
     /// Metadata about the index
     pub metadata: IndexMetadata,
+
+    /// Mmap handles that must outlive the tensors they back.
+    /// Arc-wrapped for shared ownership across shallow clones.
+    pub _mmap_handles: Arc<Vec<Mmap>>,
 }
 
 impl Clone for LoadedIndex {
@@ -235,6 +241,7 @@ impl Clone for LoadedIndex {
             offsets_compacted: self.offsets_compacted.shallow_clone(),
             kdummy_centroid: self.kdummy_centroid,
             metadata: self.metadata.clone(),
+            _mmap_handles: Arc::clone(&self._mmap_handles),
         }
     }
 }
