@@ -92,7 +92,7 @@ jobs:
         run: |
           VENV_VERSION="20.30.0"
           if [ "$RUNNER_OS" = "Windows" ]; then
-            CACHE_DIR="$LOCALAPPDATA/cibuildwheel"
+            CACHE_DIR="$LOCALAPPDATA/pypa/cibuildwheel/Cache"
           elif [ "$RUNNER_OS" = "macOS" ]; then
             CACHE_DIR="$HOME/Library/Caches/cibuildwheel"
           else
