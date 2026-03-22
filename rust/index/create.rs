@@ -5,13 +5,13 @@ use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use serde_json::json;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
 use super::{compact, source::EmbeddingSource};
 use crate::utils::residual_codec::ResidualCodec;
-use crate::utils::types::{IndexConfig, IndexPlan};
+use crate::utils::types::{IndexConfig, IndexMetadata, IndexPlan};
 use crate::index::encode::{encode_chunks, compress_into_codes, EncodeResult, CHUNK_SIZE, CODE_BATCH_SIZE};
 
 /// Creates a new WARP index from a collection of document embeddings.
@@ -210,29 +210,25 @@ fn finalize_ivf_and_compact(
     encode_result: &EncodeResult,
     centroids: &Tensor,
 ) -> Result<()> {
-    let final_meta_fpath = config.index_path.join("metadata.json");
     let final_avg_doclen = if plan.n_docs > 0 {
         encode_result.total_embeddings as f64 / plan.n_docs as f64
     } else {
         0.0
     };
 
-    let final_meta_json = json!({
-        "num_chunks": plan.num_chunks,
-        "nbits": plan.nbits,
-        "num_partitions": plan.est_total_embs,
-        "num_embeddings": encode_result.total_embeddings,
-        "avg_doclen": final_avg_doclen,
-        "num_passages": plan.n_docs,
-        "next_passage_id": plan.n_docs,
-        "num_centroids": centroids.size()[0] as usize,
-        "dim": config.embedding_dim,
-        "created_at": Utc::now().to_rfc3339(),
-    });
-
-    let meta_file = File::create(final_meta_fpath)?;
-    let writer = BufWriter::new(meta_file);
-    serde_json::to_writer_pretty(writer, &final_meta_json)?;
+    let meta = IndexMetadata {
+        num_chunks: plan.num_chunks,
+        nbits: plan.nbits,
+        num_partitions: plan.est_total_embs,
+        num_embeddings: encode_result.total_embeddings,
+        avg_doclen: final_avg_doclen,
+        num_passages: plan.n_docs,
+        next_passage_id: Some(plan.n_docs as i64),
+        num_centroids: centroids.size()[0] as usize,
+        dim: config.embedding_dim as usize,
+        created_at: Utc::now().to_rfc3339(),
+    };
+    meta.save(&config.index_path)?;
 
     compact::compact_index_counting_sort(
         &config.index_path,
@@ -285,6 +281,19 @@ fn train_residual_codec(
     let heldout_recon_embs = Tensor::cat(&recon_embs_vec, 0);
 
     let heldout_res_raw = (&heldout_samples - &heldout_recon_embs).to_kind(Kind::Float);
+
+    // Compute cluster_threshold: 75th percentile of residual L2 norms.
+    // Used later by centroid expansion to detect outlier embeddings.
+    {
+        let residual_norms = heldout_res_raw.norm_scalaropt_dim(2, &[1], false);
+        let n = residual_norms.size()[0];
+        let k = ((0.75 * n as f64).ceil() as i64).max(1).min(n);
+        let (threshold, _) = residual_norms.flatten(0, -1).kthvalue(k, 0, false);
+        threshold
+            .to_device(Device::Cpu)
+            .write_npy(Path::new(index_path).join("cluster_threshold.npy"))?;
+    }
+
     let avg_res_per_dim = heldout_res_raw
         .abs()
         .mean_dim(Some(&[0i64][..]), false, Kind::Float)

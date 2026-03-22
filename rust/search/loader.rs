@@ -218,13 +218,16 @@ impl IndexLoader {
             .copied()
             .ok_or_else(|| anyhow!("Centroids tensor must be 2D"))? as usize;
         let metadata_fallback = IndexMetadata {
+            num_chunks: 0,
+            nbits: 2,
+            num_partitions: 0,
+            num_embeddings: num_embeddings as i64,
+            avg_doclen: 0.0,
             num_passages: 0,
-            num_embeddings: num_embeddings as usize,
+            next_passage_id: None,
             num_centroids: num_centroids as usize,
             dim,
-            nbits: 2,
             created_at: Utc::now().to_rfc3339(),
-            index_version: "xtr-warp-1.0".to_string(),
         };
 
         let metadata = self.load_metadata(index_path, metadata_fallback)?;
@@ -303,35 +306,29 @@ impl IndexLoader {
             return Ok(fallback);
         }
 
-        #[derive(Debug, Default, serde::Deserialize)]
-        struct DiskMetadata {
-            num_passages: Option<usize>,
-            num_embeddings: Option<usize>,
-            num_centroids: Option<usize>,
-            dim: Option<usize>,
-            nbits: Option<u8>,
-            created_at: Option<String>,
-            index_version: Option<String>,
-        }
-
         let file = File::open(&metadata_path)
             .with_context(|| format!("Failed to open {:?}", metadata_path))?;
         let reader = BufReader::new(file);
-        let disk: DiskMetadata = serde_json::from_reader(reader)
+        let mut meta: IndexMetadata = serde_json::from_reader(reader)
             .with_context(|| format!("Failed to parse {:?}", metadata_path))?;
 
-        Ok(IndexMetadata {
-            num_passages: disk.num_passages.unwrap_or(fallback.num_passages),
-            num_embeddings: disk.num_embeddings.unwrap_or(fallback.num_embeddings),
-            num_centroids: disk.num_centroids.unwrap_or(fallback.num_centroids),
-            dim: disk.dim.unwrap_or(fallback.dim),
-            nbits: disk.nbits.unwrap_or(fallback.nbits),
-            created_at: disk
-                .created_at
-                .unwrap_or_else(|| fallback.created_at.clone()),
-            index_version: disk
-                .index_version
-                .unwrap_or_else(|| fallback.index_version.clone()),
-        })
+        // Fill in zero-defaults from the fallback (derived from tensor shapes)
+        if meta.num_embeddings == 0 {
+            meta.num_embeddings = fallback.num_embeddings;
+        }
+        if meta.num_centroids == 0 {
+            meta.num_centroids = fallback.num_centroids;
+        }
+        if meta.dim == 0 {
+            meta.dim = fallback.dim;
+        }
+        if meta.nbits == 0 {
+            meta.nbits = fallback.nbits;
+        }
+        if meta.created_at.is_empty() {
+            meta.created_at = fallback.created_at;
+        }
+
+        Ok(meta)
     }
 }

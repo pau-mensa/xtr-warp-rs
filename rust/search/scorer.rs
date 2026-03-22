@@ -54,7 +54,7 @@ impl WARPScorer {
         let batch_size = config.batch_size;
         let centroid_selector = CentroidSelector::new(
             &config,
-            index.metadata.num_embeddings,
+            index.metadata.num_embeddings as usize,
             index.metadata.num_centroids,
         );
         let dtype = parse_dtype(&config.dtype)?;

@@ -334,18 +334,17 @@ fn delete(_py: Python<'_>, index: String, passage_ids: Vec<i64>) -> PyResult<()>
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete: {}", e)))
 }
 
-/// Add new passages to an existing index. Encodes + recompacts.
-/// Returns the new passage IDs assigned.
-/// Reads embedding_dim from the existing index metadata.
+/// Add new passages to an existing index. Encodes + incrementally merges.
+/// Returns a dict with `new_passage_ids`, `residual_norms`, and `embedding_dim`.
 #[pyfunction]
 #[pyo3(signature = (index, torch_path, device, embeddings))]
 fn add(
-    _py: Python<'_>,
+    py: Python<'_>,
     index: String,
     torch_path: String,
     device: String,
     embeddings: EmbeddingsInput,
-) -> PyResult<Vec<i64>> {
+) -> PyResult<PyObject> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
     let device = get_device(&device)?;
@@ -358,7 +357,26 @@ fn add(
         device,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to add to index: {}", e)))?;
-    Ok(result.new_passage_ids)
+
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("new_passage_ids", result.new_passage_ids)?;
+    dict.set_item("residual_norms", result.residual_norms)?;
+    dict.set_item("embedding_dim", result.embedding_dim)?;
+    Ok(dict.into_any().unbind())
+}
+
+/// Append new centroids to the codebook (called after Python-side K-means).
+#[pyfunction]
+fn append_centroids_py(
+    _py: Python<'_>,
+    index: String,
+    new_centroids: PyTensor,
+) -> PyResult<()> {
+    crate::index::update::append_centroids(
+        Path::new(&index),
+        &new_centroids,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to append centroids: {}", e)))
 }
 
 /// Update passages in-place: new embeddings, same IDs.
@@ -422,5 +440,6 @@ fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(add, m)?)?;
     m.add_function(wrap_pyfunction!(update, m)?)?;
     m.add_function(wrap_pyfunction!(compact, m)?)?;
+    m.add_function(wrap_pyfunction!(append_centroids_py, m)?)?;
     Ok(())
 }

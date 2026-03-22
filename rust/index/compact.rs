@@ -7,6 +7,20 @@ use tch::{Device, IndexOp, Kind, Tensor};
 
 use crate::utils::types::CompactStats;
 
+/// Per-centroid data built from a subset of chunks (used by incremental merge).
+pub struct PartialCompacted {
+    /// Passage IDs per centroid (sorted within each centroid).
+    pub centroid_pids: Vec<Vec<i64>>,
+    /// Flattened residual bytes per centroid.
+    pub centroid_residuals: Vec<Vec<u8>>,
+    /// Number of embeddings per centroid.
+    pub centroid_counts: Vec<i64>,
+    /// Total active passage count across these chunks.
+    pub num_active_passages: usize,
+    /// Total embedding count across these chunks.
+    pub total_embeddings: i64,
+}
+
 fn build_ivf_from_compacted(
     codes_compacted: &Tensor,
     sizes_vec: &[i64],
@@ -452,4 +466,284 @@ pub fn compact_index_filtered(
         total_embeddings: total_filtered,
         num_active_passages: active_pids_set.len(),
     })
+}
+
+// ── Incremental merge helpers ──
+
+/// Build per-centroid data from a range of chunks.
+///
+/// Only processes chunks `[start_chunk, end_chunk)`, skipping any
+/// tombstoned passage IDs.  When `include_only_pids` is `Some`, only
+/// embeddings whose passage ID is in the set are included (used when
+/// coalescing to avoid double-counting old data in a merged chunk).
+pub fn build_partial_compacted(
+    index_path: &Path,
+    start_chunk: usize,
+    end_chunk: usize,
+    num_centroids: usize,
+    residual_dim: usize,
+    deleted_pids: &HashSet<i64>,
+    include_only_pids: Option<&HashSet<i64>>,
+) -> Result<PartialCompacted> {
+    let mut centroid_pids: Vec<Vec<i64>> = vec![Vec::new(); num_centroids];
+    let mut centroid_residuals: Vec<Vec<u8>> = vec![Vec::new(); num_centroids];
+    let mut centroid_counts = vec![0i64; num_centroids];
+    let mut active_pids_set: HashSet<i64> = HashSet::new();
+    let mut total_embeddings: i64 = 0;
+
+    for chunk_idx in start_chunk..end_chunk {
+        let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64);
+        let residuals = Tensor::read_npy(index_path.join(format!("{}.residuals.npy", chunk_idx)))?
+            .to_device(Device::Cpu);
+        let doclens = Tensor::read_npy(index_path.join(format!("doclens.{}.npy", chunk_idx)))?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64);
+        let doclens_vec: Vec<i64> = doclens.try_into()?;
+
+        let pids_path = index_path.join(format!("{}.passage_ids.npy", chunk_idx));
+        let pids_vec: Vec<i64> = if pids_path.exists() {
+            Tensor::read_npy(&pids_path)?
+                .to_device(Device::Cpu)
+                .to_kind(Kind::Int64)
+                .try_into()?
+        } else {
+            (0..doclens_vec.len() as i64).collect()
+        };
+
+        let codes_vec: Vec<i64> = codes.try_into()?;
+        // Get residuals as raw bytes — flatten [total_embs, residual_dim] -> [total_embs * residual_dim]
+        let res_flat: Vec<u8> = Vec::<u8>::try_from(
+            residuals.to_kind(Kind::Uint8).contiguous().flatten(0, -1),
+        )?;
+
+        let mut emb_offset = 0usize;
+        for (doc_idx, &doc_len) in doclens_vec.iter().enumerate() {
+            let pid = pids_vec[doc_idx];
+            let skip = deleted_pids.contains(&pid)
+                || include_only_pids.map_or(false, |set| !set.contains(&pid));
+            if skip {
+                emb_offset += doc_len as usize;
+                continue;
+            }
+            active_pids_set.insert(pid);
+            for _ in 0..doc_len as usize {
+                let centroid_id = codes_vec[emb_offset] as usize;
+                centroid_pids[centroid_id].push(pid);
+                let byte_start = emb_offset * residual_dim;
+                let byte_end = byte_start + residual_dim;
+                centroid_residuals[centroid_id].extend_from_slice(&res_flat[byte_start..byte_end]);
+                centroid_counts[centroid_id] += 1;
+                total_embeddings += 1;
+                emb_offset += 1;
+            }
+        }
+    }
+
+    Ok(PartialCompacted {
+        centroid_pids,
+        centroid_residuals,
+        centroid_counts,
+        num_active_passages: active_pids_set.len(),
+        total_embeddings,
+    })
+}
+
+/// Incrementally merge new data into existing compacted structures.
+///
+/// For centroids that are untouched (no new data), copies contiguous ranges
+/// from the old compacted arrays.  For modified centroids, copies old data
+/// and appends new data.
+pub fn merge_compacted_incremental(
+    index_path: &Path,
+    partial: &PartialCompacted,
+    num_centroids: usize,
+    residual_dim: usize,
+    device: Device,
+) -> Result<CompactStats> {
+    // Load existing compacted structures
+    let old_sizes_path = index_path.join("sizes.compacted.npy");
+    let old_sizes_tensor = Tensor::read_npy(&old_sizes_path)?
+        .to_device(Device::Cpu)
+        .to_kind(Kind::Int64);
+    let old_sizes: Vec<i64> = old_sizes_tensor.try_into()?;
+
+    let old_codes = Tensor::read_npy(index_path.join("codes.compacted.npy"))?
+        .to_device(device)
+        .to_kind(Kind::Int64);
+    let old_residuals = Tensor::read_npy(index_path.join("residuals.compacted.npy"))?
+        .to_device(device);
+
+    // Compute old offsets
+    let mut old_offsets = vec![0i64; num_centroids + 1];
+    for i in 0..num_centroids {
+        old_offsets[i + 1] = old_offsets[i] + old_sizes[i];
+    }
+    let _old_total = old_offsets[num_centroids];
+
+    // Compute new sizes and offsets
+    let new_sizes: Vec<i64> = old_sizes
+        .iter()
+        .zip(&partial.centroid_counts)
+        .map(|(&o, &n)| o + n)
+        .collect();
+
+    let mut new_offsets = vec![0i64; num_centroids + 1];
+    for i in 0..num_centroids {
+        new_offsets[i + 1] = new_offsets[i] + new_sizes[i];
+    }
+    let new_total = new_offsets[num_centroids];
+
+    // Allocate new compacted arrays
+    let new_codes = Tensor::zeros(&[new_total], (Kind::Int64, device));
+    let new_residuals =
+        Tensor::zeros(&[new_total, residual_dim as i64], (Kind::Uint8, device));
+
+    // Walk centroids and merge
+    let mut c = 0usize;
+    while c < num_centroids {
+        if partial.centroid_counts[c] == 0 {
+            // Fast path: find contiguous range of unchanged centroids
+            let range_start = c;
+            while c < num_centroids && partial.centroid_counts[c] == 0 {
+                c += 1;
+            }
+            // Copy entire contiguous slice at once
+            let old_start = old_offsets[range_start];
+            let old_len = old_offsets[c] - old_start;
+            let dst_start = new_offsets[range_start];
+            if old_len > 0 {
+                new_codes
+                    .narrow(0, dst_start, old_len)
+                    .copy_(&old_codes.narrow(0, old_start, old_len));
+                new_residuals
+                    .narrow(0, dst_start, old_len)
+                    .copy_(&old_residuals.narrow(0, old_start, old_len));
+            }
+        } else {
+            // Modified partition: copy old data + append new
+            let old_start = old_offsets[c];
+            let old_count = old_sizes[c];
+            let dst_start = new_offsets[c];
+
+            if old_count > 0 {
+                new_codes
+                    .narrow(0, dst_start, old_count)
+                    .copy_(&old_codes.narrow(0, old_start, old_count));
+                new_residuals
+                    .narrow(0, dst_start, old_count)
+                    .copy_(&old_residuals.narrow(0, old_start, old_count));
+            }
+
+            // Append new data
+            let new_count = partial.centroid_counts[c];
+            let append_start = dst_start + old_count;
+
+            let pids_tensor =
+                Tensor::from_slice(&partial.centroid_pids[c]).to_device(device);
+            new_codes
+                .narrow(0, append_start, new_count)
+                .copy_(&pids_tensor);
+
+            let res_tensor = Tensor::from_slice(&partial.centroid_residuals[c])
+                .to_device(device)
+                .reshape([new_count, residual_dim as i64]);
+            new_residuals
+                .narrow(0, append_start, new_count)
+                .copy_(&res_tensor);
+
+            c += 1;
+        }
+    }
+
+    // Write compacted files
+    let new_sizes_tensor = Tensor::from_slice(&new_sizes);
+    new_sizes_tensor.write_npy(index_path.join("sizes.compacted.npy"))?;
+
+    new_codes
+        .to_device(Device::Cpu)
+        .write_npy(index_path.join("codes.compacted.npy"))?;
+    new_residuals
+        .to_device(Device::Cpu)
+        .write_npy(index_path.join("residuals.compacted.npy"))?;
+
+    let new_offsets_tensor = Tensor::from_slice(&new_offsets).to_device(device);
+    new_offsets_tensor
+        .to_device(Device::Cpu)
+        .write_npy(index_path.join("offsets.compacted.npy"))?;
+
+    // Rebuild IVF from new compacted codes
+    build_ivf_from_compacted(&new_codes.to_device(device), &new_sizes, index_path, device)?;
+
+    // Count total unique PIDs in the merged compacted.
+    // Use the IVF we just built — it already contains deduplicated PIDs per centroid.
+    let ivf_pids: Vec<i64> = Tensor::read_npy(index_path.join("ivf.npy"))?
+        .to_device(Device::Cpu)
+        .to_kind(Kind::Int64)
+        .try_into()?;
+    let active_set: HashSet<i64> = ivf_pids.into_iter().collect();
+
+    Ok(CompactStats {
+        total_embeddings: new_total,
+        num_active_passages: active_set.len(),
+    })
+}
+
+/// Remove centroids with zero embeddings from the codebook and chunk files.
+///
+/// Returns the new centroid count, or `None` if no centroids were pruned.
+pub fn prune_empty_centroids(
+    index_path: &Path,
+    num_chunks: usize,
+    device: Device,
+) -> Result<Option<usize>> {
+    let sizes = Tensor::read_npy(index_path.join("sizes.compacted.npy"))?
+        .to_device(Device::Cpu)
+        .to_kind(Kind::Int64);
+    let sizes_vec: Vec<i64> = sizes.try_into()?;
+
+    let empty_count = sizes_vec.iter().filter(|&&c| c == 0).count();
+    if empty_count == 0 {
+        return Ok(None);
+    }
+
+    // Build old->new renumbering map
+    let old_count = sizes_vec.len();
+    let mut old_to_new = vec![-1i64; old_count];
+    let mut keep_indices: Vec<i64> = Vec::new();
+    let mut new_id = 0i64;
+    for (old_id, &count) in sizes_vec.iter().enumerate() {
+        if count > 0 {
+            old_to_new[old_id] = new_id;
+            keep_indices.push(old_id as i64);
+            new_id += 1;
+        }
+    }
+    let new_num_centroids = new_id as usize;
+
+    // Rewrite centroids.npy
+    let centroids = Tensor::read_npy(index_path.join("centroids.npy"))?
+        .to_device(Device::Cpu);
+    let keep_tensor = Tensor::from_slice(&keep_indices);
+    let new_centroids = centroids.index_select(0, &keep_tensor);
+    new_centroids.write_npy(index_path.join("centroids.npy"))?;
+
+    // Rewrite chunk codes with renumbered centroid IDs
+    let remap_tensor = Tensor::from_slice(&old_to_new).to_device(device);
+    for chunk_idx in 0..num_chunks {
+        let codes_path = index_path.join(format!("{}.codes.npy", chunk_idx));
+        if !codes_path.exists() {
+            continue;
+        }
+        let codes = Tensor::read_npy(&codes_path)?
+            .to_device(device)
+            .to_kind(Kind::Int64);
+        let new_codes = remap_tensor.index_select(0, &codes);
+        new_codes
+            .to_device(Device::Cpu)
+            .write_npy(&codes_path)?;
+    }
+
+    Ok(Some(new_num_centroids))
 }

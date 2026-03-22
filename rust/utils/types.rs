@@ -187,16 +187,59 @@ pub struct IndexPlan {
     pub nbits: u8,
 }
 
-/// Index metadata stored alongside the index
+/// Canonical on-disk + in-memory representation of `metadata.json`.
+///
+/// Every field that may be absent in legacy indexes is tagged with
+/// `#[serde(default)]` so that old metadata files still parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMetadata {
-    pub num_passages: usize,
-    pub num_embeddings: usize,
-    pub num_centroids: usize,
-    pub dim: usize,
+    #[serde(default)]
+    pub num_chunks: usize,
     pub nbits: u8,
+    #[serde(default)]
+    pub num_partitions: i64,
+    #[serde(default)]
+    pub num_embeddings: i64,
+    #[serde(default)]
+    pub avg_doclen: f64,
+    #[serde(default)]
+    pub num_passages: usize,
+    /// Watermark for the next passage ID to assign.
+    /// Defaults to `num_passages` for indexes created before this field existed.
+    #[serde(default)]
+    pub next_passage_id: Option<i64>,
+    #[serde(default)]
+    pub num_centroids: usize,
+    #[serde(default)]
+    pub dim: usize,
+    #[serde(default)]
     pub created_at: String,
-    pub index_version: String,
+}
+
+impl IndexMetadata {
+    /// Load metadata from `metadata.json` in the given index directory.
+    pub fn load(index_path: &std::path::Path) -> anyhow::Result<Self> {
+        let path = index_path.join("metadata.json");
+        let file = std::fs::File::open(&path)
+            .map_err(|e| anyhow::anyhow!("Failed to open {}: {}", path.display(), e))?;
+        let meta: IndexMetadata = serde_json::from_reader(std::io::BufReader::new(file))
+            .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))?;
+        Ok(meta)
+    }
+
+    /// Persist metadata to `metadata.json`.
+    pub fn save(&self, index_path: &std::path::Path) -> anyhow::Result<()> {
+        let path = index_path.join("metadata.json");
+        let file = std::fs::File::create(&path)
+            .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", path.display(), e))?;
+        serde_json::to_writer_pretty(std::io::BufWriter::new(file), self)?;
+        Ok(())
+    }
+
+    /// Effective next passage ID (falls back to num_passages for legacy indexes).
+    pub fn next_pid(&self) -> i64 {
+        self.next_passage_id.unwrap_or(self.num_passages as i64)
+    }
 }
 
 /// Components of a loaded index
@@ -358,6 +401,10 @@ pub struct CompactStats {
 /// Result from adding documents to an index
 pub struct AddResult {
     pub new_passage_ids: Vec<i64>,
+    /// Per-embedding residual norms (for centroid expansion outlier detection).
+    pub residual_norms: Vec<f32>,
+    /// Embedding dimension.
+    pub embedding_dim: usize,
 }
 
 /// Parses a string identifier into a `tch::Device`.

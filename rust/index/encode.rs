@@ -19,6 +19,8 @@ pub struct EncodeResult {
     pub chunk_stats: Vec<ChunkStats>,
     pub total_embeddings: i64,
     pub global_centroid_counts: Tensor,
+    /// Per-embedding L2 residual norms (only populated when `collect_norms` is true).
+    pub residual_norms: Option<Vec<f32>>,
 }
 
 pub struct ChunkStats {
@@ -37,6 +39,36 @@ pub fn encode_chunks(
     passage_ids: Option<&[i64]>,
     start_chunk_idx: usize,
 ) -> Result<EncodeResult> {
+    encode_chunks_inner(plan, source, centroids, codec, index_path, device, embedding_dim, passage_ids, start_chunk_idx, false)
+}
+
+/// Like `encode_chunks` but also returns per-embedding residual norms.
+pub fn encode_chunks_with_norms(
+    plan: &IndexPlan,
+    source: &mut dyn EmbeddingSource,
+    centroids: &Tensor,
+    codec: &ResidualCodec,
+    index_path: &Path,
+    device: Device,
+    embedding_dim: u32,
+    passage_ids: Option<&[i64]>,
+    start_chunk_idx: usize,
+) -> Result<EncodeResult> {
+    encode_chunks_inner(plan, source, centroids, codec, index_path, device, embedding_dim, passage_ids, start_chunk_idx, true)
+}
+
+fn encode_chunks_inner(
+    plan: &IndexPlan,
+    source: &mut dyn EmbeddingSource,
+    centroids: &Tensor,
+    codec: &ResidualCodec,
+    index_path: &Path,
+    device: Device,
+    embedding_dim: u32,
+    passage_ids: Option<&[i64]>,
+    start_chunk_idx: usize,
+    collect_norms: bool,
+) -> Result<EncodeResult> {
     if let Some(pids) = passage_ids {
         anyhow::ensure!(
             pids.len() == source.num_docs(),
@@ -52,6 +84,7 @@ pub fn encode_chunks(
     let mut total_embeddings: i64 = 0;
     let mut global_counts = Tensor::zeros(&[num_centroids as i64], (Kind::Int64, device));
     let mut passage_offset: usize = 0;
+    let mut all_norms: Vec<f32> = Vec::new();
 
     let chunk_iter = source.chunk_iter(CHUNK_SIZE)?;
     for (local_chk_idx, chunk) in chunk_iter.enumerate() {
@@ -78,6 +111,15 @@ pub fn encode_chunks(
             let recon_centroids = Tensor::cat(&recon_centroids_batches, 0);
 
             let mut res_batch = &emb_batch - &recon_centroids;
+
+            if collect_norms {
+                let norms = res_batch
+                    .to_kind(Kind::Float)
+                    .norm_scalaropt_dim(2, &[1], false)
+                    .to_device(Device::Cpu);
+                let norms_vec: Vec<f32> = norms.try_into()?;
+                all_norms.extend(norms_vec);
+            }
 
             let bucket_cutoffs = codec.bucket_cutoffs.as_ref().unwrap().contiguous();
             res_batch = Tensor::bucketize(&res_batch, &bucket_cutoffs, true, false);
@@ -157,6 +199,7 @@ pub fn encode_chunks(
         chunk_stats,
         total_embeddings,
         global_centroid_counts: global_counts,
+        residual_norms: if collect_norms { Some(all_norms) } else { None },
     })
 }
 
