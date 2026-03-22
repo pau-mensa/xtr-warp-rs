@@ -654,3 +654,59 @@ def test_add_then_delete_then_compact_consistency():
         assert pid not in pids, f"Deleted PID {pid} should not appear"
 
     _cleanup()
+
+
+def test_recalibration_on_compact():
+    """Compact should recalibrate cluster_threshold and avg_residual."""
+    idx, docs, _queries = _fresh_index()
+
+    threshold_path = os.path.join(INDEX_DIR, "cluster_threshold.npy")
+    avg_res_path = os.path.join(INDEX_DIR, "avg_residual.npy")
+
+    threshold_before = float(np.load(threshold_path))
+    avg_res_before = np.load(avg_res_path).copy()
+
+    # Add documents with a different distribution to shift the statistics
+    torch.manual_seed(999)
+    new_docs = [torch.randn(DOC_LEN, DIM) * 3.0 for _ in range(50)]
+    idx.add(embeddings_source=new_docs, reload=False)
+
+    # Delete some originals so compact has work to do
+    idx.delete(list(range(30)))
+    idx.compact(reload=False)
+
+    threshold_after = float(np.load(threshold_path))
+    avg_res_after = np.load(avg_res_path)
+
+    # Both should have been rewritten with correct shape
+    assert avg_res_after.shape == avg_res_before.shape
+    assert avg_res_after.shape == (DIM,)
+    # With 3x-scaled docs added, the threshold should shift upward
+    assert threshold_after > threshold_before, (
+        f"Expected threshold to increase with scaled docs: {threshold_before} -> {threshold_after}"
+    )
+
+    _cleanup()
+
+
+def test_auto_compact_on_delete():
+    """delete(auto_compact=True) should trigger compaction above threshold."""
+    idx, _docs, _queries = _fresh_index()
+
+    tombstone_path = os.path.join(INDEX_DIR, "deleted_pids.npy")
+
+    # Delete 10% — below the 20% threshold, no compaction
+    idx.delete(list(range(10)), auto_compact=True, compact_threshold=0.2)
+    assert os.path.exists(tombstone_path), "Tombstones should still exist below threshold"
+
+    # Delete another 15% — now at 25%, above threshold → auto-compact
+    idx.delete(list(range(10, 25)), auto_compact=True, compact_threshold=0.2)
+    assert not os.path.exists(tombstone_path), (
+        "Tombstones should be cleared after auto-compaction"
+    )
+
+    # Metadata should reflect the compaction
+    meta = _load_metadata()
+    assert meta["num_passages"] == NUM_DOCS - 25
+
+    _cleanup()

@@ -5,7 +5,7 @@ use tch::{Device, IndexOp, Kind, Tensor};
 
 use crate::index::compact::{
     build_partial_compacted, compact_index_filtered, merge_compacted_incremental,
-    prune_empty_centroids, recalibrate_threshold,
+    prune_empty_centroids, recalibrate_threshold, remove_and_merge_compacted,
 };
 use crate::index::delete::{clear_tombstones, load_tombstones, save_tombstones};
 use crate::index::encode::{
@@ -112,8 +112,11 @@ pub fn add_to_index(
 /// Update documents in-place: new embeddings, same passage IDs.
 ///
 /// Marks old data as deleted, encodes new data with the original IDs,
-/// then rebuilds compacted structures so old chunk data is excluded but
-/// the new chunk data (carrying the same IDs) is included.
+/// then incrementally merges the new chunks into the compacted structures.
+/// The old chunk data carrying those IDs becomes dead weight until the next
+/// `compact_standalone` call.
+///
+/// Cost: O(new_embeddings) — only the new chunks are processed.
 pub fn update_in_index(
     passage_ids: &[i64],
     embeddings: &mut dyn EmbeddingSource,
@@ -129,7 +132,7 @@ pub fn update_in_index(
 
     let meta = IndexMetadata::load(index_path)?;
 
-    // Mark old passage IDs as deleted so compaction excludes them from old chunks
+    // Mark old passage IDs as deleted so search/compaction excludes them
     crate::index::delete::delete_from_index(passage_ids, index_path)?;
 
     let codec = load_codec_from_disk(index_path, meta.nbits, device)?;
@@ -167,17 +170,32 @@ pub fn update_in_index(
         save_tombstones(&tombstones, index_path)?;
     }
 
-    // Rebuild compacted structures from all chunks, excluding remaining tombstones
+    // Incremental merge: only process the NEW chunks, same as add_to_index.
+    // The old chunks still contain stale data for the updated PIDs, but those
+    // PIDs are tombstoned so they're excluded from the compacted structures.
     let total_chunks = meta.num_chunks + encode_result.chunk_stats.len();
-    let deleted_pids = load_tombstones(index_path)?;
-    let stats = compact_index_filtered(
+    let residual_dim = (meta.dim * meta.nbits as usize) / 8;
+
+    let updated_pids_set: HashSet<i64> = passage_ids.iter().copied().collect();
+    let partial = build_partial_compacted(
         index_path,
+        meta.num_chunks,   // start from the first new chunk
         total_chunks,
         meta.num_centroids,
-        meta.dim,
-        meta.nbits as usize,
+        residual_dim,
+        &HashSet::new(),
+        Some(&updated_pids_set),
+    )?;
+
+    // Remove old entries for updated PIDs from compacted, then merge new ones in.
+    // We do this by rebuilding: remove old PIDs + merge new data.
+    let stats = remove_and_merge_compacted(
+        index_path,
+        &partial,
+        &updated_pids_set,
+        meta.num_centroids,
+        residual_dim,
         device,
-        &deleted_pids,
     )?;
 
     // next_passage_id stays the same: we're replacing, not appending

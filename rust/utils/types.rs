@@ -214,12 +214,15 @@ impl IndexMetadata {
         Ok(meta)
     }
 
-    /// Persist metadata to `metadata.json`.
+    /// Persist metadata to `metadata.json` atomically (write tmp, rename).
     pub fn save(&self, index_path: &std::path::Path) -> anyhow::Result<()> {
         let path = index_path.join("metadata.json");
-        let file = std::fs::File::create(&path)
-            .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", path.display(), e))?;
+        let tmp_path = index_path.join("metadata.json.tmp");
+        let file = std::fs::File::create(&tmp_path)
+            .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", tmp_path.display(), e))?;
         serde_json::to_writer_pretty(std::io::BufWriter::new(file), self)?;
+        std::fs::rename(&tmp_path, &path)
+            .map_err(|e| anyhow::anyhow!("Failed to rename {} -> {}: {}", tmp_path.display(), path.display(), e))?;
         Ok(())
     }
 }

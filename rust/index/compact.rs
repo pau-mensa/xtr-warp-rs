@@ -537,31 +537,189 @@ pub fn merge_compacted_incremental(
     })
 }
 
+/// Remove entries for specific PIDs from the existing compacted structures,
+/// then merge new data in. Used by `update_in_index` to avoid a full recompaction.
+///
+/// Cost: O(existing_compacted + new_embeddings) — reads old compacted once,
+/// filters, appends new data. Much cheaper than re-scanning all chunks.
+pub fn remove_and_merge_compacted(
+    index_path: &Path,
+    partial: &PartialCompacted,
+    pids_to_remove: &HashSet<i64>,
+    num_centroids: usize,
+    residual_dim: usize,
+    device: Device,
+) -> Result<CompactStats> {
+    let old_sizes_tensor = Tensor::read_npy(index_path.join("sizes.compacted.npy"))?
+        .to_device(Device::Cpu)
+        .to_kind(Kind::Int64);
+    let old_sizes: Vec<i64> = old_sizes_tensor.try_into()?;
+
+    let old_codes = Tensor::read_npy(index_path.join("codes.compacted.npy"))?
+        .to_device(device)
+        .to_kind(Kind::Int64);
+    let old_residuals = Tensor::read_npy(index_path.join("residuals.compacted.npy"))?
+        .to_device(device);
+
+    let mut old_offsets = vec![0i64; num_centroids + 1];
+    for i in 0..num_centroids {
+        old_offsets[i + 1] = old_offsets[i] + old_sizes[i];
+    }
+
+    // Per-centroid: filter out removed PIDs, then compute new sizes
+    // We need to know how many survive per centroid to allocate correctly.
+    let old_codes_vec: Vec<i64> = old_codes.to_device(Device::Cpu).try_into()?;
+
+    let mut filtered_sizes = vec![0i64; num_centroids];
+    for c in 0..num_centroids {
+        let start = old_offsets[c] as usize;
+        let end = old_offsets[c + 1] as usize;
+        for &pid in &old_codes_vec[start..end] {
+            if !pids_to_remove.contains(&pid) {
+                filtered_sizes[c] += 1;
+            }
+        }
+    }
+
+    // New sizes = filtered old + new from partial
+    let new_sizes: Vec<i64> = filtered_sizes
+        .iter()
+        .zip(&partial.centroid_counts)
+        .map(|(&f, &n)| f + n)
+        .collect();
+
+    let mut new_offsets = vec![0i64; num_centroids + 1];
+    for i in 0..num_centroids {
+        new_offsets[i + 1] = new_offsets[i] + new_sizes[i];
+    }
+    let new_total = new_offsets[num_centroids];
+
+    let new_codes = Tensor::zeros(&[new_total], (Kind::Int64, device));
+    let new_residuals = Tensor::zeros(&[new_total, residual_dim as i64], (Kind::Uint8, device));
+
+    // Walk centroids: copy filtered old data, then append new
+    for c in 0..num_centroids {
+        let old_start = old_offsets[c];
+        let old_count = old_sizes[c];
+        let dst_start = new_offsets[c];
+
+        if old_count > 0 {
+            // Build keep mask for this centroid
+            let segment_codes: Vec<i64> = old_codes
+                .narrow(0, old_start, old_count)
+                .to_device(Device::Cpu)
+                .try_into()?;
+            let keep_indices: Vec<i64> = (0..old_count)
+                .filter(|&i| !pids_to_remove.contains(&segment_codes[i as usize]))
+                .collect();
+
+            if !keep_indices.is_empty() {
+                let keep_tensor = Tensor::from_slice(&keep_indices).to_device(device);
+                let kept_codes = old_codes
+                    .narrow(0, old_start, old_count)
+                    .index_select(0, &keep_tensor);
+                let kept_residuals = old_residuals
+                    .narrow(0, old_start, old_count)
+                    .index_select(0, &keep_tensor);
+                let kept_count = keep_indices.len() as i64;
+
+                new_codes
+                    .narrow(0, dst_start, kept_count)
+                    .copy_(&kept_codes);
+                new_residuals
+                    .narrow(0, dst_start, kept_count)
+                    .copy_(&kept_residuals);
+            }
+        }
+
+        // Append new data from partial
+        let new_count = partial.centroid_counts[c];
+        if new_count > 0 {
+            let append_start = dst_start + filtered_sizes[c];
+
+            let pids_tensor =
+                Tensor::from_slice(&partial.centroid_pids[c]).to_device(device);
+            new_codes
+                .narrow(0, append_start, new_count)
+                .copy_(&pids_tensor);
+
+            let res_tensor = Tensor::from_slice(&partial.centroid_residuals[c])
+                .to_device(device)
+                .reshape([new_count, residual_dim as i64]);
+            new_residuals
+                .narrow(0, append_start, new_count)
+                .copy_(&res_tensor);
+        }
+    }
+
+    // Write compacted files
+    Tensor::from_slice(&new_sizes).write_npy(index_path.join("sizes.compacted.npy"))?;
+    new_codes
+        .to_device(Device::Cpu)
+        .write_npy(index_path.join("codes.compacted.npy"))?;
+    new_residuals
+        .to_device(Device::Cpu)
+        .write_npy(index_path.join("residuals.compacted.npy"))?;
+    Tensor::from_slice(&new_offsets)
+        .to_device(device)
+        .to_device(Device::Cpu)
+        .write_npy(index_path.join("offsets.compacted.npy"))?;
+
+    build_ivf_from_compacted(&new_codes.to_device(device), &new_sizes, index_path, device)?;
+
+    let ivf_pids: Vec<i64> = Tensor::read_npy(index_path.join("ivf.npy"))?
+        .to_device(Device::Cpu)
+        .to_kind(Kind::Int64)
+        .try_into()?;
+    let active_set: HashSet<i64> = ivf_pids.into_iter().collect();
+
+    Ok(CompactStats {
+        total_embeddings: new_total,
+        num_active_passages: active_set.len(),
+    })
+}
+
 /// Remove centroids with zero embeddings from the codebook and chunk files.
 ///
+/// Determines which centroids are actually used by scanning chunk codes
+/// directly (not relying on compacted sizes, which may be stale).
 /// Returns the new centroid count, or `None` if no centroids were pruned.
 pub fn prune_empty_centroids(
     index_path: &Path,
     num_chunks: usize,
     device: Device,
 ) -> Result<Option<usize>> {
-    let sizes = Tensor::read_npy(index_path.join("sizes.compacted.npy"))?
-        .to_device(Device::Cpu)
-        .to_kind(Kind::Int64);
-    let sizes_vec: Vec<i64> = sizes.try_into()?;
+    let centroids = Tensor::read_npy(index_path.join("centroids.npy"))?
+        .to_device(Device::Cpu);
+    let old_count = centroids.size()[0] as usize;
 
-    let empty_count = sizes_vec.iter().filter(|&&c| c == 0).count();
+    // Scan chunk codes to find which centroids are actually used
+    let mut used = vec![false; old_count];
+    for chunk_idx in 0..num_chunks {
+        let codes_path = index_path.join(format!("{}.codes.npy", chunk_idx));
+        if !codes_path.exists() {
+            continue;
+        }
+        let codes: Vec<i64> = Tensor::read_npy(&codes_path)?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64)
+            .try_into()?;
+        for &c in &codes {
+            used[c as usize] = true;
+        }
+    }
+
+    let empty_count = used.iter().filter(|&&u| !u).count();
     if empty_count == 0 {
         return Ok(None);
     }
 
     // Build old->new renumbering map
-    let old_count = sizes_vec.len();
     let mut old_to_new = vec![-1i64; old_count];
     let mut keep_indices: Vec<i64> = Vec::new();
     let mut new_id = 0i64;
-    for (old_id, &count) in sizes_vec.iter().enumerate() {
-        if count > 0 {
+    for (old_id, &is_used) in used.iter().enumerate() {
+        if is_used {
             old_to_new[old_id] = new_id;
             keep_indices.push(old_id as i64);
             new_id += 1;
@@ -570,8 +728,6 @@ pub fn prune_empty_centroids(
     let new_num_centroids = new_id as usize;
 
     // Rewrite centroids.npy
-    let centroids = Tensor::read_npy(index_path.join("centroids.npy"))?
-        .to_device(Device::Cpu);
     let keep_tensor = Tensor::from_slice(&keep_indices);
     let new_centroids = centroids.index_select(0, &keep_tensor);
     new_centroids.write_npy(index_path.join("centroids.npy"))?;
@@ -595,12 +751,12 @@ pub fn prune_empty_centroids(
     Ok(Some(new_num_centroids))
 }
 
-/// Recompute the cluster threshold (75th percentile of residual norms)
-/// from the current index data.
+/// Recompute codec statistics from current index data.
 ///
 /// Samples up to 50 000 embeddings, decompresses their quantized residuals
-/// via bucket weights, computes L2 norms, and saves the 75th percentile
-/// to `cluster_threshold.npy`.
+/// via bucket weights, and recomputes:
+/// - `cluster_threshold.npy`: 75th percentile of residual L2 norms
+/// - `avg_residual.npy`: per-dimension mean absolute residual
 pub fn recalibrate_threshold(
     index_path: &Path,
     num_chunks: usize,
@@ -617,10 +773,11 @@ pub fn recalibrate_threshold(
         .to_kind(Kind::Float);
 
     let max_sample = 50_000i64;
-    let mut all_norms: Vec<f32> = Vec::new();
+    let mut all_approx: Vec<Tensor> = Vec::new();
+    let mut total_sampled = 0i64;
 
     for chunk_idx in 0..num_chunks {
-        if all_norms.len() as i64 >= max_sample {
+        if total_sampled >= max_sample {
             break;
         }
 
@@ -630,31 +787,39 @@ pub fn recalibrate_threshold(
         }
         let packed = Tensor::read_npy(&res_path)?.to_device(device);
         let n = packed.size()[0];
-        let take = (max_sample - all_norms.len() as i64).min(n);
+        let take = (max_sample - total_sampled).min(n);
         let sample = packed.narrow(0, 0, take);
 
         let bucket_indices = unpack_residuals(&sample, nbits, dim as i64);
         let approx = bucket_weights
             .index_select(0, &bucket_indices.flatten(0, -1).to_kind(Kind::Int64))
             .reshape([take, dim as i64]);
-        let norms = approx
-            .norm_scalaropt_dim(2, &[1], false)
-            .to_device(Device::Cpu);
-        let norms_vec: Vec<f32> = norms.try_into()?;
-        all_norms.extend(norms_vec);
+        all_approx.push(approx.to_device(Device::Cpu));
+        total_sampled += take;
     }
 
-    if all_norms.is_empty() {
+    if all_approx.is_empty() {
         return Ok(());
     }
 
-    let norms_tensor = Tensor::from_slice(&all_norms);
-    let n = norms_tensor.size()[0];
+    let all_residuals = Tensor::cat(&all_approx, 0); // [total_sampled, dim]
+
+    // Cluster threshold: 75th percentile of L2 norms
+    let norms = all_residuals.norm_scalaropt_dim(2, &[1], false);
+    let n = norms.size()[0];
     let k = ((0.75 * n as f64).ceil() as i64).max(1).min(n);
-    let (threshold, _) = norms_tensor.kthvalue(k, 0, false);
+    let (threshold, _) = norms.kthvalue(k, 0, false);
     threshold
         .to_device(Device::Cpu)
         .write_npy(index_path.join("cluster_threshold.npy"))?;
+
+    // Average residual: per-dimension mean absolute value
+    let avg_residual = all_residuals
+        .abs()
+        .mean_dim(Some(&[0i64][..]), false, Kind::Float);
+    avg_residual
+        .to_device(Device::Cpu)
+        .write_npy(index_path.join("avg_residual.npy"))?;
 
     Ok(())
 }
