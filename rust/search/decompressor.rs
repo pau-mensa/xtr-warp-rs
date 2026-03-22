@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use rayon::{prelude::*, ThreadPool};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
@@ -73,6 +74,7 @@ impl CentroidDecompressor {
         index: &Arc<ReadOnlyIndex>,
         query_embeddings: &Tensor, // [num_tokens, dim]
         nprobe: usize,
+        deleted_pids: &HashSet<i64>,
     ) -> Result<DecompressedCentroidsOutput> {
         let centroid_ids = centroid_ids.to_kind(Kind::Int64);
         let num_cells = centroid_ids.size()[0] as usize;
@@ -129,6 +131,7 @@ impl CentroidDecompressor {
                 index,
                 &query_embeddings,
                 nprobe,
+                deleted_pids,
             );
         }
 
@@ -182,6 +185,7 @@ impl CentroidDecompressor {
                             index,
                             residual_bytes_per_embedding,
                             bucket_dim_shift,
+                            deleted_pids,
                         )
                     })
                     .collect()
@@ -216,6 +220,7 @@ impl CentroidDecompressor {
                     index,
                     residual_bytes_per_embedding,
                     bucket_dim_shift,
+                    deleted_pids,
                 );
 
                 candidate_sizes[cell_idx] = size;
@@ -256,6 +261,7 @@ impl CentroidDecompressor {
         index: &Arc<ReadOnlyIndex>,
         query_embeddings: &Tensor, // [num_tokens, dim]
         nprobe: usize,
+        deleted_pids: &HashSet<i64>,
     ) -> Result<DecompressedCentroidsOutput> {
         let device = query_embeddings.device();
         anyhow::ensure!(
@@ -392,6 +398,27 @@ impl CentroidDecompressor {
         let centroid_per_candidate = centroid_scores_f.index_select(0, &candidate_cells);
         let scores = centroid_per_candidate + residual_scores;
 
+        // Filter tombstoned passage IDs by setting their scores to -inf
+        let (passage_ids, scores) = if !deleted_pids.is_empty() {
+            let pids_cpu: Vec<i64> = passage_ids.to_device(Device::Cpu).try_into()?;
+            let keep_flags: Vec<i8> = pids_cpu
+                .iter()
+                .map(|pid| if deleted_pids.contains(pid) { 0i8 } else { 1i8 })
+                .collect();
+            let keep_mask = Tensor::from_slice(&keep_flags)
+                .to_device(device)
+                .to_kind(Kind::Bool);
+            let neg_inf =
+                Tensor::full_like(&scores, f64::NEG_INFINITY).to_kind(Kind::Float);
+            let neg_one = Tensor::full_like(&passage_ids, -1i64);
+            (
+                passage_ids.where_self(&keep_mask, &neg_one),
+                scores.where_self(&keep_mask, &neg_inf),
+            )
+        } else {
+            (passage_ids, scores)
+        };
+
         Ok(DecompressedCentroidsOutput {
             capacities: capacities.shallow_clone(),
             sizes,
@@ -415,6 +442,7 @@ impl CentroidDecompressor {
         index: &Arc<ReadOnlyIndex>,
         residual_bytes_per_embedding: usize,
         bucket_dim_shift: usize,
+        deleted_pids: &HashSet<i64>,
     ) -> (Vec<i64>, Vec<f32>, i32) {
         let capacity = capacities_vec[cell_idx] as usize;
         if capacity == 0 {
@@ -444,10 +472,13 @@ impl CentroidDecompressor {
         let token_bucket_scores =
             &bucket_scores_flat[bucket_scores_offset..bucket_scores_offset + bucket_score_stride];
 
-        // Score all embeddings in this cell
+        // Score all embeddings in this cell, skipping tombstoned PIDs
         let mut scored: Vec<(i64, f32)> = Vec::with_capacity(capacity);
         for i in 0..capacity {
             let pid = local_pids_raw[i];
+            if deleted_pids.contains(&pid) {
+                continue;
+            }
             let residual_start = i * residual_bytes_per_embedding;
             let residual_end = residual_start + residual_bytes_per_embedding;
             let residual_bytes = &local_residuals_raw[residual_start..residual_end];

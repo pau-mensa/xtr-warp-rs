@@ -34,7 +34,18 @@ pub fn encode_chunks(
     index_path: &Path,
     device: Device,
     embedding_dim: u32,
+    passage_ids: Option<&[i64]>,
+    start_chunk_idx: usize,
 ) -> Result<EncodeResult> {
+    if let Some(pids) = passage_ids {
+        anyhow::ensure!(
+            pids.len() == source.num_docs(),
+            "passage_ids length ({}) must match source num_docs ({})",
+            pids.len(),
+            source.num_docs()
+        );
+    }
+
     let num_centroids = centroids.size()[0] as usize;
     let mut chunk_stats = Vec::with_capacity(plan.num_chunks);
     let mut current_emb_offset: usize = 0;
@@ -43,7 +54,8 @@ pub fn encode_chunks(
     let mut passage_offset: usize = 0;
 
     let chunk_iter = source.chunk_iter(CHUNK_SIZE)?;
-    for (chk_idx, chunk) in chunk_iter.enumerate() {
+    for (local_chk_idx, chunk) in chunk_iter.enumerate() {
+        let chk_idx = start_chunk_idx + local_chk_idx;
         let chunk = chunk?;
         let chk_doclens = chunk.doclens;
         let chk_embs_vec = chunk.embeddings;
@@ -112,6 +124,15 @@ pub fn encode_chunks(
         let dl_file = File::create(chk_doclens_path)?;
         let buf_writer = BufWriter::new(dl_file);
         serde_json::to_writer(buf_writer, &chk_doclens)?;
+
+        // Write explicit passage IDs for this chunk
+        let chunk_pids: Vec<i64> = if let Some(pids) = passage_ids {
+            pids[passage_offset..passage_offset + chk_doclens.len()].to_vec()
+        } else {
+            (passage_offset as i64..(passage_offset + chk_doclens.len()) as i64).collect()
+        };
+        let chunk_pids_fpath = index_path.join(format!("{}.passage_ids.npy", chk_idx));
+        Tensor::from_slice(&chunk_pids).write_npy(&chunk_pids_fpath)?;
 
         let chk_meta = json!({
             "passage_offset": passage_offset,

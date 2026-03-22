@@ -1,8 +1,11 @@
 use anyhow::{bail, Result};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use tch::{Device, IndexOp, Kind, Tensor};
+
+use crate::utils::types::CompactStats;
 
 fn build_ivf_from_compacted(
     codes_compacted: &Tensor,
@@ -274,4 +277,179 @@ pub fn compact_index(
         .write_npy(&offsets_path)?;
 
     Ok(())
+}
+
+/// Recompact all chunks, excluding tombstoned passage IDs.
+///
+/// Two-pass counting sort: first counts per-centroid embeddings (excluding deleted),
+/// then places surviving embeddings into the compacted layout.
+pub fn compact_index_filtered(
+    index_path: &Path,
+    num_chunks: usize,
+    num_centroids: usize,
+    embedding_dim: usize,
+    nbits: usize,
+    device: Device,
+    deleted_pids: &HashSet<i64>,
+) -> Result<CompactStats> {
+    // ── Pass 1: count embeddings per centroid, excluding deleted ──
+    let mut centroid_counts = vec![0i64; num_centroids];
+    let mut total_filtered = 0i64;
+    let mut active_pids_set: HashSet<i64> = HashSet::new();
+    let mut passage_offset: i64 = 0;
+
+    for chunk_idx in 0..num_chunks {
+        let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64);
+        let doclens = Tensor::read_npy(index_path.join(format!("doclens.{}.npy", chunk_idx)))?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64);
+        let doclens_vec: Vec<i64> = doclens.try_into()?;
+        let num_passages = doclens_vec.len() as i64;
+
+        let pids_path = index_path.join(format!("{}.passage_ids.npy", chunk_idx));
+        let pids_base: Vec<i64> = if pids_path.exists() {
+            let t = Tensor::read_npy(&pids_path)?
+                .to_device(Device::Cpu)
+                .to_kind(Kind::Int64);
+            t.try_into()?
+        } else {
+            (passage_offset..passage_offset + num_passages).collect()
+        };
+
+        let codes_vec: Vec<i64> = codes.try_into()?;
+        let mut emb_offset = 0usize;
+        for (doc_idx, &doc_len) in doclens_vec.iter().enumerate() {
+            let pid = pids_base[doc_idx];
+            if deleted_pids.contains(&pid) {
+                emb_offset += doc_len as usize;
+                continue;
+            }
+            active_pids_set.insert(pid);
+            for _ in 0..doc_len as usize {
+                let centroid_id = codes_vec[emb_offset] as usize;
+                centroid_counts[centroid_id] += 1;
+                total_filtered += 1;
+                emb_offset += 1;
+            }
+        }
+        passage_offset += num_passages;
+    }
+
+    // Build offsets
+    let mut offsets_vec = vec![0i64; num_centroids + 1];
+    for i in 0..num_centroids {
+        offsets_vec[i + 1] = offsets_vec[i] + centroid_counts[i];
+    }
+
+    // Write sizes
+    let sizes_tensor = Tensor::from_slice(&centroid_counts);
+    sizes_tensor.write_npy(index_path.join("sizes.compacted.npy"))?;
+
+    // ── Pass 2: place non-deleted embeddings into compacted arrays ──
+    let residual_dim = (embedding_dim * nbits) / 8;
+    let compacted_residuals =
+        Tensor::zeros(&[total_filtered, residual_dim as i64], (Kind::Uint8, device));
+    let compacted_codes = Tensor::zeros(&[total_filtered], (Kind::Int64, device));
+
+    let mut write_offsets = offsets_vec[..num_centroids].to_vec();
+    let mut passage_offset: i64 = 0;
+
+    for chunk_idx in 0..num_chunks {
+        let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?
+            .to_device(device);
+        let residuals =
+            Tensor::read_npy(index_path.join(format!("{}.residuals.npy", chunk_idx)))?
+                .to_device(device);
+        let doclens = Tensor::read_npy(index_path.join(format!("doclens.{}.npy", chunk_idx)))?
+            .to_device(device)
+            .to_kind(Kind::Int64);
+
+        let pids_path = index_path.join(format!("{}.passage_ids.npy", chunk_idx));
+        let num_passages = doclens.size()[0];
+        let pids_base = if pids_path.exists() {
+            Tensor::read_npy(&pids_path)?
+                .to_device(device)
+                .to_kind(Kind::Int64)
+        } else {
+            Tensor::arange_start(
+                passage_offset,
+                passage_offset + num_passages,
+                (Kind::Int64, device),
+            )
+        };
+
+        let chunk_total = codes.size()[0];
+        let pids = Tensor::repeat_interleave_self_tensor(
+            &pids_base,
+            &doclens,
+            0,
+            Some(chunk_total),
+        );
+
+        // Build keep indices (non-deleted)
+        let pids_vec: Vec<i64> = pids.to_device(Device::Cpu).try_into()?;
+        let keep_indices: Vec<i64> = (0..chunk_total)
+            .filter(|&i| !deleted_pids.contains(&pids_vec[i as usize]))
+            .collect();
+
+        if keep_indices.is_empty() {
+            passage_offset += num_passages;
+            continue;
+        }
+
+        let keep_tensor = Tensor::from_slice(&keep_indices).to_device(device);
+        let filtered_codes = codes.index_select(0, &keep_tensor);
+        let filtered_residuals = residuals.index_select(0, &keep_tensor);
+        let filtered_pids = pids.index_select(0, &keep_tensor);
+
+        // Sort by centroid for counting-sort placement
+        let sort_result = filtered_codes.sort(0, false);
+        let sorted_codes = sort_result.0;
+        let sorted_idx = sort_result.1;
+        let sorted_residuals = filtered_residuals.index_select(0, &sorted_idx);
+        let sorted_pids = filtered_pids.index_select(0, &sorted_idx);
+
+        let chunk_counts = sorted_codes.bincount::<Tensor>(None, num_centroids as i64);
+        let chunk_counts_vec: Vec<i64> = chunk_counts.to_device(Device::Cpu).try_into()?;
+
+        let mut local_offset: i64 = 0;
+        for (centroid_id, &count) in chunk_counts_vec.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let write_pos = write_offsets[centroid_id];
+            compacted_residuals
+                .narrow(0, write_pos, count)
+                .copy_(&sorted_residuals.narrow(0, local_offset, count));
+            compacted_codes
+                .narrow(0, write_pos, count)
+                .copy_(&sorted_pids.narrow(0, local_offset, count));
+            write_offsets[centroid_id] += count;
+            local_offset += count;
+        }
+
+        passage_offset += num_passages;
+    }
+
+    // Write compacted data
+    compacted_residuals
+        .to_device(Device::Cpu)
+        .write_npy(index_path.join("residuals.compacted.npy"))?;
+    compacted_codes
+        .to_device(Device::Cpu)
+        .write_npy(index_path.join("codes.compacted.npy"))?;
+
+    let offsets_tensor = Tensor::from_slice(&offsets_vec).to_device(device);
+    offsets_tensor
+        .to_device(Device::Cpu)
+        .write_npy(index_path.join("offsets.compacted.npy"))?;
+
+    build_ivf_from_compacted(&compacted_codes, &centroid_counts, index_path, device)?;
+
+    Ok(CompactStats {
+        total_embeddings: total_filtered,
+        num_active_passages: active_pids_set.len(),
+    })
 }

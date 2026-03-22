@@ -349,6 +349,17 @@ impl TPrimePolicy {
     }
 }
 
+/// Stats from index compaction
+pub struct CompactStats {
+    pub total_embeddings: i64,
+    pub num_active_passages: usize,
+}
+
+/// Result from adding documents to an index
+pub struct AddResult {
+    pub new_passage_ids: Vec<i64>,
+}
+
 /// Parses a string identifier into a `tch::Device`.
 ///
 /// Supports simple device strings like "cpu", "cuda", and indexed CUDA devices

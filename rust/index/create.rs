@@ -60,6 +60,8 @@ pub fn create_index(
         &config.index_path,
         config.device,
         config.embedding_dim,
+        None, // auto-assign passage IDs 0..N
+        0,    // start chunk index
     )?;
 
     finalize_ivf_and_compact(config, &index_plan, &encode_result, &centroids)?;
@@ -222,6 +224,7 @@ fn finalize_ivf_and_compact(
         "num_embeddings": encode_result.total_embeddings,
         "avg_doclen": final_avg_doclen,
         "num_passages": plan.n_docs,
+        "next_passage_id": plan.n_docs,
         "num_centroids": centroids.size()[0] as usize,
         "dim": config.embedding_dim,
         "created_at": Utc::now().to_rfc3339(),

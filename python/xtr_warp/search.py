@@ -305,6 +305,7 @@ class XTRWarp:
         self._torch_initialized = {}
         self._metadata: dict | None = None
         self.device: str | None = None
+        self._mmap: bool = True
 
     def _ensure_torch_initialized(self, device: str) -> str:
         """Initialize torch once per device type."""
@@ -321,6 +322,14 @@ class XTRWarp:
             for searcher in self._loaded_searchers:
                 searcher.free()
             self._loaded_searchers = None
+
+    def _reload_if_loaded(self) -> None:
+        """Free and re-load the index using the same parameters as the last ``load()`` call."""
+        if self._loaded_searchers is None or self.devices is None:
+            return
+        self.free()
+        self._metadata = None
+        self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
 
     def __del__(self):
         """Destructor."""
@@ -439,6 +448,145 @@ class XTRWarp:
             except OSError as e:
                 raise e
 
+    def delete(self, passage_ids: list[int]) -> "XTRWarp":
+        """Delete passages by ID. O(1) tombstone operation.
+
+        Search automatically filters deleted passages. To physically
+        remove deleted data, call ``compact()`` afterward.
+
+        Args:
+        ----
+        passage_ids:
+            List of passage IDs to mark as deleted.
+
+        """
+        xtr_warp_rs.delete(self.index, passage_ids)
+        if self._loaded_searchers:
+            for s in self._loaded_searchers:
+                s.update_tombstones(passage_ids)
+        return self
+
+    def add(
+        self,
+        embeddings_source: list[torch.Tensor] | torch.Tensor | str | Path,
+        device: str,
+        reload: bool = True,
+    ) -> list[int]:
+        """Add new passages. Encodes new documents and recompacts the index.
+
+        Args:
+        ----
+        embeddings_source:
+            New document embeddings (same formats as ``create``).
+        device:
+            Compute device (e.g. "cpu", "cuda:0").
+        reload:
+            If True (default) and the index was loaded, automatically
+            free and re-load so searches reflect the new data.
+            Set to False when batching several mutations before a
+            manual ``load()`` call.
+
+        Returns:
+        -------
+        List of newly assigned passage IDs.
+
+        """
+        torch_path = self._ensure_torch_initialized(device)
+        embeddings = self._prepare_embeddings(embeddings_source)
+        new_ids = xtr_warp_rs.add(
+            index=self.index,
+            torch_path=torch_path,
+            device=device,
+            embeddings=embeddings,
+        )
+        if reload:
+            self._reload_if_loaded()
+        else:
+            if self._loaded_searchers:
+                self.free()
+            self._metadata = None
+        return new_ids
+
+    def update(
+        self,
+        passage_ids: list[int],
+        embeddings_source: list[torch.Tensor] | torch.Tensor | str | Path,
+        device: str,
+        reload: bool = True,
+    ) -> "XTRWarp":
+        """Update passages in-place: new embeddings, same IDs.
+
+        Args:
+        ----
+        passage_ids:
+            IDs of passages to update.
+        embeddings_source:
+            Replacement embeddings (one per passage ID).
+        device:
+            Compute device.
+        reload:
+            If True (default), automatically re-load after mutation.
+
+        """
+        torch_path = self._ensure_torch_initialized(device)
+        embeddings = self._prepare_embeddings(embeddings_source)
+        xtr_warp_rs.update(
+            index=self.index,
+            torch_path=torch_path,
+            device=device,
+            passage_ids=passage_ids,
+            embeddings=embeddings,
+        )
+        if reload:
+            self._reload_if_loaded()
+        else:
+            if self._loaded_searchers:
+                self.free()
+            self._metadata = None
+        return self
+
+    def compact(self, device: str, reload: bool = True) -> "XTRWarp":
+        """Rebuild index excluding deleted passages.
+
+        Use after ``delete()`` to physically reclaim space.
+
+        Args:
+        ----
+        device:
+            Compute device.
+        reload:
+            If True (default), automatically re-load after mutation.
+
+        """
+        torch_path = self._ensure_torch_initialized(device)
+        xtr_warp_rs.compact(
+            index=self.index,
+            torch_path=torch_path,
+            device=device,
+        )
+        if reload:
+            self._reload_if_loaded()
+        else:
+            if self._loaded_searchers:
+                self.free()
+            self._metadata = None
+        return self
+
+    def _prepare_embeddings(
+        self,
+        embeddings_source: list[torch.Tensor] | torch.Tensor | str | Path,
+    ) -> list[torch.Tensor] | str:
+        """Normalise embeddings_source into the format expected by Rust."""
+        if isinstance(embeddings_source, torch.Tensor):
+            return [
+                embeddings_source[i] for i in range(embeddings_source.shape[0])
+            ]
+        if isinstance(embeddings_source, list):
+            return [
+                e.squeeze(0) if e.dim() == 3 else e for e in embeddings_source
+            ]
+        return str(embeddings_source)
+
     def _load_metadata(self) -> dict | None:
         """Load index metadata from disk if available."""
         if self._metadata is not None:
@@ -512,6 +660,7 @@ class XTRWarp:
             )
             mmap = False
 
+        self._mmap = mmap
         self._loaded_searchers = []
         for d in self.devices:
             _ = self._ensure_torch_initialized(d)

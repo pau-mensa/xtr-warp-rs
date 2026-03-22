@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3_tch::PyTensor;
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::ops::Deref;
 use std::path::Path;
@@ -121,6 +122,7 @@ struct LoadedSearcher {
     device: Device,
     dtype: Kind,
     use_mmap: bool,
+    deleted_pids: HashSet<i64>,
 }
 
 #[pymethods]
@@ -137,6 +139,7 @@ impl LoadedSearcher {
             device,
             dtype,
             use_mmap,
+            deleted_pids: HashSet::new(),
         })
     }
 
@@ -152,6 +155,13 @@ impl LoadedSearcher {
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to load index: {}", e)))?,
         );
         self.loaded_index = Some(loaded_index);
+
+        // Load tombstones if present
+        self.deleted_pids =
+            crate::index::delete::load_tombstones(Path::new(&self.index_path))
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to load tombstones: {}", e))
+                })?;
         Ok(())
     }
 
@@ -175,8 +185,13 @@ impl LoadedSearcher {
             )));
         }
 
-        let searcher = Searcher::new(self.loaded_index.as_ref().unwrap(), &search_config)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create searcher: {}", e)))?;
+        let deleted_pids = Arc::new(self.deleted_pids.clone());
+        let searcher = Searcher::new(
+            self.loaded_index.as_ref().unwrap(),
+            &search_config,
+            deleted_pids,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create searcher: {}", e)))?;
 
         // process batch
         let results = searcher
@@ -188,9 +203,17 @@ impl LoadedSearcher {
         Ok(results)
     }
 
+    /// Update in-memory tombstones without full reload after delete().
+    fn update_tombstones(&mut self, passage_ids: Vec<i64>) {
+        for pid in passage_ids {
+            self.deleted_pids.insert(pid);
+        }
+    }
+
     /// Free the loaded index
     fn free(&mut self) {
         self.loaded_index = None;
+        self.deleted_pids.clear();
     }
 }
 
@@ -303,6 +326,83 @@ fn create(
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)))
 }
 
+/// Delete passages by ID. O(1) tombstone operation — no index rewrite.
+/// Search automatically filters deleted passages.
+#[pyfunction]
+fn delete(_py: Python<'_>, index: String, passage_ids: Vec<i64>) -> PyResult<()> {
+    crate::index::delete::delete_from_index(&passage_ids, Path::new(&index))
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete: {}", e)))
+}
+
+/// Add new passages to an existing index. Encodes + recompacts.
+/// Returns the new passage IDs assigned.
+/// Reads embedding_dim from the existing index metadata.
+#[pyfunction]
+#[pyo3(signature = (index, torch_path, device, embeddings))]
+fn add(
+    _py: Python<'_>,
+    index: String,
+    torch_path: String,
+    device: String,
+    embeddings: EmbeddingsInput,
+) -> PyResult<Vec<i64>> {
+    call_torch(torch_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
+    let device = get_device(&device)?;
+    let mut source = embeddings
+        .into_source()
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to read embeddings: {}", e)))?;
+    let result = crate::index::update::add_to_index(
+        source.as_mut(),
+        Path::new(&index),
+        device,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to add to index: {}", e)))?;
+    Ok(result.new_passage_ids)
+}
+
+/// Update passages in-place: new embeddings, same IDs.
+/// Reads embedding_dim from the existing index metadata.
+#[pyfunction]
+#[pyo3(signature = (index, torch_path, device, passage_ids, embeddings))]
+fn update(
+    _py: Python<'_>,
+    index: String,
+    torch_path: String,
+    device: String,
+    passage_ids: Vec<i64>,
+    embeddings: EmbeddingsInput,
+) -> PyResult<()> {
+    call_torch(torch_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
+    let device = get_device(&device)?;
+    let mut source = embeddings
+        .into_source()
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to read embeddings: {}", e)))?;
+    crate::index::update::update_in_index(
+        &passage_ids,
+        source.as_mut(),
+        Path::new(&index),
+        device,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to update index: {}", e)))
+}
+
+/// Rebuild index excluding deleted passages (compact without adding new data).
+#[pyfunction]
+fn compact(
+    _py: Python<'_>,
+    index: String,
+    torch_path: String,
+    device: String,
+) -> PyResult<()> {
+    call_torch(torch_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
+    let device = get_device(&device)?;
+    crate::index::update::compact_standalone(Path::new(&index), device)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to compact index: {}", e)))
+}
+
 /// A high-performance document retrieval toolkit using a ColBERT-style late
 /// interaction model, implemented in Rust with Python bindings.
 ///
@@ -318,5 +418,9 @@ fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(initialize_torch, m)?)?;
     m.add_function(wrap_pyfunction!(create, m)?)?;
+    m.add_function(wrap_pyfunction!(delete, m)?)?;
+    m.add_function(wrap_pyfunction!(add, m)?)?;
+    m.add_function(wrap_pyfunction!(update, m)?)?;
+    m.add_function(wrap_pyfunction!(compact, m)?)?;
     Ok(())
 }
