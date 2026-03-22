@@ -1,8 +1,6 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
 use memmap2::Mmap;
 use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
@@ -212,25 +210,7 @@ impl IndexLoader {
         let kdummy_centroid = self.find_kdummy_centroid(&sizes_compacted)?;
 
         // Get metadata
-        let dim = centroids
-            .size()
-            .get(1)
-            .copied()
-            .ok_or_else(|| anyhow!("Centroids tensor must be 2D"))? as usize;
-        let metadata_fallback = IndexMetadata {
-            num_chunks: 0,
-            nbits: 2,
-            num_partitions: 0,
-            num_embeddings: num_embeddings as i64,
-            avg_doclen: 0.0,
-            num_passages: 0,
-            next_passage_id: None,
-            num_centroids: num_centroids as usize,
-            dim,
-            created_at: Utc::now().to_rfc3339(),
-        };
-
-        let metadata = self.load_metadata(index_path, metadata_fallback)?;
+        let metadata = IndexMetadata::load(index_path)?;
 
         Ok(LoadedIndex {
             centroids,
@@ -300,35 +280,4 @@ impl IndexLoader {
         Ok(kdummy_idx as CentroidId)
     }
 
-    fn load_metadata(&self, index_path: &Path, fallback: IndexMetadata) -> Result<IndexMetadata> {
-        let metadata_path = index_path.join("metadata.json");
-        if !metadata_path.exists() {
-            return Ok(fallback);
-        }
-
-        let file = File::open(&metadata_path)
-            .with_context(|| format!("Failed to open {:?}", metadata_path))?;
-        let reader = BufReader::new(file);
-        let mut meta: IndexMetadata = serde_json::from_reader(reader)
-            .with_context(|| format!("Failed to parse {:?}", metadata_path))?;
-
-        // Fill in zero-defaults from the fallback (derived from tensor shapes)
-        if meta.num_embeddings == 0 {
-            meta.num_embeddings = fallback.num_embeddings;
-        }
-        if meta.num_centroids == 0 {
-            meta.num_centroids = fallback.num_centroids;
-        }
-        if meta.dim == 0 {
-            meta.dim = fallback.dim;
-        }
-        if meta.nbits == 0 {
-            meta.nbits = fallback.nbits;
-        }
-        if meta.created_at.is_empty() {
-            meta.created_at = fallback.created_at;
-        }
-
-        Ok(meta)
-    }
 }

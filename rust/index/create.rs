@@ -223,7 +223,7 @@ fn finalize_ivf_and_compact(
         num_embeddings: encode_result.total_embeddings,
         avg_doclen: final_avg_doclen,
         num_passages: plan.n_docs,
-        next_passage_id: Some(plan.n_docs as i64),
+        next_passage_id: plan.n_docs as i64,
         num_centroids: centroids.size()[0] as usize,
         dim: config.embedding_dim as usize,
         created_at: Utc::now().to_rfc3339(),

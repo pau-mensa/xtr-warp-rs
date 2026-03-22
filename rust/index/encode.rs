@@ -5,6 +5,31 @@ use std::io::BufWriter;
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
+/// Data from a single chunk, used for coalescing during add.
+pub struct ChunkData {
+    pub codes: Tensor,
+    pub residuals: Tensor,
+    pub doclens: Vec<i64>,
+    pub pids: Vec<i64>,
+}
+
+/// Read the lightweight chunk files (codes, residuals, doclens, passage IDs).
+pub fn read_chunk_data(index_path: &Path, chunk_idx: usize) -> Result<ChunkData> {
+    let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?
+        .to_device(tch::Device::Cpu);
+    let residuals = Tensor::read_npy(index_path.join(format!("{}.residuals.npy", chunk_idx)))?
+        .to_device(tch::Device::Cpu);
+    let doclens: Vec<i64> = Tensor::read_npy(index_path.join(format!("doclens.{}.npy", chunk_idx)))?
+        .to_device(tch::Device::Cpu)
+        .to_kind(Kind::Int64)
+        .try_into()?;
+    let pids: Vec<i64> = Tensor::read_npy(index_path.join(format!("{}.passage_ids.npy", chunk_idx)))?
+        .to_device(tch::Device::Cpu)
+        .to_kind(Kind::Int64)
+        .try_into()?;
+    Ok(ChunkData { codes, residuals, doclens, pids })
+}
+
 use crate::index::source::EmbeddingSource;
 use crate::utils::residual_codec::ResidualCodec;
 use crate::utils::types::IndexPlan;
@@ -161,11 +186,6 @@ fn encode_chunks_inner(
 
         let chk_doclens_fpath = index_path.join(format!("doclens.{}.npy", chk_idx));
         Tensor::from_slice(&chk_doclens).write_npy(chk_doclens_fpath)?;
-
-        let chk_doclens_path = index_path.join(format!("doclens.{}.json", chk_idx));
-        let dl_file = File::create(chk_doclens_path)?;
-        let buf_writer = BufWriter::new(dl_file);
-        serde_json::to_writer(buf_writer, &chk_doclens)?;
 
         // Write explicit passage IDs for this chunk
         let chunk_pids: Vec<i64> = if let Some(pids) = passage_ids {

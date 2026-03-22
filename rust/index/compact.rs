@@ -1,9 +1,7 @@
 use anyhow::{bail, Result};
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
-use tch::{Device, IndexOp, Kind, Tensor};
+use tch::{Device, Kind, Tensor};
 
 use crate::utils::types::CompactStats;
 
@@ -94,25 +92,17 @@ pub fn compact_index_counting_sort(
     let compacted_codes = Tensor::zeros(&[total_embeddings], (Kind::Int64, device));
 
     let mut write_offsets = offsets_vec[..num_centroids].to_vec();
-    let mut passage_offset: i64 = 0;
 
     for chunk_idx in 0..num_chunks {
-        let codes_path = index_path.join(format!("{}.codes.npy", chunk_idx));
-        let residuals_path = index_path.join(format!("{}.residuals.npy", chunk_idx));
-        let doclens_path = index_path.join(format!("doclens.{}.npy", chunk_idx));
-
-        let codes = Tensor::read_npy(&codes_path)?.to_device(device);
-        let residuals = Tensor::read_npy(&residuals_path)?.to_device(device);
-        let doclens = Tensor::read_npy(&doclens_path)?
+        let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?.to_device(device);
+        let residuals = Tensor::read_npy(index_path.join(format!("{}.residuals.npy", chunk_idx)))?.to_device(device);
+        let doclens = Tensor::read_npy(index_path.join(format!("doclens.{}.npy", chunk_idx)))?
+            .to_device(device)
+            .to_kind(Kind::Int64);
+        let pids_base = Tensor::read_npy(index_path.join(format!("{}.passage_ids.npy", chunk_idx)))?
             .to_device(device)
             .to_kind(Kind::Int64);
 
-        let num_passages = doclens.size()[0];
-        let pids_base = Tensor::arange_start(
-            passage_offset,
-            passage_offset + num_passages,
-            (Kind::Int64, device),
-        );
         let chunk_total_embeddings = codes.size()[0];
         let pids = Tensor::repeat_interleave_self_tensor(
             &pids_base,
@@ -155,8 +145,6 @@ pub fn compact_index_counting_sort(
             write_offsets[centroid_id] += count;
             local_offset += count;
         }
-
-        passage_offset += num_passages;
     }
 
     let residuals_compacted_path = index_path.join("residuals.compacted.npy");
@@ -180,119 +168,6 @@ pub fn compact_index_counting_sort(
     Ok(())
 }
 
-pub fn compact_index(
-    index_path: &Path,
-    num_chunks: usize,
-    num_centroids: usize,
-    embedding_dim: usize,
-    nbits: usize,
-    device: Device,
-) -> Result<()> {
-    // First pass: count embeddings per centroid
-    let mut centroid_sizes = vec![0i64; num_centroids];
-    let mut total_embeddings = 0i64;
-
-    for chunk_idx in 0..num_chunks {
-        let codes_path = index_path.join(format!("{}.codes.npy", chunk_idx));
-        let codes = Tensor::read_npy(&codes_path)?;
-
-        // Count embeddings per centroid
-        for i in 0..codes.size()[0] {
-            let centroid_id = codes.i(i).int64_value(&[]) as usize;
-            centroid_sizes[centroid_id] += 1;
-            total_embeddings += 1;
-        }
-    }
-
-    // Create sizes_compacted tensor
-    let sizes_compacted = Tensor::from_slice(&centroid_sizes).to_device(device);
-    let sizes_path = index_path.join("sizes.compacted.npy");
-    sizes_compacted
-        .to_device(Device::Cpu)
-        .write_npy(&sizes_path)?;
-
-    // Calculate offsets for each centroid
-    let mut offsets = vec![0i64; num_centroids + 1];
-    for i in 0..num_centroids {
-        offsets[i + 1] = offsets[i] + centroid_sizes[i];
-    }
-
-    // Create storage for compacted data
-    let residual_dim = (embedding_dim * nbits) / 8;
-    let compacted_residuals = Tensor::zeros(
-        &[total_embeddings, residual_dim as i64],
-        (Kind::Uint8, device),
-    );
-    let compacted_codes = Tensor::zeros(&[total_embeddings], (Kind::Int, device));
-
-    // Track current write position for each centroid
-    let mut centroid_positions = offsets[0..num_centroids].to_vec();
-
-    // Second pass: reorganize data by centroid
-    let mut passage_offset = 0i32;
-
-    for chunk_idx in 0..num_chunks {
-        // Load chunk data
-        let codes_path = index_path.join(format!("{}.codes.npy", chunk_idx));
-        let residuals_path = index_path.join(format!("{}.residuals.npy", chunk_idx));
-        let doclens_path = index_path.join(format!("doclens.{}.json", chunk_idx));
-
-        let codes = Tensor::read_npy(&codes_path)?;
-        let residuals = Tensor::read_npy(&residuals_path)?;
-
-        // Load document lengths
-        let doclens_file = File::open(&doclens_path)?;
-        let doclens: Vec<i64> = serde_json::from_reader(BufReader::new(doclens_file))?;
-
-        // Create passage IDs for this chunk
-        let mut passage_ids = Vec::new();
-        for (doc_idx, &doc_len) in doclens.iter().enumerate() {
-            for _ in 0..doc_len {
-                passage_ids.push(passage_offset + doc_idx as i32);
-            }
-        }
-        let passage_ids_tensor = Tensor::from_slice(&passage_ids).to_device(device);
-
-        // Place each embedding in its centroid's section
-        for emb_idx in 0..codes.size()[0] {
-            let centroid_id = codes.i(emb_idx).int64_value(&[]) as usize;
-            let write_pos = centroid_positions[centroid_id];
-
-            // Write residual
-            let residual = residuals.i(emb_idx);
-            compacted_residuals.i(write_pos).copy_(&residual);
-
-            // Write passage ID
-            let pid = passage_ids_tensor.i(emb_idx);
-            compacted_codes.i(write_pos).copy_(&pid);
-
-            centroid_positions[centroid_id] += 1;
-        }
-
-        passage_offset += doclens.len() as i32;
-    }
-
-    // Save compacted data
-    let residuals_compacted_path = index_path.join("residuals.compacted.npy");
-    compacted_residuals
-        .to_device(Device::Cpu)
-        .write_npy(&residuals_compacted_path)?;
-
-    let codes_compacted_path = index_path.join("codes.compacted.npy");
-    compacted_codes
-        .to_device(Device::Cpu)
-        .write_npy(&codes_compacted_path)?;
-
-    // Also save the offsets for quick access during search
-    let offsets_tensor = Tensor::from_slice(&offsets).to_device(device);
-    let offsets_path = index_path.join("offsets.compacted.npy");
-    offsets_tensor
-        .to_device(Device::Cpu)
-        .write_npy(&offsets_path)?;
-
-    Ok(())
-}
-
 /// Recompact all chunks, excluding tombstoned passage IDs.
 ///
 /// Two-pass counting sort: first counts per-centroid embeddings (excluding deleted),
@@ -310,7 +185,6 @@ pub fn compact_index_filtered(
     let mut centroid_counts = vec![0i64; num_centroids];
     let mut total_filtered = 0i64;
     let mut active_pids_set: HashSet<i64> = HashSet::new();
-    let mut passage_offset: i64 = 0;
 
     for chunk_idx in 0..num_chunks {
         let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?
@@ -320,17 +194,11 @@ pub fn compact_index_filtered(
             .to_device(Device::Cpu)
             .to_kind(Kind::Int64);
         let doclens_vec: Vec<i64> = doclens.try_into()?;
-        let num_passages = doclens_vec.len() as i64;
 
-        let pids_path = index_path.join(format!("{}.passage_ids.npy", chunk_idx));
-        let pids_base: Vec<i64> = if pids_path.exists() {
-            let t = Tensor::read_npy(&pids_path)?
-                .to_device(Device::Cpu)
-                .to_kind(Kind::Int64);
-            t.try_into()?
-        } else {
-            (passage_offset..passage_offset + num_passages).collect()
-        };
+        let pids_base: Vec<i64> = Tensor::read_npy(index_path.join(format!("{}.passage_ids.npy", chunk_idx)))?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64)
+            .try_into()?;
 
         let codes_vec: Vec<i64> = codes.try_into()?;
         let mut emb_offset = 0usize;
@@ -348,7 +216,6 @@ pub fn compact_index_filtered(
                 emb_offset += 1;
             }
         }
-        passage_offset += num_passages;
     }
 
     // Build offsets
@@ -368,7 +235,6 @@ pub fn compact_index_filtered(
     let compacted_codes = Tensor::zeros(&[total_filtered], (Kind::Int64, device));
 
     let mut write_offsets = offsets_vec[..num_centroids].to_vec();
-    let mut passage_offset: i64 = 0;
 
     for chunk_idx in 0..num_chunks {
         let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?
@@ -379,20 +245,9 @@ pub fn compact_index_filtered(
         let doclens = Tensor::read_npy(index_path.join(format!("doclens.{}.npy", chunk_idx)))?
             .to_device(device)
             .to_kind(Kind::Int64);
-
-        let pids_path = index_path.join(format!("{}.passage_ids.npy", chunk_idx));
-        let num_passages = doclens.size()[0];
-        let pids_base = if pids_path.exists() {
-            Tensor::read_npy(&pids_path)?
-                .to_device(device)
-                .to_kind(Kind::Int64)
-        } else {
-            Tensor::arange_start(
-                passage_offset,
-                passage_offset + num_passages,
-                (Kind::Int64, device),
-            )
-        };
+        let pids_base = Tensor::read_npy(index_path.join(format!("{}.passage_ids.npy", chunk_idx)))?
+            .to_device(device)
+            .to_kind(Kind::Int64);
 
         let chunk_total = codes.size()[0];
         let pids = Tensor::repeat_interleave_self_tensor(
@@ -409,7 +264,6 @@ pub fn compact_index_filtered(
             .collect();
 
         if keep_indices.is_empty() {
-            passage_offset += num_passages;
             continue;
         }
 
@@ -443,8 +297,6 @@ pub fn compact_index_filtered(
             write_offsets[centroid_id] += count;
             local_offset += count;
         }
-
-        passage_offset += num_passages;
     }
 
     // Write compacted data
@@ -502,15 +354,10 @@ pub fn build_partial_compacted(
             .to_kind(Kind::Int64);
         let doclens_vec: Vec<i64> = doclens.try_into()?;
 
-        let pids_path = index_path.join(format!("{}.passage_ids.npy", chunk_idx));
-        let pids_vec: Vec<i64> = if pids_path.exists() {
-            Tensor::read_npy(&pids_path)?
-                .to_device(Device::Cpu)
-                .to_kind(Kind::Int64)
-                .try_into()?
-        } else {
-            (0..doclens_vec.len() as i64).collect()
-        };
+        let pids_vec: Vec<i64> = Tensor::read_npy(index_path.join(format!("{}.passage_ids.npy", chunk_idx)))?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Int64)
+            .try_into()?;
 
         let codes_vec: Vec<i64> = codes.try_into()?;
         // Get residuals as raw bytes — flatten [total_embs, residual_dim] -> [total_embs * residual_dim]
@@ -746,4 +593,96 @@ pub fn prune_empty_centroids(
     }
 
     Ok(Some(new_num_centroids))
+}
+
+/// Recompute the cluster threshold (75th percentile of residual norms)
+/// from the current index data.
+///
+/// Samples up to 50 000 embeddings, decompresses their quantized residuals
+/// via bucket weights, computes L2 norms, and saves the 75th percentile
+/// to `cluster_threshold.npy`.
+pub fn recalibrate_threshold(
+    index_path: &Path,
+    num_chunks: usize,
+    nbits: u8,
+    dim: usize,
+    device: Device,
+) -> Result<()> {
+    let bucket_weights_path = index_path.join("bucket_weights.npy");
+    if !bucket_weights_path.exists() {
+        return Ok(());
+    }
+    let bucket_weights = Tensor::read_npy(&bucket_weights_path)?
+        .to_device(device)
+        .to_kind(Kind::Float);
+
+    let max_sample = 50_000i64;
+    let mut all_norms: Vec<f32> = Vec::new();
+
+    for chunk_idx in 0..num_chunks {
+        if all_norms.len() as i64 >= max_sample {
+            break;
+        }
+
+        let res_path = index_path.join(format!("{}.residuals.npy", chunk_idx));
+        if !res_path.exists() {
+            continue;
+        }
+        let packed = Tensor::read_npy(&res_path)?.to_device(device);
+        let n = packed.size()[0];
+        let take = (max_sample - all_norms.len() as i64).min(n);
+        let sample = packed.narrow(0, 0, take);
+
+        let bucket_indices = unpack_residuals(&sample, nbits, dim as i64);
+        let approx = bucket_weights
+            .index_select(0, &bucket_indices.flatten(0, -1).to_kind(Kind::Int64))
+            .reshape([take, dim as i64]);
+        let norms = approx
+            .norm_scalaropt_dim(2, &[1], false)
+            .to_device(Device::Cpu);
+        let norms_vec: Vec<f32> = norms.try_into()?;
+        all_norms.extend(norms_vec);
+    }
+
+    if all_norms.is_empty() {
+        return Ok(());
+    }
+
+    let norms_tensor = Tensor::from_slice(&all_norms);
+    let n = norms_tensor.size()[0];
+    let k = ((0.75 * n as f64).ceil() as i64).max(1).min(n);
+    let (threshold, _) = norms_tensor.kthvalue(k, 0, false);
+    threshold
+        .to_device(Device::Cpu)
+        .write_npy(index_path.join("cluster_threshold.npy"))?;
+
+    Ok(())
+}
+
+/// Unpack quantized residuals from packed bytes back to bucket indices.
+///
+/// Input: `[N, dim * nbits / 8]` uint8 tensor.
+/// Output: `[N, dim]` int64 tensor with values in `[0, 2^nbits)`.
+fn unpack_residuals(packed: &Tensor, nbits: u8, dim: i64) -> Tensor {
+    let n = packed.size()[0];
+    let device = packed.device();
+
+    // Expand each byte into 8 bits
+    let shifts = Tensor::from_slice(&[7i64, 6, 5, 4, 3, 2, 1, 0]).to_device(device);
+    let bits = packed
+        .to_kind(Kind::Int64)
+        .unsqueeze(-1)
+        .bitwise_right_shift(&shifts)
+        .bitwise_and_tensor(&Tensor::ones(&[1], (Kind::Int64, device)));
+    // bits: [N, bytes_per_row, 8]
+
+    let total_bits = dim * nbits as i64;
+    let bits_flat = bits.reshape([n, total_bits]);
+    // bits_flat: [N, dim * nbits]
+
+    // Group into nbits-wide chunks and combine: bucket = sum(bit_k * 2^k)
+    let bits_grouped = bits_flat.reshape([n, dim, nbits as i64]);
+    let powers: Vec<i64> = (0..nbits).map(|i| 1i64 << i).collect();
+    let powers_tensor = Tensor::from_slice(&powers).to_device(device);
+    (&bits_grouped * &powers_tensor).sum_dim_intlist(-1, false, Kind::Int64)
 }

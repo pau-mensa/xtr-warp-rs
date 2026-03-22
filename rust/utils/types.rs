@@ -188,31 +188,18 @@ pub struct IndexPlan {
 }
 
 /// Canonical on-disk + in-memory representation of `metadata.json`.
-///
-/// Every field that may be absent in legacy indexes is tagged with
-/// `#[serde(default)]` so that old metadata files still parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMetadata {
-    #[serde(default)]
     pub num_chunks: usize,
     pub nbits: u8,
-    #[serde(default)]
     pub num_partitions: i64,
-    #[serde(default)]
     pub num_embeddings: i64,
-    #[serde(default)]
     pub avg_doclen: f64,
-    #[serde(default)]
     pub num_passages: usize,
     /// Watermark for the next passage ID to assign.
-    /// Defaults to `num_passages` for indexes created before this field existed.
-    #[serde(default)]
-    pub next_passage_id: Option<i64>,
-    #[serde(default)]
+    pub next_passage_id: i64,
     pub num_centroids: usize,
-    #[serde(default)]
     pub dim: usize,
-    #[serde(default)]
     pub created_at: String,
 }
 
@@ -234,11 +221,6 @@ impl IndexMetadata {
             .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", path.display(), e))?;
         serde_json::to_writer_pretty(std::io::BufWriter::new(file), self)?;
         Ok(())
-    }
-
-    /// Effective next passage ID (falls back to num_passages for legacy indexes).
-    pub fn next_pid(&self) -> i64 {
-        self.next_passage_id.unwrap_or(self.num_passages as i64)
     }
 }
 
