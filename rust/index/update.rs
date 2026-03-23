@@ -34,7 +34,6 @@ pub fn add_to_index(
     let next_pid = meta.next_passage_id;
 
     let codec = load_codec_from_disk(index_path, meta.nbits, device)?;
-    let centroids = Tensor::read_npy(index_path.join("centroids.npy"))?.to_device(device);
 
     let num_new_docs = embeddings.num_docs();
     let new_passage_ids: Vec<i64> = (next_pid..next_pid + num_new_docs as i64).collect();
@@ -61,7 +60,7 @@ pub fn add_to_index(
     let encode_result = encode_chunks_with_norms(
         &plan,
         embeddings,
-        &centroids,
+        &codec.centroids,
         &codec,
         index_path,
         device,
@@ -136,7 +135,6 @@ pub fn update_in_index(
     crate::index::delete::delete_from_index(passage_ids, index_path)?;
 
     let codec = load_codec_from_disk(index_path, meta.nbits, device)?;
-    let centroids = Tensor::read_npy(index_path.join("centroids.npy"))?.to_device(device);
 
     let num_new_docs = embeddings.num_docs();
     let new_num_chunks = (num_new_docs as f64 / CHUNK_SIZE as f64).ceil().max(1.0) as usize;
@@ -151,7 +149,7 @@ pub fn update_in_index(
     let encode_result = encode_chunks(
         &plan,
         embeddings,
-        &centroids,
+        &codec.centroids,
         &codec,
         index_path,
         device,
@@ -215,7 +213,7 @@ pub fn compact_standalone(index_path: &Path, device: Device) -> Result<()> {
 
     // Step 1: Rewrite chunks to physically remove deleted data
     let num_chunks = if !tombstones.is_empty() {
-        rewrite_chunks_filtered(index_path, meta.num_chunks, &tombstones, device)?;
+        rewrite_chunks_filtered(index_path, meta.num_chunks, &tombstones)?;
         clear_tombstones(index_path)?;
         count_chunks(index_path)
     } else {
@@ -415,11 +413,11 @@ fn save_metadata_from_stats(
 ///
 /// Streams one chunk at a time: read → filter → write temp → drop.
 /// Peak memory is O(max_chunk_size) instead of O(total_index_size).
+/// All work is done on CPU — this is pure data shuffling, not compute.
 fn rewrite_chunks_filtered(
     index_path: &Path,
     num_chunks: usize,
     deleted_pids: &HashSet<i64>,
-    device: Device,
 ) -> Result<()> {
     use serde_json::json;
     use std::io::BufWriter;
@@ -483,13 +481,13 @@ fn rewrite_chunks_filtered(
         chunk_mapping.iter().enumerate()
     {
         let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", old_idx)))?
-            .to_device(device);
+            .to_device(Device::Cpu);
         let residuals = Tensor::read_npy(index_path.join(format!("{}.residuals.npy", old_idx)))?
-            .to_device(device);
+            .to_device(Device::Cpu);
 
-        let idx_tensor = Tensor::from_slice(keep_emb_indices).to_device(device);
-        let filtered_codes = codes.index_select(0, &idx_tensor).to_device(Device::Cpu);
-        let filtered_residuals = residuals.index_select(0, &idx_tensor).to_device(Device::Cpu);
+        let idx_tensor = Tensor::from_slice(keep_emb_indices);
+        let filtered_codes = codes.index_select(0, &idx_tensor);
+        let filtered_residuals = residuals.index_select(0, &idx_tensor);
         drop(codes);
         drop(residuals);
 
