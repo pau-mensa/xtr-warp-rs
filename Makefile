@@ -1,3 +1,17 @@
+VENV    := .venv
+PYTHON  := $(VENV)/bin/python
+MATURIN := $(VENV)/bin/maturin
+PYTEST  := $(VENV)/bin/pytest
+
+# Common env block for recipes that need torch / libtorch.
+# Exported inline so cargo subprocesses (torch-sys build script) inherit them.
+TORCH_ENV = \
+	VIRTUAL_ENV=$(CURDIR)/$(VENV) \
+	PATH=$(CURDIR)/$(VENV)/bin:$$PATH \
+	LIBTORCH_USE_PYTORCH=1 \
+	LIBTORCH_BYPASS_VERSION_CHECK=1 \
+	LIBTORCH=$$($(PYTHON) -c "import torch,os;print(os.path.dirname(torch.__file__))")
+
 .PHONY: help install-gpu install clean build test
 
 help:	## Show all Makefile targets.
@@ -5,15 +19,15 @@ help:	## Show all Makefile targets.
 
 install-gpu:	## Install dependencies for gpu
 	@echo "Installing GPU dependencies..."
-	@test -d .venv || uv venv
-	uv pip install torch --index-url https://download.pytorch.org/whl/cu130
-	LIBTORCH_USE_PYTORCH=1 LIBTORCH_BYPASS_VERSION_CHECK=1 uv pip install --no-build-isolation -e .[dev]
+	@test -d $(VENV) || uv venv $(VENV)
+	$(TORCH_ENV) uv pip install torch --index-url https://download.pytorch.org/whl/cu130
+	$(TORCH_ENV) uv pip install --no-build-isolation -e .[dev]
 
 install:	## Install dependencies for cpu
 	@echo "Installing CPU dependencies..."
-	@test -d .venv || uv venv
-	uv pip install torch --index-url https://download.pytorch.org/whl/cpu
-	LIBTORCH_USE_PYTORCH=1 LIBTORCH_BYPASS_VERSION_CHECK=1 uv pip install --no-build-isolation -e .[dev]
+	@test -d $(VENV) || uv venv $(VENV)
+	$(TORCH_ENV) uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+	$(TORCH_ENV) uv pip install --no-build-isolation -e .[dev]
 
 clean:	## Clean build artifacts
 	cargo clean
@@ -25,11 +39,9 @@ clean:	## Clean build artifacts
 	find . -type f -name "*.pyc" -delete
 
 build:	## Build the project
-	export LIBTORCH=$$(uv run python -c "import torch; import os; print(os.path.dirname(torch.__file__))") && \
-	export LIBTORCH_USE_PYTORCH=1 && \
-	export LIBTORCH_BYPASS_VERSION_CHECK=1 && \
-	export CXXFLAGS="-w" && \
-	uv run maturin develop --release
+	@test -x $(PYTHON) || { echo "No venv found — run 'make install' first"; exit 1; }
+	$(TORCH_ENV) CXXFLAGS="-w" $(MATURIN) develop --release
 
 test:	## Run tests
-	uv run pytest tests/test.py
+	@test -x $(PYTEST) || { echo "No venv found — run 'make install' first"; exit 1; }
+	$(TORCH_ENV) $(PYTEST) tests/test.py tests/test_index_management.py
