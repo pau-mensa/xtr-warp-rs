@@ -230,14 +230,14 @@ fn finalize_ivf_and_compact(
     };
     meta.save(&config.index_path)?;
 
-    compact::compact_index_counting_sort(
+    compact::compact_index(
         &config.index_path,
         plan.num_chunks,
         centroids.size()[0] as usize,
         config.embedding_dim as usize,
         plan.nbits as usize,
         config.device,
-        &encode_result.global_centroid_counts,
+        &std::collections::HashSet::new(),
     )?;
 
     Ok(())

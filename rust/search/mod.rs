@@ -5,7 +5,6 @@ pub mod decompressor;
 pub mod loader;
 pub mod merger;
 pub mod scorer;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 // Re-export main types for convenience
@@ -26,12 +25,8 @@ pub struct Searcher {
 
 impl Searcher {
     /// Create a new searcher with loaded index
-    pub fn new(
-        index: &Arc<ReadOnlyIndex>,
-        config: &SearchConfig,
-        deleted_pids: Arc<HashSet<i64>>,
-    ) -> Result<Self> {
-        let scorer = WARPScorer::new(index, config.clone(), deleted_pids)?;
+    pub fn new(index: &Arc<ReadOnlyIndex>, config: &SearchConfig) -> Result<Self> {
+        let scorer = WARPScorer::new(index, config.clone())?;
         Ok(Self { scorer })
     }
 

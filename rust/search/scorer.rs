@@ -1,6 +1,5 @@
 use anyhow::Result;
 use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
-use std::collections::HashSet;
 use std::sync::Arc;
 use tch::{Device, IndexOp, Kind, Tensor};
 
@@ -38,18 +37,10 @@ pub struct WARPScorer {
 
     /// Batch size for centroid matmul
     batch_size: i64,
-
-    /// Tombstoned passage IDs to exclude from results
-    deleted_pids: Arc<HashSet<i64>>,
 }
 
 impl WARPScorer {
-    pub fn new(
-        index: &Arc<ReadOnlyIndex>,
-        config: SearchConfig,
-        deleted_pids: Arc<HashSet<i64>>,
-    ) -> Result<Self> {
-        // Initialize centroid selector from phase 1
+    pub fn new(index: &Arc<ReadOnlyIndex>, config: SearchConfig) -> Result<Self> {
         let device = parse_device(&config.device)?;
         let batch_size = config.batch_size;
         let centroid_selector = CentroidSelector::new(
@@ -59,14 +50,12 @@ impl WARPScorer {
         );
         let dtype = parse_dtype(&config.dtype)?;
 
-        // Build a dedicated rayon pool to reuse across all parallel sections
         let num_threads = config
             .num_threads
             .unwrap_or_else(rayon::current_num_threads)
             .max(1);
         let thread_pool = Arc::new(ThreadPoolBuilder::new().num_threads(num_threads).build()?);
 
-        // Initialize decompressor from phase 1
         let decompressor = CentroidDecompressor::new(
             index.metadata.nbits,
             index.metadata.dim,
@@ -75,7 +64,6 @@ impl WARPScorer {
             Arc::clone(&thread_pool),
         )?;
 
-        // Initialize merger
         let max_candidates = config.max_candidates.unwrap_or(256);
         let merger_config = MergerConfig {
             max_candidates: max_candidates,
@@ -93,7 +81,6 @@ impl WARPScorer {
             thread_pool,
             device,
             batch_size,
-            deleted_pids,
         })
     }
 
@@ -120,7 +107,6 @@ impl WARPScorer {
             &self.index,
             &query_embeddings,
             self.config.nprobe as usize,
-            &self.deleted_pids,
         )?;
         let (pids, scores) = self.merger.merge_candidate_scores(
             &decompressed.capacities,
@@ -163,7 +149,6 @@ impl WARPScorer {
             let index = Arc::clone(&self.index);
             let nprobe = self.config.nprobe as usize;
             let device = self.device;
-            let deleted_pids = Arc::clone(&self.deleted_pids);
 
             self.thread_pool.install(move || {
                 queries
@@ -188,7 +173,6 @@ impl WARPScorer {
                             &index,
                             &query_embeddings,
                             nprobe,
-                            &deleted_pids,
                         )?;
 
                         let (pids, scores) = merger.merge_candidate_scores(

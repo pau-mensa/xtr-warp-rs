@@ -4,7 +4,7 @@ use std::path::Path;
 use tch::{Device, IndexOp, Kind, Tensor};
 
 use crate::index::compact::{
-    build_partial_compacted, compact_index_filtered, merge_compacted_incremental,
+    build_partial_compacted, compact_index, merge_compacted_incremental,
     prune_empty_centroids, recalibrate_threshold, remove_and_merge_compacted,
 };
 use crate::index::delete::{clear_tombstones, load_tombstones, save_tombstones};
@@ -231,7 +231,7 @@ pub fn compact_standalone(index_path: &Path, device: Device) -> Result<()> {
         };
 
     // Step 3: Rebuild compacted structures from clean chunks (single pass)
-    let stats = compact_index_filtered(
+    let stats = compact_index(
         index_path,
         num_chunks,
         num_centroids,

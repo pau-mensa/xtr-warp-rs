@@ -117,6 +117,11 @@ fn get_dtype(dtype: &str) -> Result<Kind, PyErr> {
 /// Represents a loaded index
 #[pyclass(unsendable)]
 struct LoadedSearcher {
+    /// The unfiltered index as loaded from disk. Kept so we can re-filter
+    /// when tombstones change without a full disk reload.
+    unfiltered_index: Option<Arc<ReadOnlyIndex>>,
+    /// The search-ready index with tombstones already excluded from
+    /// compacted structures. Search never checks tombstones at query time.
     loaded_index: Option<Arc<ReadOnlyIndex>>,
     index_path: String,
     device: Device,
@@ -134,6 +139,7 @@ impl LoadedSearcher {
         let dtype = get_dtype(&dtype)?;
 
         Ok(Self {
+            unfiltered_index: None,
             loaded_index: None,
             index_path,
             device,
@@ -148,13 +154,9 @@ impl LoadedSearcher {
         let index_loader =
             IndexLoader::new(&self.index_path, self.device, self.dtype, self.use_mmap)
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create loader: {}", e)))?;
-        let loaded_index = Arc::new(
-            index_loader
-                .load()
-                .map(ReadOnlyIndex)
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to load index: {}", e)))?,
-        );
-        self.loaded_index = Some(loaded_index);
+        let loaded_index = index_loader
+            .load()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load index: {}", e)))?;
 
         // Load tombstones if present
         self.deleted_pids =
@@ -162,6 +164,20 @@ impl LoadedSearcher {
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!("Failed to load tombstones: {}", e))
                 })?;
+
+        // Store the unfiltered index, then build a filtered view for search
+        let unfiltered = Arc::new(ReadOnlyIndex(loaded_index.clone()));
+        self.unfiltered_index = Some(Arc::clone(&unfiltered));
+
+        if let Some(filtered) = loaded_index
+            .filter_tombstones(&self.deleted_pids)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to filter tombstones: {}", e)))?
+        {
+            self.loaded_index = Some(Arc::new(ReadOnlyIndex(filtered)));
+        } else {
+            self.loaded_index = Some(unfiltered);
+        }
+
         Ok(())
     }
 
@@ -185,11 +201,9 @@ impl LoadedSearcher {
             )));
         }
 
-        let deleted_pids = Arc::new(self.deleted_pids.clone());
         let searcher = Searcher::new(
             self.loaded_index.as_ref().unwrap(),
             &search_config,
-            deleted_pids,
         )
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create searcher: {}", e)))?;
 
@@ -204,14 +218,32 @@ impl LoadedSearcher {
     }
 
     /// Update in-memory tombstones without full reload after delete().
-    fn update_tombstones(&mut self, passage_ids: Vec<i64>) {
+    /// Rebuilds the filtered compacted structures from the unfiltered index.
+    fn update_tombstones(&mut self, passage_ids: Vec<i64>) -> PyResult<()> {
         for pid in passage_ids {
             self.deleted_pids.insert(pid);
         }
+
+        // Rebuild the filtered index from the unfiltered original
+        if let Some(unfiltered) = &self.unfiltered_index {
+            if let Some(filtered) = unfiltered
+                .0
+                .filter_tombstones(&self.deleted_pids)
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to filter tombstones: {}", e))
+                })?
+            {
+                self.loaded_index = Some(Arc::new(ReadOnlyIndex(filtered)));
+            } else {
+                self.loaded_index = Some(Arc::clone(unfiltered));
+            }
+        }
+        Ok(())
     }
 
     /// Free the loaded index
     fn free(&mut self) {
+        self.unfiltered_index = None;
         self.loaded_index = None;
         self.deleted_pids.clear();
     }

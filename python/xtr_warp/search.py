@@ -502,7 +502,9 @@ class XTRWarp:
             meta = self._load_metadata()
             if meta and meta.get("num_passages", 0) > 0:
                 deleted_path = os.path.join(self.index, "deleted_pids.npy")
-                num_deleted = len(np.load(deleted_path)) if os.path.exists(deleted_path) else 0
+                num_deleted = (
+                    len(np.load(deleted_path)) if os.path.exists(deleted_path) else 0
+                )
                 total = meta["num_passages"] + num_deleted
                 ratio = num_deleted / total if total > 0 else 0.0
                 if ratio >= compact_threshold:
