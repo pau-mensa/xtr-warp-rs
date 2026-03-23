@@ -306,7 +306,7 @@ impl CentroidDecompressor {
         let embedding_indices = &candidate_begins + &intra;
 
         let passage_ids = index
-            .codes_compacted
+            .pids_compacted
             .index_select(0, &embedding_indices)
             .to_kind(Kind::Int64);
 
@@ -423,7 +423,7 @@ impl CentroidDecompressor {
 
         // Use narrow for zero-copy views into compacted data, then convert to local Vecs
         let local_pids_raw: Vec<i64> = index
-            .codes_compacted
+            .pids_compacted
             .narrow(0, begin, capacity as i64)
             .try_into()
             .unwrap_or_default();

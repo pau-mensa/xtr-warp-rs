@@ -169,7 +169,7 @@ impl IndexLoader {
             index_path.join("residuals.compacted.npy")
         };
 
-        let (codes_compacted, residuals_compacted, mmap_handles) = if self.use_mmap {
+        let (pids_compacted, residuals_compacted, mmap_handles) = if self.use_mmap {
             anyhow::ensure!(
                 self.device == Device::Cpu,
                 "mmap is only supported on CPU"
@@ -198,7 +198,7 @@ impl IndexLoader {
             "Sum of sizes must equal number of embeddings"
         );
         assert_eq!(
-            codes_compacted.size()[0],
+            pids_compacted.size()[0],
             num_embeddings,
             "Codes must have same length as residuals"
         );
@@ -216,7 +216,7 @@ impl IndexLoader {
             centroids,
             bucket_weights,
             sizes_compacted,
-            codes_compacted,
+            pids_compacted,
             residuals_compacted,
             offsets_compacted,
             kdummy_centroid,

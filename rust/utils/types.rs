@@ -239,8 +239,8 @@ pub struct LoadedIndex {
     /// Compacted sizes per centroid
     pub sizes_compacted: Tensor,
 
-    /// Compacted codes for embeddings
-    pub codes_compacted: Tensor,
+    /// Per-embedding passage IDs in compacted (centroid-sorted) layout
+    pub pids_compacted: Tensor,
 
     /// Compacted residuals (compressed)
     pub residuals_compacted: Tensor,
@@ -265,7 +265,7 @@ impl Clone for LoadedIndex {
             centroids: self.centroids.shallow_clone(),
             bucket_weights: self.bucket_weights.shallow_clone(),
             sizes_compacted: self.sizes_compacted.shallow_clone(),
-            codes_compacted: self.codes_compacted.shallow_clone(),
+            pids_compacted: self.pids_compacted.shallow_clone(),
             residuals_compacted: self.residuals_compacted.shallow_clone(),
             offsets_compacted: self.offsets_compacted.shallow_clone(),
             kdummy_centroid: self.kdummy_centroid,
@@ -280,7 +280,7 @@ impl LoadedIndex {
     /// the compacted structures. Shares the immutable tensors (centroids,
     /// bucket_weights, mmap handles) with the original.
     ///
-    /// Cost: one pass over `codes_compacted` on CPU + two `index_select` calls.
+    /// Cost: one pass over `pids_compacted` on CPU + two `index_select` calls.
     /// Returns `None` (meaning "use the original") when `deleted_pids` is empty.
     pub fn filter_tombstones(
         &self,
@@ -290,7 +290,7 @@ impl LoadedIndex {
             return Ok(None);
         }
 
-        let device = self.codes_compacted.device();
+        let device = self.pids_compacted.device();
         let num_centroids = self.sizes_compacted.size()[0] as usize;
 
         let old_sizes: Vec<i64> = self
@@ -298,8 +298,8 @@ impl LoadedIndex {
             .to_device(Device::Cpu)
             .to_kind(Kind::Int64)
             .try_into()?;
-        let old_codes_vec: Vec<i64> = self
-            .codes_compacted
+        let old_pids_vec: Vec<i64> = self
+            .pids_compacted
             .to_device(Device::Cpu)
             .to_kind(Kind::Int64)
             .try_into()?;
@@ -311,14 +311,14 @@ impl LoadedIndex {
         }
 
         // Single pass: collect global keep_indices + per-centroid new sizes
-        let mut keep_indices: Vec<i64> = Vec::with_capacity(old_codes_vec.len());
+        let mut keep_indices: Vec<i64> = Vec::with_capacity(old_pids_vec.len());
         let mut new_sizes = vec![0i64; num_centroids];
         let mut active_pids: HashSet<i64> = HashSet::new();
 
         for c in 0..num_centroids {
             let start = old_offsets[c] as usize;
             let end = old_offsets[c + 1] as usize;
-            for (local_i, &pid) in old_codes_vec[start..end].iter().enumerate() {
+            for (local_i, &pid) in old_pids_vec[start..end].iter().enumerate() {
                 if !deleted_pids.contains(&pid) {
                     keep_indices.push((start + local_i) as i64);
                     new_sizes[c] += 1;
@@ -339,7 +339,7 @@ impl LoadedIndex {
         let new_residuals;
         if !keep_indices.is_empty() {
             let keep_tensor = Tensor::from_slice(&keep_indices).to_device(device);
-            new_codes = self.codes_compacted.index_select(0, &keep_tensor);
+            new_codes = self.pids_compacted.index_select(0, &keep_tensor);
             new_residuals = self.residuals_compacted.index_select(0, &keep_tensor);
         } else {
             let residual_dim = self.residuals_compacted.size()[1];
@@ -369,7 +369,7 @@ impl LoadedIndex {
             centroids: self.centroids.shallow_clone(),
             bucket_weights: self.bucket_weights.shallow_clone(),
             sizes_compacted: new_sizes_tensor,
-            codes_compacted: new_codes,
+            pids_compacted: new_codes,
             residuals_compacted: new_residuals,
             offsets_compacted: new_offsets_tensor,
             kdummy_centroid: kdummy,
