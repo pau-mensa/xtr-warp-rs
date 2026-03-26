@@ -119,8 +119,8 @@ impl WARPScorer {
         )?;
 
         Ok(SearchResult {
-            passage_ids: pids[..k.min(pids.len())].to_vec(),
-            scores: scores[..k.min(scores.len())].to_vec(),
+            passage_ids: pids,
+            scores,
             query_id: query_idx + 1,
         })
     }
@@ -186,8 +186,8 @@ impl WARPScorer {
                         )?;
 
                         Ok(SearchResult {
-                            passage_ids: pids[..k.min(pids.len())].to_vec(),
-                            scores: scores[..k.min(scores.len())].to_vec(),
+                            passage_ids: pids,
+                            scores,
                             query_id: idx + 1,
                         })
                     })

@@ -6,7 +6,6 @@
 use memmap2::Mmap;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
@@ -272,110 +271,6 @@ impl Clone for LoadedIndex {
             metadata: self.metadata.clone(),
             _mmap_handles: Arc::clone(&self._mmap_handles),
         }
-    }
-}
-
-impl LoadedIndex {
-    /// Return a new `LoadedIndex` with tombstoned passage IDs excluded from
-    /// the compacted structures. Shares the immutable tensors (centroids,
-    /// bucket_weights, mmap handles) with the original.
-    ///
-    /// Cost: one pass over `pids_compacted` on CPU + two `index_select` calls.
-    /// Returns `None` (meaning "use the original") when `deleted_pids` is empty.
-    pub fn filter_tombstones(
-        &self,
-        deleted_pids: &HashSet<i64>,
-    ) -> anyhow::Result<Option<LoadedIndex>> {
-        if deleted_pids.is_empty() {
-            return Ok(None);
-        }
-
-        let device = self.pids_compacted.device();
-        let num_centroids = self.sizes_compacted.size()[0] as usize;
-
-        let old_sizes: Vec<i64> = self
-            .sizes_compacted
-            .to_device(Device::Cpu)
-            .to_kind(Kind::Int64)
-            .try_into()?;
-        let old_pids_vec: Vec<i64> = self
-            .pids_compacted
-            .to_device(Device::Cpu)
-            .to_kind(Kind::Int64)
-            .try_into()?;
-
-        // Build offsets from sizes
-        let mut old_offsets = vec![0i64; num_centroids + 1];
-        for i in 0..num_centroids {
-            old_offsets[i + 1] = old_offsets[i] + old_sizes[i];
-        }
-
-        // Single pass: collect global keep_indices + per-centroid new sizes
-        let mut keep_indices: Vec<i64> = Vec::with_capacity(old_pids_vec.len());
-        let mut new_sizes = vec![0i64; num_centroids];
-        let mut active_pids: HashSet<i64> = HashSet::new();
-
-        for c in 0..num_centroids {
-            let start = old_offsets[c] as usize;
-            let end = old_offsets[c + 1] as usize;
-            for (local_i, &pid) in old_pids_vec[start..end].iter().enumerate() {
-                if !deleted_pids.contains(&pid) {
-                    keep_indices.push((start + local_i) as i64);
-                    new_sizes[c] += 1;
-                    active_pids.insert(pid);
-                }
-            }
-        }
-
-        // Build new offsets
-        let mut new_offsets = vec![0i64; num_centroids + 1];
-        for i in 0..num_centroids {
-            new_offsets[i + 1] = new_offsets[i] + new_sizes[i];
-        }
-        let new_total = new_offsets[num_centroids];
-
-        // Apply filter with two index_select calls
-        let new_codes;
-        let new_residuals;
-        if !keep_indices.is_empty() {
-            let keep_tensor = Tensor::from_slice(&keep_indices).to_device(device);
-            new_codes = self.pids_compacted.index_select(0, &keep_tensor);
-            new_residuals = self.residuals_compacted.index_select(0, &keep_tensor);
-        } else {
-            let residual_dim = self.residuals_compacted.size()[1];
-            new_codes = Tensor::zeros(&[0], (Kind::Int64, device));
-            new_residuals = Tensor::zeros(&[0, residual_dim], (Kind::Uint8, device));
-        }
-
-        let new_sizes_tensor = Tensor::from_slice(&new_sizes).to_device(device);
-        let new_offsets_tensor = Tensor::from_slice(&new_offsets).to_device(device);
-
-        // Find new kdummy (centroid with smallest size)
-        let kdummy = new_sizes
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, &s)| s)
-            .map(|(i, _)| i as CentroidId)
-            .unwrap_or(0);
-
-        let mut metadata = self.metadata.clone();
-        metadata.num_embeddings = new_total;
-        metadata.num_passages = active_pids.len();
-        if metadata.num_passages > 0 {
-            metadata.avg_doclen = new_total as f64 / metadata.num_passages as f64;
-        }
-
-        Ok(Some(LoadedIndex {
-            centroids: self.centroids.shallow_clone(),
-            bucket_weights: self.bucket_weights.shallow_clone(),
-            sizes_compacted: new_sizes_tensor,
-            pids_compacted: new_codes,
-            residuals_compacted: new_residuals,
-            offsets_compacted: new_offsets_tensor,
-            kdummy_centroid: kdummy,
-            metadata,
-            _mmap_handles: Arc::clone(&self._mmap_handles),
-        }))
     }
 }
 

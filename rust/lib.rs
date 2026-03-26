@@ -117,16 +117,13 @@ fn get_dtype(dtype: &str) -> Result<Kind, PyErr> {
 /// Represents a loaded index
 #[pyclass(unsendable)]
 struct LoadedSearcher {
-    /// The unfiltered index as loaded from disk. Kept so we can re-filter
-    /// when tombstones change without a full disk reload.
-    unfiltered_index: Option<Arc<ReadOnlyIndex>>,
-    /// The search-ready index with tombstones already excluded from
-    /// compacted structures. Search never checks tombstones at query time.
+    /// The loaded index used for search.
     loaded_index: Option<Arc<ReadOnlyIndex>>,
     index_path: String,
     device: Device,
     dtype: Kind,
     use_mmap: bool,
+    /// Tombstoned passage IDs — filtered out of search results at merge time.
     deleted_pids: HashSet<i64>,
 }
 
@@ -139,7 +136,6 @@ impl LoadedSearcher {
         let dtype = get_dtype(&dtype)?;
 
         Ok(Self {
-            unfiltered_index: None,
             loaded_index: None,
             index_path,
             device,
@@ -165,18 +161,7 @@ impl LoadedSearcher {
                     PyRuntimeError::new_err(format!("Failed to load tombstones: {}", e))
                 })?;
 
-        // Store the unfiltered index, then build a filtered view for search
-        let unfiltered = Arc::new(ReadOnlyIndex(loaded_index.clone()));
-        self.unfiltered_index = Some(Arc::clone(&unfiltered));
-
-        if let Some(filtered) = loaded_index
-            .filter_tombstones(&self.deleted_pids)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to filter tombstones: {}", e)))?
-        {
-            self.loaded_index = Some(Arc::new(ReadOnlyIndex(filtered)));
-        } else {
-            self.loaded_index = Some(unfiltered);
-        }
+        self.loaded_index = Some(Arc::new(ReadOnlyIndex(loaded_index)));
 
         Ok(())
     }
@@ -207,43 +192,50 @@ impl LoadedSearcher {
         )
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create searcher: {}", e)))?;
 
+        let k = search_config.k;
+
         // process batch
-        let results = searcher
+        let mut results = searcher
             .search(Query {
                 embeddings: queries_embeddings.deref().shallow_clone(),
             })
             .map_err(|e| PyRuntimeError::new_err(format!("Search failed: {}", e)))?;
 
+        // Filter tombstoned PIDs and truncate to k.
+        // Results arrive sorted by score descending from the merger, so we
+        // can stop as soon as we collect k non-deleted entries.
+        for result in &mut results {
+            if !self.deleted_pids.is_empty() {
+                let mut filtered_pids = Vec::with_capacity(k);
+                let mut filtered_scores = Vec::with_capacity(k);
+                for (pid, score) in result.passage_ids.iter().zip(result.scores.iter()) {
+                    if !self.deleted_pids.contains(pid) {
+                        filtered_pids.push(*pid);
+                        filtered_scores.push(*score);
+                        if filtered_pids.len() == k {
+                            break;
+                        }
+                    }
+                }
+                result.passage_ids = filtered_pids;
+                result.scores = filtered_scores;
+            } else {
+                result.passage_ids.truncate(k);
+                result.scores.truncate(k);
+            }
+        }
+
         Ok(results)
     }
 
     /// Update in-memory tombstones without full reload after delete().
-    /// Rebuilds the filtered compacted structures from the unfiltered index.
     fn update_tombstones(&mut self, passage_ids: Vec<i64>) -> PyResult<()> {
-        for pid in passage_ids {
-            self.deleted_pids.insert(pid);
-        }
-
-        // Rebuild the filtered index from the unfiltered original
-        if let Some(unfiltered) = &self.unfiltered_index {
-            if let Some(filtered) = unfiltered
-                .0
-                .filter_tombstones(&self.deleted_pids)
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("Failed to filter tombstones: {}", e))
-                })?
-            {
-                self.loaded_index = Some(Arc::new(ReadOnlyIndex(filtered)));
-            } else {
-                self.loaded_index = Some(Arc::clone(unfiltered));
-            }
-        }
+        self.deleted_pids.extend(passage_ids);
         Ok(())
     }
 
     /// Free the loaded index
     fn free(&mut self) {
-        self.unfiltered_index = None;
         self.loaded_index = None;
         self.deleted_pids.clear();
     }
