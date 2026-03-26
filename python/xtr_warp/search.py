@@ -471,26 +471,22 @@ class XTRWarp:
     def delete(
         self,
         passage_ids: list[int],
-        auto_compact: bool = False,
-        compact_threshold: float = 0.2,
+        compact_threshold: float | None = 0.2,
     ) -> "XTRWarp":
         """Delete passages by ID. O(1) tombstone operation.
 
         Search automatically filters deleted passages. To physically
         remove deleted data, call ``compact()`` afterward, or set
-        ``auto_compact=True`` to trigger compaction when the tombstone
-        ratio exceeds ``compact_threshold``.
+        ``compact_threshold`` to trigger compaction when the tombstone
+        ratio exceeds the ratio.
 
         Args:
         ----
         passage_ids:
             List of passage IDs to mark as deleted.
-        auto_compact:
-            If True, automatically run ``compact()`` when the ratio of
-            deleted passages to total passages exceeds *compact_threshold*.
         compact_threshold:
             Fraction of deleted passages that triggers auto-compaction
-            (default 0.2 = 20%).
+            (default 0.2 = 20%). If set to None the compaction does not run
 
         """
         xtr_warp_rs.delete(self.index, passage_ids)
@@ -498,7 +494,7 @@ class XTRWarp:
             for s in self._loaded_searchers:
                 s.update_tombstones(passage_ids)
 
-        if auto_compact:
+        if compact_threshold is not None:
             meta = self._load_metadata()
             if meta and meta.get("num_passages", 0) > 0:
                 deleted_path = os.path.join(self.index, "deleted_pids.npy")

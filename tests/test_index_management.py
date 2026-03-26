@@ -8,7 +8,6 @@ import numpy as np
 import torch
 from xtr_warp.search import XTRWarp
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 INDEX_DIR = ".indices/test_mgmt"
@@ -500,7 +499,9 @@ def test_cluster_threshold_created():
     """create_index should produce a cluster_threshold.npy file."""
     idx, _docs, _queries = _fresh_index()
     path = os.path.join(INDEX_DIR, "cluster_threshold.npy")
-    assert os.path.exists(path), "cluster_threshold.npy should be created during index creation"
+    assert os.path.exists(path), (
+        "cluster_threshold.npy should be created during index creation"
+    )
     threshold = float(np.load(path))
     assert threshold > 0, "cluster_threshold should be positive"
 
@@ -696,11 +697,13 @@ def test_auto_compact_on_delete():
     tombstone_path = os.path.join(INDEX_DIR, "deleted_pids.npy")
 
     # Delete 10% — below the 20% threshold, no compaction
-    idx.delete(list(range(10)), auto_compact=True, compact_threshold=0.2)
-    assert os.path.exists(tombstone_path), "Tombstones should still exist below threshold"
+    idx.delete(list(range(10)), compact_threshold=0.2)
+    assert os.path.exists(tombstone_path), (
+        "Tombstones should still exist below threshold"
+    )
 
     # Delete another 15% — now at 25%, above threshold → auto-compact
-    idx.delete(list(range(10, 25)), auto_compact=True, compact_threshold=0.2)
+    idx.delete(list(range(10, 25)), compact_threshold=0.2)
     assert not os.path.exists(tombstone_path), (
         "Tombstones should be cleared after auto-compaction"
     )

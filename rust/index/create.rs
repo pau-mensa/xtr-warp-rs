@@ -64,7 +64,7 @@ pub fn create_index(
         0,    // start chunk index
     )?;
 
-    finalize_ivf_and_compact(config, &index_plan, &encode_result, &centroids)?;
+    finalize_and_compact(config, &index_plan, &encode_result, &centroids)?;
 
     Ok(())
 }
@@ -204,7 +204,7 @@ fn sample_embeddings_streaming(
     Ok((sample_pids, sampled_embeddings, total_doc_len))
 }
 
-fn finalize_ivf_and_compact(
+fn finalize_and_compact(
     config: &IndexConfig,
     plan: &IndexPlan,
     encode_result: &EncodeResult,

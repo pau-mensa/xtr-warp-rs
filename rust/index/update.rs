@@ -297,14 +297,6 @@ pub fn append_centroids(index_path: &Path, new_centroids: &Tensor) -> Result<()>
     Tensor::cat(&[old_offsets, ext_offsets], 0)
         .write_npy(index_path.join("offsets.compacted.npy"))?;
 
-    // Extend ivf_lengths with zeros
-    let ivf_lengths_path = index_path.join("ivf_lengths.npy");
-    if ivf_lengths_path.exists() {
-        let old_lens = Tensor::read_npy(&ivf_lengths_path)?.to_device(Device::Cpu);
-        let ext_lens = Tensor::zeros(&[k_new], (old_lens.kind(), Device::Cpu));
-        Tensor::cat(&[old_lens, ext_lens], 0).write_npy(&ivf_lengths_path)?;
-    }
-
     // Update metadata
     let mut meta = IndexMetadata::load(index_path)?;
     meta.num_centroids += k_new as usize;

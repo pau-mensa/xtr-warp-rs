@@ -19,51 +19,11 @@ pub struct PartialCompacted {
     pub total_embeddings: i64,
 }
 
-/// Build the IVF (inverted file) from compacted passage IDs and write to disk.
-/// Returns the number of unique passage IDs across all centroids.
-fn build_ivf_from_compacted(
-    pids_compacted: &Tensor,
-    sizes_vec: &[i64],
-    index_path: &Path,
-    device: Device,
-) -> Result<usize> {
-    let mut ivf_list: Vec<Tensor> = Vec::with_capacity(sizes_vec.len());
-    let mut ivf_lens_vec: Vec<i64> = Vec::with_capacity(sizes_vec.len());
-    let mut all_unique_pids: HashSet<i64> = HashSet::new();
-
-    let mut offset: i64 = 0;
-    for &size in sizes_vec {
-        if size == 0 {
-            ivf_lens_vec.push(0);
-            continue;
-        }
-        let segment = pids_compacted.narrow(0, offset, size);
-        let (unique_pids, _, _) = segment.unique_dim(0, true, false, false);
-        ivf_lens_vec.push(unique_pids.size()[0]);
-        let pids_vec: Vec<i64> = unique_pids
-            .to_device(Device::Cpu)
-            .try_into()?;
-        all_unique_pids.extend(&pids_vec);
-        ivf_list.push(unique_pids);
-        offset += size;
-    }
-
-    let ivf = if ivf_list.is_empty() {
-        Tensor::zeros(&[0], (Kind::Int64, device))
-    } else {
-        Tensor::cat(&ivf_list, 0)
-    };
-    let ivf_lens = Tensor::from_slice(&ivf_lens_vec)
-        .to_device(device)
-        .to_kind(Kind::Int64);
-
-    ivf.to_device(Device::Cpu)
-        .write_npy(index_path.join("ivf.npy"))?;
-    ivf_lens
-        .to_device(Device::Cpu)
-        .write_npy(index_path.join("ivf_lengths.npy"))?;
-
-    Ok(all_unique_pids.len())
+/// Count the number of unique passage IDs in a compacted PID tensor.
+fn count_unique_pids(pids: &Tensor) -> Result<usize> {
+    let pids_vec: Vec<i64> = pids.to_device(Device::Cpu).to_kind(Kind::Int64).try_into()?;
+    let unique: HashSet<i64> = pids_vec.into_iter().collect();
+    Ok(unique.len())
 }
 
 /// Compact all chunks into the compacted layout, excluding tombstoned passage IDs.
@@ -210,8 +170,6 @@ pub fn compact_index(
     offsets_tensor
         .to_device(Device::Cpu)
         .write_npy(index_path.join("offsets.compacted.npy"))?;
-
-    let _num_unique = build_ivf_from_compacted(&compacted_pids, &centroid_counts, index_path, device)?;
 
     Ok(CompactStats {
         total_embeddings: total_filtered,
@@ -419,9 +377,7 @@ pub fn merge_compacted_incremental(
         .to_device(Device::Cpu)
         .write_npy(index_path.join("offsets.compacted.npy"))?;
 
-    // Rebuild IVF from compacted passage IDs
-    let num_active_passages =
-        build_ivf_from_compacted(&new_pids.to_device(device), &new_sizes, index_path, device)?;
+    let num_active_passages = count_unique_pids(&new_pids)?;
 
     Ok(CompactStats {
         total_embeddings: new_total,
@@ -558,8 +514,7 @@ pub fn remove_and_merge_compacted(
         .to_device(Device::Cpu)
         .write_npy(index_path.join("offsets.compacted.npy"))?;
 
-    let num_active_passages =
-        build_ivf_from_compacted(&new_pids.to_device(device), &new_sizes, index_path, device)?;
+    let num_active_passages = count_unique_pids(&new_pids)?;
 
     Ok(CompactStats {
         total_embeddings: new_total,
