@@ -35,6 +35,6 @@ jobs:
 
       - name: Install deps and run tests
         run: |
-          uv pip install --no-cache-dir "torch==2.9.0" pytest pytest-cov maturin numpy setuptools
-          uv pip install --no-cache-dir --no-build-isolation -e .
+          uv pip install "torch==2.9.0" pytest pytest-cov maturin numpy setuptools
+          uv pip install --no-build-isolation -e .
           make test
