@@ -538,6 +538,9 @@ class XTRWarp:
         device = self._resolve_device(None)
         torch_path = self._ensure_torch_initialized(device)
         embeddings = self._prepare_embeddings(embeddings_source)
+        was_loaded = self._loaded_searchers is not None
+        if was_loaded:
+            self.free()
         result = xtr_warp_rs.add(
             index=self.index,
             torch_path=torch_path,
@@ -553,11 +556,10 @@ class XTRWarp:
             device=device,
         )
 
-        if reload:
-            self._reload_if_loaded()
+        if reload and was_loaded:
+            self._metadata = None
+            self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
         else:
-            if self._loaded_searchers:
-                self.free()
             self._metadata = None
         return new_ids
 
@@ -582,6 +584,9 @@ class XTRWarp:
         device = self._resolve_device(None)
         torch_path = self._ensure_torch_initialized(device)
         embeddings = self._prepare_embeddings(embeddings_source)
+        was_loaded = self._loaded_searchers is not None
+        if was_loaded:
+            self.free()
         xtr_warp_rs.update(
             index=self.index,
             torch_path=torch_path,
@@ -589,11 +594,10 @@ class XTRWarp:
             passage_ids=passage_ids,
             embeddings=embeddings,
         )
-        if reload:
-            self._reload_if_loaded()
+        if reload and was_loaded:
+            self._metadata = None
+            self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
         else:
-            if self._loaded_searchers:
-                self.free()
             self._metadata = None
         return self
 
@@ -612,16 +616,18 @@ class XTRWarp:
         """
         device = self._resolve_device(None)
         torch_path = self._ensure_torch_initialized(device)
+        was_loaded = self._loaded_searchers is not None
+        if was_loaded:
+            self.free()
         xtr_warp_rs.compact(
             index=self.index,
             torch_path=torch_path,
             device=device,
         )
-        if reload:
-            self._reload_if_loaded()
+        if reload and was_loaded:
+            self._metadata = None
+            self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
         else:
-            if self._loaded_searchers:
-                self.free()
             self._metadata = None
         return self
 
