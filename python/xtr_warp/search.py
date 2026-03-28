@@ -517,6 +517,9 @@ class XTRWarp:
         self,
         embeddings_source: list[torch.Tensor] | torch.Tensor | str | Path,
         reload: bool = True,
+        min_outliers: int = 50,
+        max_growth_rate: float = 0.1,
+        max_points_per_centroid: int = 256,
     ) -> list[int]:
         """Add new passages. Encodes new documents and recompacts the index.
 
@@ -529,6 +532,13 @@ class XTRWarp:
             free and re-load so searches reflect the new data.
             Set to False when batching several mutations before a
             manual ``load()`` call.
+        min_outliers:
+            Minimum number of outliers to cause centroid expansion
+        max_growth_rate:
+            Ratio of the maximum number of centroids relative to the index
+            size that will be added
+        max_points_per_centroid:
+            The number of points per centroid to use
 
         Returns:
         -------
@@ -554,6 +564,9 @@ class XTRWarp:
             residual_norms=result["residual_norms"],
             embeddings_source=embeddings_source,
             device=device,
+            min_outliers=min_outliers,
+            max_growth_rate=max_growth_rate,
+            max_points_per_centroid=max_points_per_centroid,
         )
 
         if reload and was_loaded:
