@@ -569,6 +569,9 @@ class XTRWarp:
             max_points_per_centroid=max_points_per_centroid,
         )
 
+        # Recalibrate the outlier threshold so it reflects the proper data distribution
+        self._recalibrate_threshold(result["residual_norms"])
+
         if reload and was_loaded:
             self._metadata = None
             self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
@@ -721,6 +724,36 @@ class XTRWarp:
             new_centroids=new_centroids,
         )
         self._metadata = None
+
+    def _recalibrate_threshold(self, residual_norms: list[float]) -> None:
+        """Update cluster_threshold.npy using a weighted average.
+
+        We blend the old threshold (weighted by pre-existing embedding count)
+        with the 75th-percentile of the new norms (weighted by the new
+        embedding count).
+        """
+        threshold_path = os.path.join(self.index, "cluster_threshold.npy")
+        if not os.path.exists(threshold_path) or not residual_norms:
+            return
+
+        old_threshold = float(np.load(threshold_path).item())
+        new_norms = np.array(residual_norms, dtype=np.float32)
+        new_count = len(new_norms)
+        new_threshold = float(np.percentile(new_norms, 75))
+
+        # metadata on disk already includes the just-added embeddings
+        meta = self._load_metadata()
+        total = meta.get("num_embeddings", new_count) if meta else new_count
+        old_count = max(0, total - new_count)
+
+        if old_count + new_count > 0:
+            updated = (old_threshold * old_count + new_threshold * new_count) / (
+                old_count + new_count
+            )
+        else:
+            updated = new_threshold
+
+        np.save(threshold_path, np.float32(updated))
 
     def _resolve_device(self, device: str | None) -> str:
         """Return *device* if given, otherwise fall back to ``self.device``."""
