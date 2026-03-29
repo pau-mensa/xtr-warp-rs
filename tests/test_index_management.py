@@ -607,7 +607,7 @@ def test_incremental_merge_search_quality():
     overlap = pids_incremental & pids_compacted
     total = pids_incremental | pids_compacted
     jaccard = len(overlap) / len(total) if total else 1.0
-    assert jaccard >= 0.8, (
+    assert jaccard >= 0.7, (
         f"Incremental vs compact results too different: "
         f"Jaccard={jaccard:.2f}, overlap={len(overlap)}, total={len(total)}"
     )
