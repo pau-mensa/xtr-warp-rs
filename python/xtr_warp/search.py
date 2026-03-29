@@ -217,15 +217,28 @@ def compute_kmeans(  # noqa: PLR0913
     if not tensors.is_contiguous():
         tensors = tensors.contiguous()
 
+    # Ensure enough points per centroid to avoid empty clusters during
+    # k-means.  The partition formula (lines 207-210) can overshoot for
+    # small token counts (e.g. K=4096 for 121k tokens ≈ 30 pts/centroid),
+    # which leads to empty clusters → NaN centroids → CUDA assertion.
+    num_partitions = max(1, min(num_partitions, total_tokens // 100))
+
+    # GPU k-means in FastKMeans can crash when centroids outnumber the data
+    # they represent: empty clusters → NaN centroids → undefined GPU argmax →
+    # CUDA assertion inside the k-means iteration itself.  For small token
+    # counts (< 500k) CPU k-means is sub-second and immune to this (CPU
+    # argmax handles NaN deterministically).  Large datasets stay on GPU.
+    use_gpu = (device != "cpu") and total_tokens >= 500_000
+
     kmeans = FastKMeans(
         d=dim,
         k=min(num_partitions, total_tokens),
         niter=kmeans_niters,
-        gpu=device != "cpu",
+        gpu=use_gpu,
         verbose=False,
         seed=seed,
         max_points_per_centroid=max_points_per_centroid,
-        use_triton=use_triton_kmeans,
+        use_triton=use_triton_kmeans if use_gpu else False,
     )
 
     kmeans.train(data=tensors.numpy())
@@ -236,6 +249,21 @@ def compute_kmeans(  # noqa: PLR0913
         device=device,
         dtype=torch.float32,
     )
+
+    # Drop empty centroids before normalization to prevent NaN propagation
+    # Empty clusters produce zero vectors; normalizing them yields NaN,
+    # which causes undefined argmax behavior downstream in
+    # compress_into_codes and an eventual CUDA assertion failure.
+    norms = centroids.norm(dim=-1)
+    valid = norms > 1e-8
+    if not valid.all():
+        dropped = int((~valid).sum().item())
+        logger.warning(
+            "Dropped %d empty centroids out of %d (too few points per centroid)",
+            dropped,
+            centroids.shape[0],
+        )
+        centroids = centroids[valid]
 
     return torch.nn.functional.normalize(
         input=centroids,
