@@ -41,24 +41,21 @@ pub struct WARPScorer {
 
 impl WARPScorer {
     pub fn new(index: &Arc<ReadOnlyIndex>, config: SearchConfig) -> Result<Self> {
-        // Initialize centroid selector from phase 1
         let device = parse_device(&config.device)?;
         let batch_size = config.batch_size;
         let centroid_selector = CentroidSelector::new(
             &config,
-            index.metadata.num_embeddings,
+            index.metadata.num_embeddings as usize,
             index.metadata.num_centroids,
         );
         let dtype = parse_dtype(&config.dtype)?;
 
-        // Build a dedicated rayon pool to reuse across all parallel sections
         let num_threads = config
             .num_threads
             .unwrap_or_else(rayon::current_num_threads)
             .max(1);
         let thread_pool = Arc::new(ThreadPoolBuilder::new().num_threads(num_threads).build()?);
 
-        // Initialize decompressor from phase 1
         let decompressor = CentroidDecompressor::new(
             index.metadata.nbits,
             index.metadata.dim,
@@ -67,7 +64,6 @@ impl WARPScorer {
             Arc::clone(&thread_pool),
         )?;
 
-        // Initialize merger
         let max_candidates = config.max_candidates.unwrap_or(256);
         let merger_config = MergerConfig {
             max_candidates: max_candidates,
@@ -123,8 +119,8 @@ impl WARPScorer {
         )?;
 
         Ok(SearchResult {
-            passage_ids: pids[..k.min(pids.len())].to_vec(),
-            scores: scores[..k.min(scores.len())].to_vec(),
+            passage_ids: pids,
+            scores,
             query_id: query_idx + 1,
         })
     }
@@ -190,8 +186,8 @@ impl WARPScorer {
                         )?;
 
                         Ok(SearchResult {
-                            passage_ids: pids[..k.min(pids.len())].to_vec(),
-                            scores: scores[..k.min(scores.len())].to_vec(),
+                            passage_ids: pids,
+                            scores,
                             query_id: idx + 1,
                         })
                     })

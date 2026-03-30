@@ -26,15 +26,12 @@ pub struct Searcher {
 impl Searcher {
     /// Create a new searcher with loaded index
     pub fn new(index: &Arc<ReadOnlyIndex>, config: &SearchConfig) -> Result<Self> {
-        // Initialize the WARP scorer which integrates all phase 1 components
         let scorer = WARPScorer::new(index, config.clone())?;
-
         Ok(Self { scorer })
     }
 
     /// Search for top-k passages given a query
     pub fn search(&self, query: Query) -> Result<Vec<SearchResult>> {
-        // Use the WARPScorer which handles the entire batch
         self.scorer.rank(&query)
     }
 }

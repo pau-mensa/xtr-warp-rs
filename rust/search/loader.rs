@@ -1,8 +1,6 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
 use memmap2::Mmap;
 use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
@@ -171,7 +169,7 @@ impl IndexLoader {
             index_path.join("residuals.compacted.npy")
         };
 
-        let (codes_compacted, residuals_compacted, mmap_handles) = if self.use_mmap {
+        let (pids_compacted, residuals_compacted, mmap_handles) = if self.use_mmap {
             anyhow::ensure!(
                 self.device == Device::Cpu,
                 "mmap is only supported on CPU"
@@ -200,7 +198,7 @@ impl IndexLoader {
             "Sum of sizes must equal number of embeddings"
         );
         assert_eq!(
-            codes_compacted.size()[0],
+            pids_compacted.size()[0],
             num_embeddings,
             "Codes must have same length as residuals"
         );
@@ -212,28 +210,13 @@ impl IndexLoader {
         let kdummy_centroid = self.find_kdummy_centroid(&sizes_compacted)?;
 
         // Get metadata
-        let dim = centroids
-            .size()
-            .get(1)
-            .copied()
-            .ok_or_else(|| anyhow!("Centroids tensor must be 2D"))? as usize;
-        let metadata_fallback = IndexMetadata {
-            num_passages: 0,
-            num_embeddings: num_embeddings as usize,
-            num_centroids: num_centroids as usize,
-            dim,
-            nbits: 2,
-            created_at: Utc::now().to_rfc3339(),
-            index_version: "xtr-warp-1.0".to_string(),
-        };
-
-        let metadata = self.load_metadata(index_path, metadata_fallback)?;
+        let metadata = IndexMetadata::load(index_path)?;
 
         Ok(LoadedIndex {
             centroids,
             bucket_weights,
             sizes_compacted,
-            codes_compacted,
+            pids_compacted,
             residuals_compacted,
             offsets_compacted,
             kdummy_centroid,
@@ -297,41 +280,4 @@ impl IndexLoader {
         Ok(kdummy_idx as CentroidId)
     }
 
-    fn load_metadata(&self, index_path: &Path, fallback: IndexMetadata) -> Result<IndexMetadata> {
-        let metadata_path = index_path.join("metadata.json");
-        if !metadata_path.exists() {
-            return Ok(fallback);
-        }
-
-        #[derive(Debug, Default, serde::Deserialize)]
-        struct DiskMetadata {
-            num_passages: Option<usize>,
-            num_embeddings: Option<usize>,
-            num_centroids: Option<usize>,
-            dim: Option<usize>,
-            nbits: Option<u8>,
-            created_at: Option<String>,
-            index_version: Option<String>,
-        }
-
-        let file = File::open(&metadata_path)
-            .with_context(|| format!("Failed to open {:?}", metadata_path))?;
-        let reader = BufReader::new(file);
-        let disk: DiskMetadata = serde_json::from_reader(reader)
-            .with_context(|| format!("Failed to parse {:?}", metadata_path))?;
-
-        Ok(IndexMetadata {
-            num_passages: disk.num_passages.unwrap_or(fallback.num_passages),
-            num_embeddings: disk.num_embeddings.unwrap_or(fallback.num_embeddings),
-            num_centroids: disk.num_centroids.unwrap_or(fallback.num_centroids),
-            dim: disk.dim.unwrap_or(fallback.dim),
-            nbits: disk.nbits.unwrap_or(fallback.nbits),
-            created_at: disk
-                .created_at
-                .unwrap_or_else(|| fallback.created_at.clone()),
-            index_version: disk
-                .index_version
-                .unwrap_or_else(|| fallback.index_version.clone()),
-        })
-    }
 }

@@ -187,16 +187,44 @@ pub struct IndexPlan {
     pub nbits: u8,
 }
 
-/// Index metadata stored alongside the index
+/// Canonical on-disk + in-memory representation of `metadata.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMetadata {
+    pub num_chunks: usize,
+    pub nbits: u8,
+    pub num_partitions: i64,
+    pub num_embeddings: i64,
+    pub avg_doclen: f64,
     pub num_passages: usize,
-    pub num_embeddings: usize,
+    /// Watermark for the next passage ID to assign.
+    pub next_passage_id: i64,
     pub num_centroids: usize,
     pub dim: usize,
-    pub nbits: u8,
     pub created_at: String,
-    pub index_version: String,
+}
+
+impl IndexMetadata {
+    /// Load metadata from `metadata.json` in the given index directory.
+    pub fn load(index_path: &std::path::Path) -> anyhow::Result<Self> {
+        let path = index_path.join("metadata.json");
+        let file = std::fs::File::open(&path)
+            .map_err(|e| anyhow::anyhow!("Failed to open {}: {}", path.display(), e))?;
+        let meta: IndexMetadata = serde_json::from_reader(std::io::BufReader::new(file))
+            .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))?;
+        Ok(meta)
+    }
+
+    /// Persist metadata to `metadata.json` atomically (write tmp, rename).
+    pub fn save(&self, index_path: &std::path::Path) -> anyhow::Result<()> {
+        let path = index_path.join("metadata.json");
+        let tmp_path = index_path.join("metadata.json.tmp");
+        let file = std::fs::File::create(&tmp_path)
+            .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", tmp_path.display(), e))?;
+        serde_json::to_writer_pretty(std::io::BufWriter::new(file), self)?;
+        std::fs::rename(&tmp_path, &path)
+            .map_err(|e| anyhow::anyhow!("Failed to rename {} -> {}: {}", tmp_path.display(), path.display(), e))?;
+        Ok(())
+    }
 }
 
 /// Components of a loaded index
@@ -210,8 +238,8 @@ pub struct LoadedIndex {
     /// Compacted sizes per centroid
     pub sizes_compacted: Tensor,
 
-    /// Compacted codes for embeddings
-    pub codes_compacted: Tensor,
+    /// Per-embedding passage IDs in compacted (centroid-sorted) layout
+    pub pids_compacted: Tensor,
 
     /// Compacted residuals (compressed)
     pub residuals_compacted: Tensor,
@@ -236,7 +264,7 @@ impl Clone for LoadedIndex {
             centroids: self.centroids.shallow_clone(),
             bucket_weights: self.bucket_weights.shallow_clone(),
             sizes_compacted: self.sizes_compacted.shallow_clone(),
-            codes_compacted: self.codes_compacted.shallow_clone(),
+            pids_compacted: self.pids_compacted.shallow_clone(),
             residuals_compacted: self.residuals_compacted.shallow_clone(),
             offsets_compacted: self.offsets_compacted.shallow_clone(),
             kdummy_centroid: self.kdummy_centroid,
@@ -347,6 +375,21 @@ impl TPrimePolicy {
             },
         }
     }
+}
+
+/// Stats from index compaction
+pub struct CompactStats {
+    pub total_embeddings: i64,
+    pub num_active_passages: usize,
+}
+
+/// Result from adding documents to an index
+pub struct AddResult {
+    pub new_passage_ids: Vec<i64>,
+    /// Per-embedding residual norms (for centroid expansion outlier detection).
+    pub residual_norms: Vec<f32>,
+    /// Embedding dimension.
+    pub embedding_dim: usize,
 }
 
 /// Parses a string identifier into a `tch::Device`.

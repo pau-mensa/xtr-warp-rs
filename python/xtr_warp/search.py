@@ -17,8 +17,6 @@ from fastkmeans import FastKMeans
 
 from . import xtr_warp_rs
 
-# from ..filtering import create, delete, update
-#
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -164,32 +162,52 @@ def _create_source(embeddings_source: list[torch.Tensor] | Path) -> EmbeddingSou
 
 
 def compute_kmeans(  # noqa: PLR0913
-    embeddings_source: list[torch.Tensor] | Path,
+    embeddings_source: list[torch.Tensor] | torch.Tensor | Path,
     device: str,
     kmeans_niters: int,
     max_points_per_centroid: int,
     seed: int,
     n_samples_kmeans: int | None = None,
     use_triton_kmeans: bool | None = None,
+    num_partitions_override: int | None = None,
 ) -> tuple[torch.Tensor, int]:
-    """Compute K-means centroids for document embeddings."""
-    source = _create_source(embeddings_source)
-    num_passages = source.get_num_passages()
+    """Compute K-means centroids for document embeddings.
 
-    if n_samples_kmeans is None:
-        n_samples_kmeans = min(
-            1 + int(16 * math.sqrt(120 * num_passages)),
-            num_passages,
+    When ``num_partitions_override`` is set, the K for K-means is forced to
+    that value (used by centroid expansion).  When a raw ``torch.Tensor`` is
+    passed as *embeddings_source*, it is treated as a flat [N, dim] tensor of
+    pre-sampled embeddings (no sampling step).
+    """
+    # Fast path: raw tensor (used by centroid expansion)
+    if isinstance(embeddings_source, torch.Tensor) and embeddings_source.dim() == 2:
+        tensors = embeddings_source
+        total_tokens = tensors.shape[0]
+        dim = tensors.shape[1]
+        num_partitions = num_partitions_override or max(
+            1, total_tokens // max_points_per_centroid
         )
+    else:
+        source = _create_source(embeddings_source)
+        num_passages = source.get_num_passages()
 
-    # Sample passages
-    rng = random.Random(seed)
-    sampled_pids = rng.sample(range(num_passages), k=n_samples_kmeans)
+        if n_samples_kmeans is None:
+            n_samples_kmeans = min(
+                1 + int(16 * math.sqrt(120 * num_passages)),
+                num_passages,
+            )
 
-    tensors, total_tokens, dim = source.sample_embeddings(sampled_pids)
+        rng = random.Random(seed)
+        sampled_pids = rng.sample(range(num_passages), k=n_samples_kmeans)
 
-    num_partitions = (total_tokens / n_samples_kmeans) * num_passages
-    num_partitions = int(2 ** math.floor(math.log2(16 * math.sqrt(num_partitions))))
+        tensors, total_tokens, dim = source.sample_embeddings(sampled_pids)
+
+        if num_partitions_override is not None:
+            num_partitions = num_partitions_override
+        else:
+            num_partitions = (total_tokens / n_samples_kmeans) * num_passages
+            num_partitions = int(
+                2 ** math.floor(math.log2(16 * math.sqrt(num_partitions)))
+            )
 
     # I don't want any surprises here
     if tensors.is_cuda:
@@ -199,15 +217,28 @@ def compute_kmeans(  # noqa: PLR0913
     if not tensors.is_contiguous():
         tensors = tensors.contiguous()
 
+    # Ensure enough points per centroid to avoid empty clusters during
+    # k-means.  The partition formula (lines 207-210) can overshoot for
+    # small token counts (e.g. K=4096 for 121k tokens ≈ 30 pts/centroid),
+    # which leads to empty clusters → NaN centroids → CUDA assertion.
+    num_partitions = max(1, min(num_partitions, total_tokens // 100))
+
+    # GPU k-means in FastKMeans can crash when centroids outnumber the data
+    # they represent: empty clusters → NaN centroids → undefined GPU argmax →
+    # CUDA assertion inside the k-means iteration itself.  For small token
+    # counts (< 500k) CPU k-means is sub-second and immune to this (CPU
+    # argmax handles NaN deterministically).  Large datasets stay on GPU.
+    use_gpu = (device != "cpu") and total_tokens >= 500_000
+
     kmeans = FastKMeans(
         d=dim,
         k=min(num_partitions, total_tokens),
         niter=kmeans_niters,
-        gpu=device != "cpu",
+        gpu=use_gpu,
         verbose=False,
         seed=seed,
         max_points_per_centroid=max_points_per_centroid,
-        use_triton=use_triton_kmeans,
+        use_triton=use_triton_kmeans if use_gpu else False,
     )
 
     kmeans.train(data=tensors.numpy())
@@ -218,6 +249,21 @@ def compute_kmeans(  # noqa: PLR0913
         device=device,
         dtype=torch.float32,
     )
+
+    # Drop empty centroids before normalization to prevent NaN propagation
+    # Empty clusters produce zero vectors; normalizing them yields NaN,
+    # which causes undefined argmax behavior downstream in
+    # compress_into_codes and an eventual CUDA assertion failure.
+    norms = centroids.norm(dim=-1)
+    valid = norms > 1e-8
+    if not valid.all():
+        dropped = int((~valid).sum().item())
+        logger.warning(
+            "Dropped %d empty centroids out of %d (too few points per centroid)",
+            dropped,
+            centroids.shape[0],
+        )
+        centroids = centroids[valid]
 
     return torch.nn.functional.normalize(
         input=centroids,
@@ -297,6 +343,7 @@ class XTRWarp:
     def __init__(
         self,
         index: str,
+        device: str | None = None,
     ) -> None:
         self._loaded_searchers: list | None = None
         self.index: str = index
@@ -304,7 +351,8 @@ class XTRWarp:
         self.dtype: torch.dtype | None = None
         self._torch_initialized = {}
         self._metadata: dict | None = None
-        self.device: str | None = None
+        self.device: str | None = device
+        self._mmap: bool = True
 
     def _ensure_torch_initialized(self, device: str) -> str:
         """Initialize torch once per device type."""
@@ -321,6 +369,14 @@ class XTRWarp:
             for searcher in self._loaded_searchers:
                 searcher.free()
             self._loaded_searchers = None
+
+    def _reload_if_loaded(self) -> None:
+        """Free and re-load the index using the same parameters as the last ``load()`` call."""
+        if self._loaded_searchers is None or self.devices is None:
+            return
+        self.free()
+        self._metadata = None
+        self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
 
     def __del__(self):
         """Destructor."""
@@ -367,6 +423,7 @@ class XTRWarp:
             set to True if the device is not "cpu".
 
         """
+        self.device = device
         torch_path = self._ensure_torch_initialized(device)
 
         embeddings_path = None
@@ -439,6 +496,314 @@ class XTRWarp:
             except OSError as e:
                 raise e
 
+    def delete(
+        self,
+        passage_ids: list[int],
+        compact_threshold: float | None = 0.2,
+    ) -> "XTRWarp":
+        """Delete passages by ID. O(1) tombstone operation.
+
+        Search automatically filters deleted passages. To physically
+        remove deleted data, call ``compact()`` afterward, or set
+        ``compact_threshold`` to trigger compaction when the tombstone
+        ratio exceeds the ratio.
+
+        Args:
+        ----
+        passage_ids:
+            List of passage IDs to mark as deleted.
+        compact_threshold:
+            Fraction of deleted passages that triggers auto-compaction
+            (default 0.2 = 20%). If set to None the compaction does not run
+
+        """
+        xtr_warp_rs.delete(self.index, passage_ids)
+        if self._loaded_searchers:
+            for s in self._loaded_searchers:
+                s.update_tombstones(passage_ids)
+
+        if compact_threshold is not None:
+            meta = self._load_metadata()
+            if meta and meta.get("num_passages", 0) > 0:
+                deleted_path = os.path.join(self.index, "deleted_pids.npy")
+                num_deleted = (
+                    len(np.load(deleted_path)) if os.path.exists(deleted_path) else 0
+                )
+                total = meta["num_passages"] + num_deleted
+                ratio = num_deleted / total if total > 0 else 0.0
+                if ratio >= compact_threshold:
+                    logger.warning(
+                        "Tombstone ratio %.1f%% >= %.0f%% threshold, running auto-compaction",
+                        ratio * 100,
+                        compact_threshold * 100,
+                    )
+                    self.compact()
+
+        return self
+
+    def add(
+        self,
+        embeddings_source: list[torch.Tensor] | torch.Tensor | str | Path,
+        reload: bool = True,
+        min_outliers: int = 50,
+        max_growth_rate: float = 0.1,
+        max_points_per_centroid: int = 256,
+    ) -> list[int]:
+        """Add new passages. Encodes new documents and recompacts the index.
+
+        Args:
+        ----
+        embeddings_source:
+            New document embeddings (same formats as ``create``).
+        reload:
+            If True (default) and the index was loaded, automatically
+            free and re-load so searches reflect the new data.
+            Set to False when batching several mutations before a
+            manual ``load()`` call.
+        min_outliers:
+            Minimum number of outliers to cause centroid expansion
+        max_growth_rate:
+            Ratio of the maximum number of centroids relative to the index
+            size that will be added
+        max_points_per_centroid:
+            The number of points per centroid to use
+
+        Returns:
+        -------
+        List of newly assigned passage IDs.
+
+        """
+        device = self._resolve_device(None)
+        torch_path = self._ensure_torch_initialized(device)
+        embeddings = self._prepare_embeddings(embeddings_source)
+        was_loaded = self._loaded_searchers is not None
+        if was_loaded:
+            self.free()
+        result = xtr_warp_rs.add(
+            index=self.index,
+            torch_path=torch_path,
+            device=device,
+            embeddings=embeddings,
+        )
+        new_ids = result["new_passage_ids"]
+
+        # Centroid expansion: detect outliers and grow the codebook
+        self._maybe_expand_centroids(
+            residual_norms=result["residual_norms"],
+            embeddings_source=embeddings_source,
+            device=device,
+            min_outliers=min_outliers,
+            max_growth_rate=max_growth_rate,
+            max_points_per_centroid=max_points_per_centroid,
+        )
+
+        # Recalibrate the outlier threshold so it reflects the proper data distribution
+        self._recalibrate_threshold(result["residual_norms"])
+
+        if reload and was_loaded:
+            self._metadata = None
+            self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
+        else:
+            self._metadata = None
+        return new_ids
+
+    def update(
+        self,
+        passage_ids: list[int],
+        embeddings_source: list[torch.Tensor] | torch.Tensor | str | Path,
+        reload: bool = True,
+    ) -> "XTRWarp":
+        """Update passages in-place: new embeddings, same IDs.
+
+        Args:
+        ----
+        passage_ids:
+            IDs of passages to update.
+        embeddings_source:
+            Replacement embeddings (one per passage ID).
+        reload:
+            If True (default), automatically re-load after mutation.
+
+        """
+        device = self._resolve_device(None)
+        torch_path = self._ensure_torch_initialized(device)
+        embeddings = self._prepare_embeddings(embeddings_source)
+        was_loaded = self._loaded_searchers is not None
+        if was_loaded:
+            self.free()
+        xtr_warp_rs.update(
+            index=self.index,
+            torch_path=torch_path,
+            device=device,
+            passage_ids=passage_ids,
+            embeddings=embeddings,
+        )
+        if reload and was_loaded:
+            self._metadata = None
+            self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
+        else:
+            self._metadata = None
+        return self
+
+    def compact(self, reload: bool = True) -> "XTRWarp":
+        """Rebuild index excluding deleted passages.
+
+        Use after ``delete()`` to physically reclaim space.
+
+        Args:
+        ----
+        device:
+            Compute device. Defaults to the device set at init or load time.
+        reload:
+            If True (default), automatically re-load after mutation.
+
+        """
+        device = self._resolve_device(None)
+        torch_path = self._ensure_torch_initialized(device)
+        was_loaded = self._loaded_searchers is not None
+        if was_loaded:
+            self.free()
+        xtr_warp_rs.compact(
+            index=self.index,
+            torch_path=torch_path,
+            device=device,
+        )
+        if reload and was_loaded:
+            self._metadata = None
+            self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
+        else:
+            self._metadata = None
+        return self
+
+    def _maybe_expand_centroids(
+        self,
+        residual_norms: list[float],
+        embeddings_source: list[torch.Tensor] | torch.Tensor | str | Path,
+        device: str,
+        min_outliers: int = 50,
+        max_growth_rate: float = 0.1,
+        max_points_per_centroid: int = 256,
+    ) -> None:
+        """Expand the centroid codebook if many new embeddings are outliers.
+
+        An outlier is an embedding whose residual norm (distance to its
+        nearest centroid) exceeds the cluster threshold stored at index
+        creation time.
+        """
+        threshold_path = os.path.join(self.index, "cluster_threshold.npy")
+        if not os.path.exists(threshold_path) or not residual_norms:
+            return
+
+        threshold = float(np.load(threshold_path).item())
+        norms = np.array(residual_norms, dtype=np.float32)
+        outlier_mask = norms > threshold
+        outlier_count = int(outlier_mask.sum())
+
+        if outlier_count < min_outliers:
+            return
+
+        # Collect outlier embeddings from the source
+        if isinstance(embeddings_source, (str, Path)):
+            logger.warning(
+                "Centroid expansion with disk-based embeddings not yet supported, skipping."
+            )
+            return
+
+        if isinstance(embeddings_source, torch.Tensor):
+            all_embs = [embeddings_source[i] for i in range(embeddings_source.shape[0])]
+        else:
+            all_embs = embeddings_source
+
+        # Flatten all embeddings and select outliers
+        flat_embs = torch.cat(
+            [e.squeeze(0) if e.dim() == 3 else e for e in all_embs], dim=0
+        )
+        outlier_embs = flat_embs[torch.from_numpy(outlier_mask)]
+
+        # Determine K for new centroids
+        meta = self._load_metadata()
+        current_centroids = meta.get("num_centroids", 1) if meta else 1
+        target_k = math.ceil(outlier_count / max_points_per_centroid)
+        max_new = max(1, int(current_centroids * max_growth_rate))
+        k_new = max(1, min(target_k, max_new))
+
+        if k_new < 1 or outlier_embs.shape[0] < k_new:
+            return
+
+        logger.info(
+            "Centroid expansion: %d outliers detected, adding %d centroids",
+            outlier_count,
+            k_new,
+        )
+
+        # Run K-means on outlier embeddings
+        new_centroids, _ = compute_kmeans(
+            embeddings_source=outlier_embs,
+            device=device,
+            kmeans_niters=4,
+            max_points_per_centroid=max_points_per_centroid,
+            seed=42,
+            num_partitions_override=k_new,
+        )
+
+        # Append to codebook via Rust
+        xtr_warp_rs.append_centroids_py(
+            index=self.index,
+            new_centroids=new_centroids,
+        )
+        self._metadata = None
+
+    def _recalibrate_threshold(self, residual_norms: list[float]) -> None:
+        """Update cluster_threshold.npy using a weighted average.
+
+        We blend the old threshold (weighted by pre-existing embedding count)
+        with the 75th-percentile of the new norms (weighted by the new
+        embedding count).
+        """
+        threshold_path = os.path.join(self.index, "cluster_threshold.npy")
+        if not os.path.exists(threshold_path) or not residual_norms:
+            return
+
+        old_threshold = float(np.load(threshold_path).item())
+        new_norms = np.array(residual_norms, dtype=np.float32)
+        new_count = len(new_norms)
+        new_threshold = float(np.percentile(new_norms, 75))
+
+        # metadata on disk already includes the just-added embeddings
+        meta = self._load_metadata()
+        total = meta.get("num_embeddings", new_count) if meta else new_count
+        old_count = max(0, total - new_count)
+
+        if old_count + new_count > 0:
+            updated = (old_threshold * old_count + new_threshold * new_count) / (
+                old_count + new_count
+            )
+        else:
+            updated = new_threshold
+
+        np.save(threshold_path, np.float32(updated))
+
+    def _resolve_device(self, device: str | None) -> str:
+        """Return *device* if given, otherwise fall back to ``self.device``."""
+        if device is not None:
+            return device
+        if self.device is not None:
+            return self.device
+        raise ValueError(
+            "No device specified. Pass device= or set it via __init__/load()."
+        )
+
+    def _prepare_embeddings(
+        self,
+        embeddings_source: list[torch.Tensor] | torch.Tensor | str | Path,
+    ) -> list[torch.Tensor] | str:
+        """Normalise embeddings_source into the format expected by Rust."""
+        if isinstance(embeddings_source, torch.Tensor):
+            return [embeddings_source[i] for i in range(embeddings_source.shape[0])]
+        if isinstance(embeddings_source, list):
+            return [e.squeeze(0) if e.dim() == 3 else e for e in embeddings_source]
+        return str(embeddings_source)
+
     def _load_metadata(self) -> dict | None:
         """Load index metadata from disk if available."""
         if self._metadata is not None:
@@ -506,12 +871,16 @@ class XTRWarp:
         else:
             self.devices = devices
 
+        # Store the primary device so mutation methods can default to it
+        self.device = self.devices[0]
+
         if mmap and any(d != "cpu" for d in self.devices):
             logger.warning(
                 "mmap=True is only supported when device='cpu', disabling it"
             )
             mmap = False
 
+        self._mmap = mmap
         self._loaded_searchers = []
         for d in self.devices:
             _ = self._ensure_torch_initialized(d)

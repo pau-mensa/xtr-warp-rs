@@ -269,8 +269,6 @@ impl CentroidDecompressor {
         let num_cells = capacities_i64.size()[0];
         let total_capacity = capacities_i64.sum(Kind::Int64).int64_value(&[]).max(0);
 
-        // Sizes are used to define per-cell ranges for downstream merge logic.
-        // We keep the contract by returning sizes == capacities (no per-cell dedup here).
         let sizes = capacities_i64.to_kind(Kind::Int);
 
         let end_offsets = capacities_i64.cumsum(0, Kind::Int64);
@@ -308,7 +306,7 @@ impl CentroidDecompressor {
         let embedding_indices = &candidate_begins + &intra;
 
         let passage_ids = index
-            .codes_compacted
+            .pids_compacted
             .index_select(0, &embedding_indices)
             .to_kind(Kind::Int64);
 
@@ -425,7 +423,7 @@ impl CentroidDecompressor {
 
         // Use narrow for zero-copy views into compacted data, then convert to local Vecs
         let local_pids_raw: Vec<i64> = index
-            .codes_compacted
+            .pids_compacted
             .narrow(0, begin, capacity as i64)
             .try_into()
             .unwrap_or_default();

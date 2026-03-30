@@ -5,6 +5,31 @@ use std::io::BufWriter;
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
+/// Data from a single chunk, used for coalescing during add.
+pub struct ChunkData {
+    pub codes: Tensor,
+    pub residuals: Tensor,
+    pub doclens: Vec<i64>,
+    pub pids: Vec<i64>,
+}
+
+/// Read the lightweight chunk files (codes, residuals, doclens, passage IDs).
+pub fn read_chunk_data(index_path: &Path, chunk_idx: usize) -> Result<ChunkData> {
+    let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?
+        .to_device(tch::Device::Cpu);
+    let residuals = Tensor::read_npy(index_path.join(format!("{}.residuals.npy", chunk_idx)))?
+        .to_device(tch::Device::Cpu);
+    let doclens: Vec<i64> = Tensor::read_npy(index_path.join(format!("doclens.{}.npy", chunk_idx)))?
+        .to_device(tch::Device::Cpu)
+        .to_kind(Kind::Int64)
+        .try_into()?;
+    let pids: Vec<i64> = Tensor::read_npy(index_path.join(format!("{}.passage_ids.npy", chunk_idx)))?
+        .to_device(tch::Device::Cpu)
+        .to_kind(Kind::Int64)
+        .try_into()?;
+    Ok(ChunkData { codes, residuals, doclens, pids })
+}
+
 use crate::index::source::EmbeddingSource;
 use crate::utils::residual_codec::ResidualCodec;
 use crate::utils::types::IndexPlan;
@@ -19,6 +44,8 @@ pub struct EncodeResult {
     pub chunk_stats: Vec<ChunkStats>,
     pub total_embeddings: i64,
     pub global_centroid_counts: Tensor,
+    /// Per-embedding L2 residual norms (only populated when `collect_norms` is true).
+    pub residual_norms: Option<Vec<f32>>,
 }
 
 pub struct ChunkStats {
@@ -34,16 +61,59 @@ pub fn encode_chunks(
     index_path: &Path,
     device: Device,
     embedding_dim: u32,
+    passage_ids: Option<&[i64]>,
+    start_chunk_idx: usize,
 ) -> Result<EncodeResult> {
+    encode_chunks_inner(plan, source, centroids, codec, index_path, device, embedding_dim, passage_ids, start_chunk_idx, false)
+}
+
+/// Like `encode_chunks` but also returns per-embedding residual norms.
+pub fn encode_chunks_with_norms(
+    plan: &IndexPlan,
+    source: &mut dyn EmbeddingSource,
+    centroids: &Tensor,
+    codec: &ResidualCodec,
+    index_path: &Path,
+    device: Device,
+    embedding_dim: u32,
+    passage_ids: Option<&[i64]>,
+    start_chunk_idx: usize,
+) -> Result<EncodeResult> {
+    encode_chunks_inner(plan, source, centroids, codec, index_path, device, embedding_dim, passage_ids, start_chunk_idx, true)
+}
+
+fn encode_chunks_inner(
+    plan: &IndexPlan,
+    source: &mut dyn EmbeddingSource,
+    centroids: &Tensor,
+    codec: &ResidualCodec,
+    index_path: &Path,
+    device: Device,
+    embedding_dim: u32,
+    passage_ids: Option<&[i64]>,
+    start_chunk_idx: usize,
+    collect_norms: bool,
+) -> Result<EncodeResult> {
+    if let Some(pids) = passage_ids {
+        anyhow::ensure!(
+            pids.len() == source.num_docs(),
+            "passage_ids length ({}) must match source num_docs ({})",
+            pids.len(),
+            source.num_docs()
+        );
+    }
+
     let num_centroids = centroids.size()[0] as usize;
     let mut chunk_stats = Vec::with_capacity(plan.num_chunks);
     let mut current_emb_offset: usize = 0;
     let mut total_embeddings: i64 = 0;
     let mut global_counts = Tensor::zeros(&[num_centroids as i64], (Kind::Int64, device));
     let mut passage_offset: usize = 0;
+    let mut all_norms: Vec<f32> = Vec::new();
 
     let chunk_iter = source.chunk_iter(CHUNK_SIZE)?;
-    for (chk_idx, chunk) in chunk_iter.enumerate() {
+    for (local_chk_idx, chunk) in chunk_iter.enumerate() {
+        let chk_idx = start_chunk_idx + local_chk_idx;
         let chunk = chunk?;
         let chk_doclens = chunk.doclens;
         let chk_embs_vec = chunk.embeddings;
@@ -66,6 +136,15 @@ pub fn encode_chunks(
             let recon_centroids = Tensor::cat(&recon_centroids_batches, 0);
 
             let mut res_batch = &emb_batch - &recon_centroids;
+
+            if collect_norms {
+                let norms = res_batch
+                    .to_kind(Kind::Float)
+                    .norm_scalaropt_dim(2, &[1], false)
+                    .to_device(Device::Cpu);
+                let norms_vec: Vec<f32> = norms.try_into()?;
+                all_norms.extend(norms_vec);
+            }
 
             let bucket_cutoffs = codec.bucket_cutoffs.as_ref().unwrap().contiguous();
             res_batch = Tensor::bucketize(&res_batch, &bucket_cutoffs, true, false);
@@ -108,10 +187,14 @@ pub fn encode_chunks(
         let chk_doclens_fpath = index_path.join(format!("doclens.{}.npy", chk_idx));
         Tensor::from_slice(&chk_doclens).write_npy(chk_doclens_fpath)?;
 
-        let chk_doclens_path = index_path.join(format!("doclens.{}.json", chk_idx));
-        let dl_file = File::create(chk_doclens_path)?;
-        let buf_writer = BufWriter::new(dl_file);
-        serde_json::to_writer(buf_writer, &chk_doclens)?;
+        // Write explicit passage IDs for this chunk
+        let chunk_pids: Vec<i64> = if let Some(pids) = passage_ids {
+            pids[passage_offset..passage_offset + chk_doclens.len()].to_vec()
+        } else {
+            (passage_offset as i64..(passage_offset + chk_doclens.len()) as i64).collect()
+        };
+        let chunk_pids_fpath = index_path.join(format!("{}.passage_ids.npy", chk_idx));
+        Tensor::from_slice(&chunk_pids).write_npy(&chunk_pids_fpath)?;
 
         let chk_meta = json!({
             "passage_offset": passage_offset,
@@ -136,6 +219,7 @@ pub fn encode_chunks(
         chunk_stats,
         total_embeddings,
         global_centroid_counts: global_counts,
+        residual_norms: if collect_norms { Some(all_norms) } else { None },
     })
 }
 

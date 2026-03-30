@@ -48,9 +48,9 @@ xtr-warp-rs supports three torch versions:
 
 | xtr-warp-rs Version | PyTorch Version | Installation Command                |
 | ------------------- | --------------- | ----------------------------------- |
-| 0.2.290         | 2.9.0           | `uv pip install xtr-warp-rs==0.2.290` |
-| 0.2.280         | 2.8.0           | `uv pip install xtr-warp-rs==0.2.280` |
-| 0.2.270         | 2.7.0           | `uv pip install xtr-warp-rs==0.2.270` |
+| 1.0.290         | 2.9.0           | `uv pip install xtr-warp-rs==1.0.290` |
+| 1.0.280         | 2.8.0           | `uv pip install xtr-warp-rs==1.0.280` |
+| 1.0.270         | 2.7.0           | `uv pip install xtr-warp-rs==1.0.270` |
 
 ### Build from Source
 
@@ -314,6 +314,105 @@ mmap                      True           Whether or not to load the large tensor
 > [!WARNING]
 > The operator `aten::unique_dim` is not implemented in torch for the `mps` device, so if you want to use it you will need to set up the env var `PYTORCH_ENABLE_MPS_FALLBACK=1`, which fallbacks to the CPU
 
+### Index Mutability
+
+WARP supports incremental index mutations without requiring a full rebuild. Documents can be added, updated, or deleted after the initial `create()` call, and all changes are immediately reflected in search results.
+
+#### How it works
+
+- **Deletions** are O(1) tombstone operations: passage IDs are written to a `deleted_pids.npy` file and filtered out at search time. No data is physically removed until compaction runs.
+- **Additions** encode new embeddings into chunks and incrementally merge them into the existing compacted structures. Only the new chunks are processed — old data is left untouched. Small additions (< 2,000 documents) are coalesced into the last chunk to avoid file fragmentation.
+- **Updates** combine both: the old passage IDs are tombstoned and the replacement embeddings are encoded with the same IDs, so the document identity is preserved.
+- **Compaction** physically removes tombstoned data by rewriting chunks, pruning empty centroids, rebuilding the compacted layout, and recalibrating internal thresholds.
+
+After each `add()`, the engine also checks for *outlier* embeddings (those far from any existing centroid). If enough outliers are found, it runs K-means on them and expands the centroid codebook, keeping cluster quality stable as the distribution shifts. The outlier detection threshold is recalibrated via a weighted average so it adapts to the evolving data.
+
+#### Delete
+
+```python
+xtr_warp.delete(passage_ids=[0, 3, 7])
+```
+
+```python
+Parameter                   Default     Description
+passage_ids                 required    List of passage IDs to mark as deleted
+compact_threshold           0.2         Fraction of deleted passages that triggers auto-compaction. Set to None to disable
+```
+
+When the ratio of tombstoned passages exceeds `compact_threshold`, compaction runs automatically.
+
+#### Add
+
+```python
+new_ids = xtr_warp.add(
+    embeddings_source=[torch.randn(200, 128) for _ in range(10)],
+)
+```
+
+```python
+Parameter                   Default     Description
+embeddings_source           required    New document embeddings (same formats as create)
+reload                      True        Auto-reload index after mutation so searches reflect the new data
+min_outliers                50          Minimum outlier count to trigger centroid expansion
+max_growth_rate             0.1         Maximum ratio of new centroids relative to current codebook size
+max_points_per_centroid     256         Points per centroid for expansion K-means
+```
+
+Returns the list of newly assigned passage IDs.
+
+#### Update
+
+```python
+xtr_warp.update(
+    passage_ids=[0, 1],
+    embeddings_source=[torch.randn(200, 128), torch.randn(150, 128)],
+)
+```
+
+```python
+Parameter                   Default     Description
+passage_ids                 required    IDs of passages to replace
+embeddings_source           required    Replacement embeddings (one per passage ID)
+reload                      True        Auto-reload index after mutation
+```
+
+#### Compact
+
+```python
+xtr_warp.compact()
+```
+
+```python
+Parameter                   Default     Description
+reload                      True        Auto-reload index after compaction
+```
+
+Compaction rewrites all chunks to exclude deleted passages, prunes centroids that no longer have any assigned embeddings, rebuilds the centroid-sorted layout, and recalibrates the cluster threshold and average residual. Use it after a batch of deletions or updates to reclaim disk space and keep the index tight.
+
+#### Typical lifecycle
+
+```python
+idx = XTRWarp(index="my_index")
+
+# 1. Create the initial index
+idx.create(embeddings_source=docs, device="cuda")
+idx.load(device="cpu", dtype=torch.float32)
+
+# 2. Search
+results = idx.search(queries_embeddings=queries, top_k=10)
+
+# 3. Incremental mutations
+new_ids = idx.add(new_docs)                          # new passage IDs assigned
+idx.update(passage_ids=[5], embeddings_source=[upd])  # replace doc 5
+idx.delete(passage_ids=[2, 8])                        # tombstone docs 2 and 8
+
+# 4. Searches immediately reflect all changes
+results = idx.search(queries_embeddings=queries, top_k=10)
+
+# 5. Compact when convenient
+idx.compact()
+```
+
 &nbsp;
 
 ## Citation
@@ -346,7 +445,7 @@ And for WARP (arXiv entry):
 ## Contributing
 
 This is an active in development project. Contributions are welcome, particularly in:
-- Index updates
+- Metadata filtering
 - Adding a reranking step at the end of the search pipeline can stabilize the retrieval metrics, especially for datasets like `fiqa`
 
 ## Acknowledgments
