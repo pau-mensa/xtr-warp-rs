@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
+use crate::utils::maybe_progress;
 use crate::utils::types::CompactStats;
 
 /// Per-centroid data built from a subset of chunks (used by incremental merge).
@@ -39,11 +40,14 @@ pub fn compact_index(
     nbits: usize,
     device: Device,
     deleted_pids: &HashSet<i64>,
+    show_progress: bool,
 ) -> Result<CompactStats> {
     // ── Pass 1: count embeddings per centroid, excluding deleted ──
     let mut centroid_counts = vec![0i64; num_centroids];
     let mut total_filtered = 0i64;
     let mut active_pids_set: HashSet<i64> = HashSet::new();
+
+    let bar1 = maybe_progress(show_progress, num_chunks as u64, "Compacting (pass 1)");
 
     for chunk_idx in 0..num_chunks {
         let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?
@@ -75,7 +79,11 @@ pub fn compact_index(
                 emb_offset += 1;
             }
         }
+
+        bar1.inc(1);
     }
+
+    bar1.finish_and_clear();
 
     // Build offsets
     let mut offsets_vec = vec![0i64; num_centroids + 1];
@@ -94,6 +102,8 @@ pub fn compact_index(
     let compacted_pids = Tensor::zeros(&[total_filtered], (Kind::Int64, device));
 
     let mut write_offsets = offsets_vec[..num_centroids].to_vec();
+
+    let bar2 = maybe_progress(show_progress, num_chunks as u64, "Compacting (pass 2)");
 
     for chunk_idx in 0..num_chunks {
         let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?
@@ -156,7 +166,11 @@ pub fn compact_index(
             write_offsets[centroid_id] += count;
             local_offset += count;
         }
+
+        bar2.inc(1);
     }
+
+    bar2.finish_and_clear();
 
     // Write compacted data
     compacted_residuals

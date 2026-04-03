@@ -295,6 +295,7 @@ def search_on_device(
     loaded_index,
     torch_path: str,
     subset: list[int] | None = None,
+    show_progress: bool = True,
 ) -> list[list[tuple[int, float]]]:
     """Perform a search on a loaded index."""
     scores = loaded_index.search(
@@ -302,6 +303,7 @@ def search_on_device(
         queries_embeddings=queries_embeddings,
         search_config=search_config,
         subset=subset,
+        show_progress=show_progress,
     )
 
     return [
@@ -380,6 +382,7 @@ class XTRWarp:
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
         metadata: list[dict] | None = None,
+        show_progress: bool = True,
     ) -> "XTRWarp":
         """Create and saves the XTRWarp index.
 
@@ -453,6 +456,7 @@ class XTRWarp:
             embeddings=documents_embeddings or str(embeddings_path),
             embedding_dim=dim,
             seed=seed,
+            show_progress=show_progress,
         )
 
         if metadata is not None:
@@ -551,6 +555,7 @@ class XTRWarp:
         max_growth_rate: float = 0.1,
         max_points_per_centroid: int = 256,
         metadata: list[dict] | None = None,
+        show_progress: bool = True,
     ) -> list[int]:
         """Add new passages. Encodes new documents and recompacts the index.
 
@@ -587,6 +592,7 @@ class XTRWarp:
             torch_path=torch_path,
             device=device,
             embeddings=embeddings,
+            show_progress=show_progress,
         )
         new_ids = result["new_passage_ids"]
 
@@ -620,6 +626,7 @@ class XTRWarp:
         passage_ids: list[int],
         embeddings_source: list[torch.Tensor] | torch.Tensor | str | Path,
         reload: bool = True,
+        show_progress: bool = True,
     ) -> "XTRWarp":
         """Update passages in-place: new embeddings, same IDs.
 
@@ -645,6 +652,7 @@ class XTRWarp:
             device=device,
             passage_ids=passage_ids,
             embeddings=embeddings,
+            show_progress=show_progress,
         )
         if reload and was_loaded:
             self._metadata = None
@@ -653,7 +661,7 @@ class XTRWarp:
             self._metadata = None
         return self
 
-    def compact(self, reload: bool = True) -> "XTRWarp":
+    def compact(self, reload: bool = True, show_progress: bool = True) -> "XTRWarp":
         """Rebuild index excluding deleted passages.
 
         Use after ``delete()`` to physically reclaim space.
@@ -683,6 +691,7 @@ class XTRWarp:
             index=self.index,
             torch_path=torch_path,
             device=device,
+            show_progress=show_progress,
         )
 
         # Delete metadata after successful compact
@@ -1029,6 +1038,7 @@ class XTRWarp:
         centroid_score_threshold: float | None = None,
         batch_size: int | None = 8192,
         subset: list[int] | None = None,
+        show_progress: bool = True,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
 
@@ -1150,6 +1160,7 @@ class XTRWarp:
                 search_config=search_config,
                 loaded_index=self._loaded_searchers[0],
                 subset=subset,
+                show_progress=show_progress,
             )
         else:
             num_queries = queries_embeddings.shape[0]
@@ -1159,7 +1170,7 @@ class XTRWarp:
             )
 
             args_for_starmap = [
-                (search_config, dev_queries, loaded_index, torch_path, subset)
+                (search_config, dev_queries, loaded_index, torch_path, subset, show_progress)
                 for loaded_index, dev_queries in zip(
                     self._loaded_searchers, queries_embeddings_splits
                 )

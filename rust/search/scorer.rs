@@ -3,6 +3,8 @@ use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use std::sync::Arc;
 use tch::{Device, IndexOp, Kind, Tensor};
 
+use crate::utils::maybe_progress;
+
 use crate::search::centroid_selector::CentroidSelector;
 use crate::search::decompressor::CentroidDecompressor;
 use crate::search::merger::{MergerConfig, ResultMerger};
@@ -132,6 +134,7 @@ impl WARPScorer {
         &self,
         query: &Query, // [batch, num_tokens, dim]
         subset: Option<&[i64]>,
+        show_progress: bool,
     ) -> Result<Vec<SearchResult>> {
         let _guard = tch::no_grad_guard();
 
@@ -139,6 +142,8 @@ impl WARPScorer {
         let n_queries = query.embeddings.size()[0] as usize;
         // Need to wrap it to ensure it can be shared in the parallel path
         let masks: ReadOnlyTensor = ReadOnlyTensor(query.embeddings.ne(0).any_dim(2, false));
+
+        let bar = maybe_progress(show_progress, n_queries as u64, "Searching");
 
         if self.device == Device::Cpu {
             // cpu path: rayon works automatically with 1 thread
@@ -152,8 +157,9 @@ impl WARPScorer {
             let index = Arc::clone(&self.index);
             let nprobe = self.config.nprobe as usize;
             let device = self.device;
+            let bar_clone = bar.clone();
 
-            self.thread_pool.install(move || {
+            let results = self.thread_pool.install(move || {
                 queries
                     .into_par_iter()
                     .enumerate()
@@ -189,6 +195,8 @@ impl WARPScorer {
                             k,
                         )?;
 
+                        bar_clone.inc(1);
+
                         Ok(SearchResult {
                             passage_ids: pids,
                             scores,
@@ -196,7 +204,11 @@ impl WARPScorer {
                         })
                     })
                     .collect()
-            })
+            });
+
+            bar.finish_and_clear();
+
+            results
         } else {
             // accelerator path (optimized for cuda)
             let mut results = Vec::with_capacity(n_queries);
@@ -223,8 +235,13 @@ impl WARPScorer {
                         subset,
                     )?;
                     results.push(result);
+
+                    bar.inc(1);
                 }
             }
+
+            bar.finish_and_clear();
+
             Ok(results)
         }
     }
