@@ -167,13 +167,14 @@ impl LoadedSearcher {
     }
 
     /// Main search entrypoint
-    #[pyo3(signature = (torch_path, queries_embeddings, search_config, subset=None))]
+    #[pyo3(signature = (torch_path, queries_embeddings, search_config, subset=None, show_progress=true))]
     fn search(
         &self,
         torch_path: String,
         queries_embeddings: PyTensor,
         search_config: SearchConfig,
         subset: Option<Vec<i64>>,
+        show_progress: bool,
     ) -> PyResult<Vec<SearchResult>> {
         call_torch(torch_path)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -203,6 +204,7 @@ impl LoadedSearcher {
                     embeddings: queries_embeddings.deref().shallow_clone(),
                 },
                 subset.as_deref(),
+                show_progress,
             )
             .map_err(|e| PyRuntimeError::new_err(format!("Search failed: {}", e)))?;
 
@@ -316,6 +318,7 @@ impl EmbeddingsInput {
     embeddings,
     embedding_dim=None,
     seed=None,
+    show_progress=true,
 ))]
 fn create(
     _py: Python<'_>,
@@ -327,6 +330,7 @@ fn create(
     embeddings: EmbeddingsInput,
     embedding_dim: Option<u32>,
     seed: Option<u64>,
+    show_progress: bool,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -351,6 +355,7 @@ fn create(
         source.as_mut(),
         centroids,
         seed,
+        show_progress,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)))
 }
@@ -366,13 +371,14 @@ fn delete(_py: Python<'_>, index: String, passage_ids: Vec<i64>) -> PyResult<()>
 /// Add new passages to an existing index. Encodes + incrementally merges.
 /// Returns a dict with `new_passage_ids`, `residual_norms`, and `embedding_dim`.
 #[pyfunction]
-#[pyo3(signature = (index, torch_path, device, embeddings))]
+#[pyo3(signature = (index, torch_path, device, embeddings, show_progress=true))]
 fn add(
     py: Python<'_>,
     index: String,
     torch_path: String,
     device: String,
     embeddings: EmbeddingsInput,
+    show_progress: bool,
 ) -> PyResult<PyObject> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -384,6 +390,7 @@ fn add(
         source.as_mut(),
         Path::new(&index),
         device,
+        show_progress,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to add to index: {}", e)))?;
 
@@ -411,7 +418,7 @@ fn append_centroids_py(
 /// Update passages in-place: new embeddings, same IDs.
 /// Reads embedding_dim from the existing index metadata.
 #[pyfunction]
-#[pyo3(signature = (index, torch_path, device, passage_ids, embeddings))]
+#[pyo3(signature = (index, torch_path, device, passage_ids, embeddings, show_progress=true))]
 fn update(
     _py: Python<'_>,
     index: String,
@@ -419,6 +426,7 @@ fn update(
     device: String,
     passage_ids: Vec<i64>,
     embeddings: EmbeddingsInput,
+    show_progress: bool,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -431,22 +439,25 @@ fn update(
         source.as_mut(),
         Path::new(&index),
         device,
+        show_progress,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to update index: {}", e)))
 }
 
 /// Rebuild index excluding deleted passages (compact without adding new data).
 #[pyfunction]
+#[pyo3(signature = (index, torch_path, device, show_progress=true))]
 fn compact(
     _py: Python<'_>,
     index: String,
     torch_path: String,
     device: String,
+    show_progress: bool,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
     let device = get_device(&device)?;
-    crate::index::update::compact_standalone(Path::new(&index), device)
+    crate::index::update::compact_standalone(Path::new(&index), device, show_progress)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to compact index: {}", e)))
 }
 

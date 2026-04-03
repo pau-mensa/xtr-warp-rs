@@ -48,9 +48,9 @@ xtr-warp-rs supports three torch versions:
 
 | xtr-warp-rs Version | PyTorch Version | Installation Command                |
 | ------------------- | --------------- | ----------------------------------- |
-| 1.1.0.290         | 2.9.0           | `uv pip install xtr-warp-rs==1.1.0.290` |
-| 1.1.0.280         | 2.8.0           | `uv pip install xtr-warp-rs==1.1.0.280` |
-| 1.1.0.270         | 2.7.0           | `uv pip install xtr-warp-rs==1.1.0.270` |
+| 1.1.1.290         | 2.9.0           | `uv pip install xtr-warp-rs==1.1.1.290` |
+| 1.1.1.280         | 2.8.0           | `uv pip install xtr-warp-rs==1.1.1.280` |
+| 1.1.1.270         | 2.7.0           | `uv pip install xtr-warp-rs==1.1.1.270` |
 
 ### Build from Source
 
@@ -200,7 +200,7 @@ Example structure:
 |  | ndcg@10 | 0.84 | 0.80 |
 |  | recall@10 | 0.02 | 0.02 |
 | webis-touche2020 (382,545) | qps | 55.37 | 601.75 (+980.9%) |
-|  | indexing | 28.48s | 41.293s |
+|  | indexing | 28.48s | 33.08s |
 |  | ndcg@10 | 0.25 | 0.24 |
 |  | recall@10 | 0.16 | 0.16 |
 

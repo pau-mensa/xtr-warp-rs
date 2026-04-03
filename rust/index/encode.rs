@@ -5,6 +5,8 @@ use std::io::BufWriter;
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
+use crate::utils::maybe_progress;
+
 /// Data from a single chunk, used for coalescing during add.
 pub struct ChunkData {
     pub codes: Tensor,
@@ -63,8 +65,9 @@ pub fn encode_chunks(
     embedding_dim: u32,
     passage_ids: Option<&[i64]>,
     start_chunk_idx: usize,
+    show_progress: bool,
 ) -> Result<EncodeResult> {
-    encode_chunks_inner(plan, source, centroids, codec, index_path, device, embedding_dim, passage_ids, start_chunk_idx, false)
+    encode_chunks_inner(plan, source, centroids, codec, index_path, device, embedding_dim, passage_ids, start_chunk_idx, false, show_progress)
 }
 
 /// Like `encode_chunks` but also returns per-embedding residual norms.
@@ -78,8 +81,9 @@ pub fn encode_chunks_with_norms(
     embedding_dim: u32,
     passage_ids: Option<&[i64]>,
     start_chunk_idx: usize,
+    show_progress: bool,
 ) -> Result<EncodeResult> {
-    encode_chunks_inner(plan, source, centroids, codec, index_path, device, embedding_dim, passage_ids, start_chunk_idx, true)
+    encode_chunks_inner(plan, source, centroids, codec, index_path, device, embedding_dim, passage_ids, start_chunk_idx, true, show_progress)
 }
 
 fn encode_chunks_inner(
@@ -93,6 +97,7 @@ fn encode_chunks_inner(
     passage_ids: Option<&[i64]>,
     start_chunk_idx: usize,
     collect_norms: bool,
+    show_progress: bool,
 ) -> Result<EncodeResult> {
     if let Some(pids) = passage_ids {
         anyhow::ensure!(
@@ -110,6 +115,8 @@ fn encode_chunks_inner(
     let mut global_counts = Tensor::zeros(&[num_centroids as i64], (Kind::Int64, device));
     let mut passage_offset: usize = 0;
     let mut all_norms: Vec<f32> = Vec::new();
+
+    let bar = maybe_progress(show_progress, plan.num_chunks as u64, "Encoding chunks");
 
     let chunk_iter = source.chunk_iter(CHUNK_SIZE)?;
     for (local_chk_idx, chunk) in chunk_iter.enumerate() {
@@ -213,7 +220,11 @@ fn encode_chunks_inner(
         });
         current_emb_offset += chunk_num_embeddings;
         passage_offset += chk_doclens.len();
+
+        bar.inc(1);
     }
+
+    bar.finish_and_clear();
 
     Ok(EncodeResult {
         chunk_stats,

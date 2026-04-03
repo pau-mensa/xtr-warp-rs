@@ -29,6 +29,7 @@ pub fn add_to_index(
     embeddings: &mut dyn EmbeddingSource,
     index_path: &Path,
     device: Device,
+    show_progress: bool,
 ) -> Result<AddResult> {
     let meta = IndexMetadata::load(index_path)?;
     let next_pid = meta.next_passage_id;
@@ -67,6 +68,7 @@ pub fn add_to_index(
         meta.dim as u32,
         Some(&new_passage_ids),
         start_chunk_idx,
+        show_progress,
     )?;
 
     // If coalescing, prepend old data to the first new chunk
@@ -121,6 +123,7 @@ pub fn update_in_index(
     embeddings: &mut dyn EmbeddingSource,
     index_path: &Path,
     device: Device,
+    show_progress: bool,
 ) -> Result<()> {
     anyhow::ensure!(
         passage_ids.len() == embeddings.num_docs(),
@@ -156,6 +159,7 @@ pub fn update_in_index(
         meta.dim as u32,
         Some(passage_ids),
         meta.num_chunks,
+        show_progress,
     )?;
 
     // Remove updated PIDs from tombstones — fresh data lives in the new chunks.
@@ -207,7 +211,7 @@ pub fn update_in_index(
 /// Rewrites chunk files to remove deleted data, prunes empty centroids,
 /// rebuilds compacted structures, and recalibrates the cluster threshold.
 /// Single-pass: no redundant recompaction.
-pub fn compact_standalone(index_path: &Path, device: Device) -> Result<()> {
+pub fn compact_standalone(index_path: &Path, device: Device, show_progress: bool) -> Result<()> {
     let meta = IndexMetadata::load(index_path)?;
     let tombstones = load_tombstones(index_path)?;
 
@@ -237,6 +241,7 @@ pub fn compact_standalone(index_path: &Path, device: Device) -> Result<()> {
         meta.nbits as usize,
         device,
         &HashSet::new(), // chunks are already clean
+        show_progress,
     )?;
 
     // Step 4: Recalibrate cluster threshold from current data

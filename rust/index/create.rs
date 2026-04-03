@@ -21,6 +21,7 @@ pub fn create_index(
     embeddings_source: &mut dyn EmbeddingSource,
     centroids: Tensor,
     seed: Option<u64>,
+    show_progress: bool,
 ) -> Result<()> {
     // Create the index directory if it doesn't exist
     std::fs::create_dir_all(&config.index_path)?;
@@ -62,9 +63,10 @@ pub fn create_index(
         config.embedding_dim,
         None, // auto-assign passage IDs 0..N
         0,    // start chunk index
+        show_progress,
     )?;
 
-    finalize_and_compact(config, &index_plan, &encode_result, &centroids)?;
+    finalize_and_compact(config, &index_plan, &encode_result, &centroids, show_progress)?;
 
     Ok(())
 }
@@ -209,6 +211,7 @@ fn finalize_and_compact(
     plan: &IndexPlan,
     encode_result: &EncodeResult,
     centroids: &Tensor,
+    show_progress: bool,
 ) -> Result<()> {
     let final_avg_doclen = if plan.n_docs > 0 {
         encode_result.total_embeddings as f64 / plan.n_docs as f64
@@ -238,6 +241,7 @@ fn finalize_and_compact(
         plan.nbits as usize,
         config.device,
         &std::collections::HashSet::new(),
+        show_progress,
     )?;
 
     Ok(())
