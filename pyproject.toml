@@ -9,7 +9,7 @@ build-backend = "maturin"
 
 [project]
 name = "xtr-warp-rs"
-version = "1.0"
+version = "1.1"
 description = "XTR-Warp"
 authors = [
   { name = "Pau Montserrat", email = "pau.mopuig@gmail.com" },
