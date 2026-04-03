@@ -25,7 +25,7 @@ xtr-warp-rs is a high-performance implementation of the **WARP** engine for mult
 
 Compared to the current SOTA (FastPlaid), xtr-warp-rs focuses on doing less work per query while staying close in quality: it prunes the centroid/posting-list space per token, uses an error-aware merge that keeps ranking stable with fewer examined candidates, and keeps the hot path (selection → decompression → merge) highly optimized and parallel friendly.
 
-**Speed**: Achieves **3-10x** speedup on CUDA and **8-180x** on CPU (depending on dataset and thread count) vs FastPlaid.
+**Speed**: Achieves **3-10x** speedup on CUDA and **8-190x** on CPU (depending on dataset and thread count) vs FastPlaid.
 
 **Memory**: During search WARP reduces memory footprint by **58%** on average vs FastPlaid, reaching **76%** on the larger indices. During index creation the VRAM usage is around **10%** less, with an optional streaming mode that reduces it further by **66%** at a **20-25%** speed cost.
 
@@ -204,14 +204,14 @@ Example structure:
 
 | Dataset (Size) | QPS fast-plaid | QPS xtr-warp (Single) | QPS xtr-warp-rs (Multi) |
 |----------------|----------------|-----------------------|-------------------------|
-| arguana (8,674) | 4.79 | 170.64 (+3462.4%) | 397.89 (+8206.6%) |
-| fiqa (57,638) | 4.78 | 129.65 (+2162.3%) | 299.97 (+6175.5%) |
-| nfcorpus (3,633) | 6.69 | 189.9 (+2738.5%) | 1252.7 (+18624.9%) |
-| quora (522,931) | 8.60 | 100.0 (+1062.7%) | 296.18 (+3343.9%) |
-| scidocs (25,657) | 4.52 | 102.78 (+2173.9%) | 260.53 (+5663.9%) |
-| scifact (5,183) | 6.14 | 229.48 (+3637.4%) | 514.5 (+8279.4%) |
-| trec-covid (171,332) | 1.82 | 17.33 (+852.1%) | 94.0 (+5064.8%) |
-| webis-touche2020 (382,545) | 3.14 | 41.63 (+1225.8%) | 145.68 (+4539.4%) |
+| arguana (8,674) | 4.79 | 170.64 (+3462.4%) | 495.5 (+10244.5%) |
+| fiqa (57,638) | 4.78 | 129.65 (+2162.3%) | 301.78 (+6213.4%) |
+| nfcorpus (3,633) | 6.69 | 189.9 (+2738.5%) | 1288.85 (+19165.3%) |
+| quora (522,931) | 8.60 | 100.0 (+1062.7%) | 298.72 (+3373.4%) |
+| scidocs (25,657) | 4.52 | 102.78 (+2173.9%) | 262.46 (+5706.6%) |
+| scifact (5,183) | 6.14 | 229.48 (+3637.4%) | 584.6 (+9421.2%) |
+| trec-covid (171,332) | 1.82 | 17.33 (+852.1%) | 106.17 (+5733.5%) |
+| webis-touche2020 (382,545) | 3.14 | 41.63 (+1225.8%) | 144.08 (+4488.6%) |
 
 #### Search Memory comparison
 
