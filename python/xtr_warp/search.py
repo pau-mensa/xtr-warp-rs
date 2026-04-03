@@ -16,6 +16,7 @@ import torch.multiprocessing as mp
 from fastkmeans import FastKMeans
 
 from . import xtr_warp_rs
+from .filtering import MetadataStore
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -179,7 +180,8 @@ def compute_kmeans(  # noqa: PLR0913
     pre-sampled embeddings (no sampling step).
     """
     # Fast path: raw tensor (used by centroid expansion)
-    if isinstance(embeddings_source, torch.Tensor) and embeddings_source.dim() == 2:
+    if isinstance(embeddings_source, torch.Tensor):
+        assert embeddings_source.dim() == 2, "Centroid expansion requires 2-dim tensors"
         tensors = embeddings_source
         total_tokens = tensors.shape[0]
         dim = tensors.shape[1]
@@ -217,22 +219,19 @@ def compute_kmeans(  # noqa: PLR0913
     if not tensors.is_contiguous():
         tensors = tensors.contiguous()
 
-    # Ensure enough points per centroid to avoid empty clusters during
-    # k-means.  The partition formula (lines 207-210) can overshoot for
-    # small token counts (e.g. K=4096 for 121k tokens ≈ 30 pts/centroid),
-    # which leads to empty clusters → NaN centroids → CUDA assertion.
-    num_partitions = max(1, min(num_partitions, total_tokens // 100))
+    use_gpu = device != "cpu"
 
-    # GPU k-means in FastKMeans can crash when centroids outnumber the data
-    # they represent: empty clusters → NaN centroids → undefined GPU argmax →
-    # CUDA assertion inside the k-means iteration itself.  For small token
-    # counts (< 500k) CPU k-means is sub-second and immune to this (CPU
-    # argmax handles NaN deterministically).  Large datasets stay on GPU.
-    use_gpu = (device != "cpu") and total_tokens >= 500_000
+    # The triton k-means kernel in fastkmeans produces incorrect cluster
+    # assignments for non-power-of-2 k, so round down.
+    # TODO(pau-mensa): apparently this has been fixed for +10 months in their repo
+    # they just have not released it yet, so I'll keep this here just in case
+    k = min(num_partitions, total_tokens)
+    if k > 0 and (k & (k - 1)) != 0:
+        k = 2 ** int(math.log2(k))
 
     kmeans = FastKMeans(
         d=dim,
-        k=min(num_partitions, total_tokens),
+        k=k,
         niter=kmeans_niters,
         gpu=use_gpu,
         verbose=False,
@@ -243,27 +242,9 @@ def compute_kmeans(  # noqa: PLR0913
 
     kmeans.train(data=tensors.numpy())
 
-    centroids = torch.from_numpy(
-        kmeans.centroids,
-    ).to(
-        device=device,
-        dtype=torch.float32,
+    centroids = torch.from_numpy(kmeans.centroids).to(
+        device=device, dtype=torch.float32
     )
-
-    # Drop empty centroids before normalization to prevent NaN propagation
-    # Empty clusters produce zero vectors; normalizing them yields NaN,
-    # which causes undefined argmax behavior downstream in
-    # compress_into_codes and an eventual CUDA assertion failure.
-    norms = centroids.norm(dim=-1)
-    valid = norms > 1e-8
-    if not valid.all():
-        dropped = int((~valid).sum().item())
-        logger.warning(
-            "Dropped %d empty centroids out of %d (too few points per centroid)",
-            dropped,
-            centroids.shape[0],
-        )
-        centroids = centroids[valid]
 
     return torch.nn.functional.normalize(
         input=centroids,
@@ -313,12 +294,14 @@ def search_on_device(
     queries_embeddings: torch.Tensor,
     loaded_index,
     torch_path: str,
+    subset: list[int] | None = None,
 ) -> list[list[tuple[int, float]]]:
     """Perform a search on a loaded index."""
     scores = loaded_index.search(
         torch_path=torch_path,
         queries_embeddings=queries_embeddings,
         search_config=search_config,
+        subset=subset,
     )
 
     return [
@@ -353,6 +336,7 @@ class XTRWarp:
         self._metadata: dict | None = None
         self.device: str | None = device
         self._mmap: bool = True
+        self._metadata_store: MetadataStore | None = None
 
     def _ensure_torch_initialized(self, device: str) -> str:
         """Initialize torch once per device type."""
@@ -369,6 +353,9 @@ class XTRWarp:
             for searcher in self._loaded_searchers:
                 searcher.free()
             self._loaded_searchers = None
+        if self._metadata_store is not None:
+            self._metadata_store.close()
+            self._metadata_store = None
 
     def _reload_if_loaded(self) -> None:
         """Free and re-load the index using the same parameters as the last ``load()`` call."""
@@ -392,6 +379,7 @@ class XTRWarp:
         n_samples_kmeans: int | None = None,
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
+        metadata: list[dict] | None = None,
     ) -> "XTRWarp":
         """Create and saves the XTRWarp index.
 
@@ -467,6 +455,11 @@ class XTRWarp:
             seed=seed,
         )
 
+        if metadata is not None:
+            store = MetadataStore(self.index)
+            store.create(metadata, start_pid=0)
+            store.close()
+
         return self
 
     @staticmethod
@@ -488,6 +481,12 @@ class XTRWarp:
             for pt_file in glob.glob(os.path.join(index_path, "*.pt")):
                 try:
                     os.remove(pt_file)
+                except OSError:
+                    pass
+
+            for duckdb_file in glob.glob(os.path.join(index_path, "*.duckdb*")):
+                try:
+                    os.remove(duckdb_file)
                 except OSError:
                     pass
         elif not os.path.exists(index_path):
@@ -522,6 +521,9 @@ class XTRWarp:
             for s in self._loaded_searchers:
                 s.update_tombstones(passage_ids)
 
+        if self._metadata_store is not None:
+            self._metadata_store.delete(passage_ids)
+
         if compact_threshold is not None:
             meta = self._load_metadata()
             if meta and meta.get("num_passages", 0) > 0:
@@ -548,6 +550,7 @@ class XTRWarp:
         min_outliers: int = 50,
         max_growth_rate: float = 0.1,
         max_points_per_centroid: int = 256,
+        metadata: list[dict] | None = None,
     ) -> list[int]:
         """Add new passages. Encodes new documents and recompacts the index.
 
@@ -599,6 +602,11 @@ class XTRWarp:
 
         # Recalibrate the outlier threshold so it reflects the proper data distribution
         self._recalibrate_threshold(result["residual_norms"])
+
+        if metadata is not None:
+            store = MetadataStore(self.index)
+            store.add(metadata, start_pid=new_ids[0])
+            store.close()
 
         if reload and was_loaded:
             self._metadata = None
@@ -663,11 +671,25 @@ class XTRWarp:
         was_loaded = self._loaded_searchers is not None
         if was_loaded:
             self.free()
+
+        # Read tombstones before compact (compact clears the tombstone file)
+        metadata_db = os.path.join(self.index, "metadata.duckdb")
+        deleted_path = os.path.join(self.index, "deleted_pids.npy")
+        tombstones: list[int] = []
+        if os.path.exists(metadata_db) and os.path.exists(deleted_path):
+            tombstones = np.load(deleted_path).tolist()
+
         xtr_warp_rs.compact(
             index=self.index,
             torch_path=torch_path,
             device=device,
         )
+
+        # Delete metadata after successful compact
+        if tombstones:
+            store = MetadataStore(self.index)
+            store.delete(tombstones)
+            store.close()
         if reload and was_loaded:
             self._metadata = None
             self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
@@ -888,6 +910,10 @@ class XTRWarp:
             searcher.load()
             self._loaded_searchers.append(searcher)
 
+        metadata_db = os.path.join(self.index, "metadata.duckdb")
+        if os.path.exists(metadata_db):
+            self._metadata_store = MetadataStore(self.index)
+
         return self
 
     def optimize_hyperparams(
@@ -961,6 +987,36 @@ class XTRWarp:
             t_prime,
         )
 
+    def filter(
+        self,
+        condition: str,
+        parameters: list | tuple | None = None,
+    ) -> list[int]:
+        """Return passage IDs matching a metadata filter condition.
+
+        Requires metadata to have been provided during ``create()`` or ``add()``.
+
+        Args:
+        ----
+        condition:
+            SQL WHERE clause fragment, e.g. ``"category = ? AND age > ?"``.
+            DuckDB native functions are supported (``list_contains``, struct
+            dot-notation, etc.).
+        parameters:
+            Values for ``?`` placeholders in *condition*.
+
+        Returns:
+        -------
+        List of matching passage IDs.
+
+        """
+        if self._metadata_store is None:
+            raise RuntimeError(
+                "No metadata available. Ensure metadata was provided during "
+                "create() or add(), and that the index is loaded."
+            )
+        return self._metadata_store.filter(condition, parameters)
+
     def search(
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
@@ -972,6 +1028,7 @@ class XTRWarp:
         max_candidates: int | None = None,
         centroid_score_threshold: float | None = None,
         batch_size: int | None = 8192,
+        subset: list[int] | None = None,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
 
@@ -1001,6 +1058,15 @@ class XTRWarp:
         if self._loaded_searchers is None or self.devices is None:
             error = "Index not loaded, call load() first"
             raise RuntimeError(error)
+
+        # Empty subset → no results possible
+        if subset is not None and len(subset) == 0:
+            n_queries = (
+                len(queries_embeddings)
+                if isinstance(queries_embeddings, list)
+                else queries_embeddings.shape[0]
+            )
+            return [[] for _ in range(n_queries)]
 
         if (
             num_threads is not None
@@ -1083,6 +1149,7 @@ class XTRWarp:
                 queries_embeddings=queries_embeddings,
                 search_config=search_config,
                 loaded_index=self._loaded_searchers[0],
+                subset=subset,
             )
         else:
             num_queries = queries_embeddings.shape[0]
@@ -1092,7 +1159,7 @@ class XTRWarp:
             )
 
             args_for_starmap = [
-                (search_config, dev_queries, loaded_index, torch_path)
+                (search_config, dev_queries, loaded_index, torch_path, subset)
                 for loaded_index, dev_queries in zip(
                     self._loaded_searchers, queries_embeddings_splits
                 )

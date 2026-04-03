@@ -93,6 +93,7 @@ impl WARPScorer {
         centroid_scores: Tensor,
         query_mask: Tensor,
         k: usize,
+        subset: Option<&[i64]>,
     ) -> Result<SearchResult> {
         let selected = self.centroid_selector.select_centroids(
             &query_mask.to_device(self.device),
@@ -107,6 +108,7 @@ impl WARPScorer {
             &self.index,
             &query_embeddings,
             self.config.nprobe as usize,
+            subset,
         )?;
         let (pids, scores) = self.merger.merge_candidate_scores(
             &decompressed.capacities,
@@ -129,6 +131,7 @@ impl WARPScorer {
     pub fn rank(
         &self,
         query: &Query, // [batch, num_tokens, dim]
+        subset: Option<&[i64]>,
     ) -> Result<Vec<SearchResult>> {
         let _guard = tch::no_grad_guard();
 
@@ -173,6 +176,7 @@ impl WARPScorer {
                             &index,
                             &query_embeddings,
                             nprobe,
+                            subset,
                         )?;
 
                         let (pids, scores) = merger.merge_candidate_scores(
@@ -216,6 +220,7 @@ impl WARPScorer {
                         centroid_scores.i(b),
                         batch_mask.i(b),
                         k,
+                        subset,
                     )?;
                     results.push(result);
                 }

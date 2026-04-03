@@ -3,7 +3,7 @@ use rayon::{prelude::*, ThreadPool};
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
-use crate::utils::types::{DecompressedCentroidsOutput, ReadOnlyIndex};
+use crate::utils::types::{DecompressedCentroidsOutput, PassageBitset, ReadOnlyIndex};
 
 /// Centroid decompressor for efficient residual decompression
 #[derive(Clone)]
@@ -73,6 +73,7 @@ impl CentroidDecompressor {
         index: &Arc<ReadOnlyIndex>,
         query_embeddings: &Tensor, // [num_tokens, dim]
         nprobe: usize,
+        subset: Option<&[i64]>,
     ) -> Result<DecompressedCentroidsOutput> {
         let centroid_ids = centroid_ids.to_kind(Kind::Int64);
         let num_cells = centroid_ids.size()[0] as usize;
@@ -129,8 +130,11 @@ impl CentroidDecompressor {
                 index,
                 &query_embeddings,
                 nprobe,
+                subset,
             );
         }
+
+        let subset_bitset = subset.map(PassageBitset::new);
 
         let bucket_weights = index.bucket_weights.to_kind(self.dtype);
         let vt_bucket_scores =
@@ -166,6 +170,7 @@ impl CentroidDecompressor {
         let use_parallel = self.thread_pool.current_num_threads() > 1 && num_cells > 1;
 
         if use_parallel {
+            let subset_bitset_ref = subset_bitset.as_ref();
             let cell_results: Vec<_> = self.thread_pool.install(|| {
                 (0..num_cells)
                     .into_par_iter()
@@ -182,6 +187,7 @@ impl CentroidDecompressor {
                             index,
                             residual_bytes_per_embedding,
                             bucket_dim_shift,
+                            subset_bitset_ref,
                         )
                     })
                     .collect()
@@ -216,6 +222,7 @@ impl CentroidDecompressor {
                     index,
                     residual_bytes_per_embedding,
                     bucket_dim_shift,
+                    subset_bitset.as_ref(),
                 );
 
                 candidate_sizes[cell_idx] = size;
@@ -256,6 +263,7 @@ impl CentroidDecompressor {
         index: &Arc<ReadOnlyIndex>,
         query_embeddings: &Tensor, // [num_tokens, dim]
         nprobe: usize,
+        subset: Option<&[i64]>,
     ) -> Result<DecompressedCentroidsOutput> {
         let device = query_embeddings.device();
         anyhow::ensure!(
@@ -305,10 +313,42 @@ impl CentroidDecompressor {
         let intra = &ranges - &candidate_cell_starts;
         let embedding_indices = &candidate_begins + &intra;
 
-        let passage_ids = index
+        let mut passage_ids = index
             .pids_compacted
             .index_select(0, &embedding_indices)
             .to_kind(Kind::Int64);
+
+        // Apply subset filter before expensive residual retrieval
+        let (embedding_indices, candidate_cells, total_capacity) = if let Some(subset_ids) = subset
+        {
+            let subset_tensor =
+                Tensor::from_slice(subset_ids).to_device(device).to_kind(Kind::Int64);
+            let max_pid = passage_ids.max().int64_value(&[]);
+            let max_subset = subset_tensor.max().int64_value(&[]);
+            let lookup_size = max_pid.max(max_subset) + 1;
+            let mut lookup = Tensor::zeros(&[lookup_size], (Kind::Bool, device));
+            let _ = lookup.index_fill_(0, &subset_tensor, 1);
+            let mask = lookup.index_select(0, &passage_ids);
+            let valid_indices = mask.nonzero().squeeze_dim(-1);
+
+            if valid_indices.numel() == 0 {
+                return Ok(DecompressedCentroidsOutput {
+                    capacities: capacities.shallow_clone(),
+                    sizes,
+                    passage_ids: Tensor::zeros(&[0], (Kind::Int64, device)),
+                    scores: Tensor::zeros(&[0], (Kind::Float, device)),
+                    offsets,
+                });
+            }
+
+            passage_ids = passage_ids.index_select(0, &valid_indices);
+            let embedding_indices = embedding_indices.index_select(0, &valid_indices);
+            let candidate_cells = candidate_cells.index_select(0, &valid_indices);
+            let total_capacity = valid_indices.size()[0];
+            (embedding_indices, candidate_cells, total_capacity)
+        } else {
+            (embedding_indices, candidate_cells, total_capacity)
+        };
 
         let residuals = index
             .residuals_compacted
@@ -413,6 +453,7 @@ impl CentroidDecompressor {
         index: &Arc<ReadOnlyIndex>,
         residual_bytes_per_embedding: usize,
         bucket_dim_shift: usize,
+        subset_bitset: Option<&PassageBitset>,
     ) -> (Vec<i64>, Vec<f32>, i32) {
         let capacity = capacities_vec[cell_idx] as usize;
         if capacity == 0 {
@@ -446,6 +487,11 @@ impl CentroidDecompressor {
         let mut scored: Vec<(i64, f32)> = Vec::with_capacity(capacity);
         for i in 0..capacity {
             let pid = local_pids_raw[i];
+            if let Some(bitset) = subset_bitset {
+                if !bitset.contains(pid) {
+                    continue;
+                }
+            }
             let residual_start = i * residual_bytes_per_embedding;
             let residual_end = residual_start + residual_bytes_per_embedding;
             let residual_bytes = &local_residuals_raw[residual_start..residual_end];
