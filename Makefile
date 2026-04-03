@@ -44,4 +44,4 @@ build:	## Build the project
 
 test:	## Run tests
 	@test -x $(PYTEST) || { echo "No venv found — run 'make install' first"; exit 1; }
-	$(TORCH_ENV) $(PYTEST) tests/test.py tests/test_index_management.py
+	$(TORCH_ENV) $(PYTEST) tests/test.py tests/test_index_management.py tests/test_filtering.py

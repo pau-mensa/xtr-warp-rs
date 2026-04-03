@@ -36,4 +36,4 @@ jobs:
         run: |
           uv pip install xtr-warp-rs==${{ inputs.release_tag }}
           uv pip install pytest pytest-cov
-          pytest tests/test.py
+          pytest tests/test.py tests/test_index_management.py tests/test_filtering.py

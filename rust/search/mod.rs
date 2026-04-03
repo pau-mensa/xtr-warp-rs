@@ -31,7 +31,7 @@ impl Searcher {
     }
 
     /// Search for top-k passages given a query
-    pub fn search(&self, query: Query) -> Result<Vec<SearchResult>> {
-        self.scorer.rank(&query)
+    pub fn search(&self, query: Query, subset: Option<&[i64]>) -> Result<Vec<SearchResult>> {
+        self.scorer.rank(&query, subset)
     }
 }

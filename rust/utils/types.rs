@@ -418,6 +418,37 @@ pub fn parse_device(device: &str) -> anyhow::Result<Device> {
     }
 }
 
+/// Bitset for O(1) passage ID membership checks during subset filtering.
+pub struct PassageBitset {
+    bits: Vec<u64>,
+}
+
+impl PassageBitset {
+    pub fn new(ids: &[i64]) -> Self {
+        let max_id = ids.iter().copied().max().unwrap_or(-1);
+        if max_id < 0 {
+            return Self { bits: Vec::new() };
+        }
+        let num_words = (max_id as usize / 64) + 1;
+        let mut bits = vec![0u64; num_words];
+        for &id in ids {
+            if id >= 0 {
+                bits[id as usize / 64] |= 1u64 << (id as usize % 64);
+            }
+        }
+        Self { bits }
+    }
+
+    #[inline]
+    pub fn contains(&self, pid: i64) -> bool {
+        if pid < 0 {
+            return false;
+        }
+        let word = pid as usize / 64;
+        word < self.bits.len() && (self.bits[word] & (1u64 << (pid as usize % 64))) != 0
+    }
+}
+
 /// Parses a string identifier into a `tch::Kind`.
 ///
 /// Supports simple strings like "float32", "float16"

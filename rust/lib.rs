@@ -167,11 +167,13 @@ impl LoadedSearcher {
     }
 
     /// Main search entrypoint
+    #[pyo3(signature = (torch_path, queries_embeddings, search_config, subset=None))]
     fn search(
         &self,
         torch_path: String,
         queries_embeddings: PyTensor,
         search_config: SearchConfig,
+        subset: Option<Vec<i64>>,
     ) -> PyResult<Vec<SearchResult>> {
         call_torch(torch_path)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -196,9 +198,12 @@ impl LoadedSearcher {
 
         // process batch
         let mut results = searcher
-            .search(Query {
-                embeddings: queries_embeddings.deref().shallow_clone(),
-            })
+            .search(
+                Query {
+                    embeddings: queries_embeddings.deref().shallow_clone(),
+                },
+                subset.as_deref(),
+            )
             .map_err(|e| PyRuntimeError::new_err(format!("Search failed: {}", e)))?;
 
         // Filter tombstoned PIDs and truncate to k.

@@ -25,7 +25,7 @@ xtr-warp-rs is a high-performance implementation of the **WARP** engine for mult
 
 Compared to the current SOTA (FastPlaid), xtr-warp-rs focuses on doing less work per query while staying close in quality: it prunes the centroid/posting-list space per token, uses an error-aware merge that keeps ranking stable with fewer examined candidates, and keeps the hot path (selection → decompression → merge) highly optimized and parallel friendly.
 
-**Speed**: Achieves **3-10x** speedup on CUDA and **8-180x** on CPU (depending on dataset and thread count) vs FastPlaid.
+**Speed**: Achieves **3-10x** speedup on CUDA and **8-190x** on CPU (depending on dataset and thread count) vs FastPlaid.
 
 **Memory**: During search WARP reduces memory footprint by **58%** on average vs FastPlaid, reaching **76%** on the larger indices. During index creation the VRAM usage is around **10%** less, with an optional streaming mode that reduces it further by **66%** at a **20-25%** speed cost.
 
@@ -48,9 +48,9 @@ xtr-warp-rs supports three torch versions:
 
 | xtr-warp-rs Version | PyTorch Version | Installation Command                |
 | ------------------- | --------------- | ----------------------------------- |
-| 1.0.290         | 2.9.0           | `uv pip install xtr-warp-rs==1.0.290` |
-| 1.0.280         | 2.8.0           | `uv pip install xtr-warp-rs==1.0.280` |
-| 1.0.270         | 2.7.0           | `uv pip install xtr-warp-rs==1.0.270` |
+| 1.1.0.290         | 2.9.0           | `uv pip install xtr-warp-rs==1.1.0.290` |
+| 1.1.0.280         | 2.8.0           | `uv pip install xtr-warp-rs==1.1.0.280` |
+| 1.1.0.270         | 2.7.0           | `uv pip install xtr-warp-rs==1.1.0.270` |
 
 ### Build from Source
 
@@ -79,38 +79,44 @@ make build
 
 ## ⚡️ Quick Start
 
-Get started with creating an index and performing a search in just a few lines of Python.
-
-### In-Memory Embeddings
-
 ```python
 import torch
-
 from xtr_warp import XTRWarp
 
-xtr_warp = XTRWarp(index="index")
-
+idx = XTRWarp(index="my_index")
 embedding_dim = 128
 
-# Index 100 documents, each with 300 tokens, each token is a 128-dim vector.
-xtr_warp.create(
+# 1. Create the index with document metadata
+metadata = [
+    {"category": "science", "year": 2024, "tags": ["ml", "search"]},
+    {"category": "history", "year": 2023, "tags": ["medieval"]},
+    # ... one dict per document
+]
+idx.create(
     embeddings_source=[torch.randn(300, embedding_dim) for _ in range(100)],
     device="cpu",
+    metadata=metadata,
 )
+idx.load(device="cpu", dtype=torch.float32)
 
-# Load the index
-xtr_warp.load(device="cpu", dtype=torch.float32)
+# 2. Search (returns list of lists of (passage_id, score) tuples)
+results = idx.search(queries_embeddings=torch.randn(2, 50, embedding_dim), top_k=10)
 
-# Search for 2 queries, each with 50 tokens, each token is a 128-dim vector
-scores = xtr_warp.search(
-    queries_embeddings=torch.randn(2, 50, embedding_dim),
-    top_k=10,
-)
+# 3. Filter by metadata, then search only matching documents
+subset = idx.filter("category = ? AND year >= ?", ["science", 2024])
+results = idx.search(queries_embeddings=torch.randn(2, 50, embedding_dim), top_k=10, subset=subset)
 
-print(scores)
+# 4. Incremental mutations (metadata can be attached to new documents too)
+new_ids = idx.add(new_docs, metadata=[{"category": "art", "year": 2025}])
+idx.update(passage_ids=[5], embeddings_source=[torch.randn(200, embedding_dim)])
+idx.delete(passage_ids=[2, 8])
+
+# 5. Searches immediately reflect all changes
+results = idx.search(queries_embeddings=torch.randn(2, 50, embedding_dim), top_k=10)
+
+# 6. Compact when convenient
+idx.compact()
 ```
-
-The output will be a list of lists, where each inner list contains tuples of (document_index, similarity_score) for the top_k results for each query.
 
 ### Streaming from Disk (Path-Based)
 
@@ -165,36 +171,36 @@ Example structure:
 
 | Dataset (Size) | Metric | fast-plaid | xtr-warp-rs |
 |----------------|--------|------------|-------------|
-| arguana (8,674) | qps | 110.26 | 1008.69 (+814.8%) |
-|  | indexing | 1.67s | 1.595s |
+| arguana (8,674) | qps | 110.26 | 1024.55 (+829.2%) |
+|  | indexing | 1.67s | 1.39s |
 |  | ndcg@10 | 0.47 | 0.49 |
 |  | recall@10 | 0.73 | 0.75 |
-| fiqa (57,638) | qps | 87.16 | 943.08 (+982.0%) |
-|  | indexing | 4.90s | 5.51s |
+| fiqa (57,638) | qps | 87.16 | 981.71 (+1026.3%) |
+|  | indexing | 4.90s | 5.57s |
 |  | ndcg@10 | 0.41 | 0.37 |
 |  | recall@10 | 0.48 | 0.42 |
 | nfcorpus (3,633) | qps | 123.87 | 1155.00 (+832.4%) |
-|  | indexing | 0.90s | 0.965s |
+|  | indexing | 0.90s | 0.905s |
 |  | ndcg@10 | 0.37 | 0.36 |
 |  | recall@10 | 0.18 | 0.17 |
 | quora (522,931) | qps | 217.47 | 927.92 (+326.7%) |
-|  | indexing | 10.51s | 11.44s |
+|  | indexing | 10.51s | 9.56s |
 |  | ndcg@10 | 0.88 | 0.86 |
 |  | recall@10 | 0.95 | 0.94 |
-| scidocs (25,657) | qps | 97.49 | 861.50 (+783.7%) |
-|  | indexing | 3.93s | 4.17s |
+| scidocs (25,657) | qps | 97.49 | 880.92 (+803.6%) |
+|  | indexing | 3.93s | 4.15s |
 |  | ndcg@10 | 0.19 | 0.18 |
 |  | recall@10 | 0.19 | 0.19 |
 | scifact (5,183) | qps | 112.30 | 1133.98 (+909.8%) |
-|  | indexing | 1.42s | 1.47s |
+|  | indexing | 1.42s | 1.35s |
 |  | ndcg@10 | 0.74 | 0.73 |
 |  | recall@10 | 0.86 | 0.85 |
-| trec-covid (171,332) | qps | 43.16 | 282.75 (+555.1%) |
-|  | indexing | 17.44s | 19.47s |
+| trec-covid (171,332) | qps | 43.16 | 339.79 (+687.3%) |
+|  | indexing | 17.44s | 22.73s |
 |  | ndcg@10 | 0.84 | 0.80 |
 |  | recall@10 | 0.02 | 0.02 |
-| webis-touche2020 (382,545) | qps | 55.37 | 578.41 (+944.6%) |
-|  | indexing | 28.48s | 33.08s |
+| webis-touche2020 (382,545) | qps | 55.37 | 601.75 (+980.9%) |
+|  | indexing | 28.48s | 41.293s |
 |  | ndcg@10 | 0.25 | 0.24 |
 |  | recall@10 | 0.16 | 0.16 |
 
@@ -204,14 +210,14 @@ Example structure:
 
 | Dataset (Size) | QPS fast-plaid | QPS xtr-warp (Single) | QPS xtr-warp-rs (Multi) |
 |----------------|----------------|-----------------------|-------------------------|
-| arguana (8,674) | 4.79 | 170.64 (+3462.4%) | 397.89 (+8206.6%) |
-| fiqa (57,638) | 4.78 | 129.65 (+2162.3%) | 299.97 (+6175.5%) |
-| nfcorpus (3,633) | 6.69 | 189.9 (+2738.5%) | 1252.7 (+18624.9%) |
-| quora (522,931) | 8.60 | 100.0 (+1062.7%) | 296.18 (+3343.9%) |
-| scidocs (25,657) | 4.52 | 102.78 (+2173.9%) | 260.53 (+5663.9%) |
-| scifact (5,183) | 6.14 | 229.48 (+3637.4%) | 514.5 (+8279.4%) |
-| trec-covid (171,332) | 1.82 | 17.33 (+852.1%) | 94.0 (+5064.8%) |
-| webis-touche2020 (382,545) | 3.14 | 41.63 (+1225.8%) | 145.68 (+4539.4%) |
+| arguana (8,674) | 4.79 | 170.64 (+3462.4%) | 495.5 (+10244.5%) |
+| fiqa (57,638) | 4.78 | 129.65 (+2162.3%) | 301.78 (+6213.4%) |
+| nfcorpus (3,633) | 6.69 | 189.9 (+2738.5%) | 1288.85 (+19165.3%) |
+| quora (522,931) | 8.60 | 100.0 (+1062.7%) | 298.72 (+3373.4%) |
+| scidocs (25,657) | 4.52 | 102.78 (+2173.9%) | 262.46 (+5706.6%) |
+| scifact (5,183) | 6.14 | 229.48 (+3637.4%) | 584.6 (+9421.2%) |
+| trec-covid (171,332) | 1.82 | 17.33 (+852.1%) | 106.17 (+5733.5%) |
+| webis-touche2020 (382,545) | 3.14 | 41.63 (+1225.8%) | 144.08 (+4488.6%) |
 
 #### Search Memory comparison
 
@@ -273,6 +279,7 @@ centroid_score_threshold    None        Per-token filter to skip weak tokens, fr
 max_candidates              None        Cap on document candidates before final selection (e.g 64000)
 batch_size                  8192        Batch size for centroid scoring (watch out for VRAM spike in large indices)
 num_threads                 1           Upper bound for CPU parallelism during search (not used on CUDA)
+subset                      None        List of passage IDs to restrict search to (from filter())
 ```
 
 ### Indexing
@@ -292,6 +299,7 @@ nbits                      4           Product quantization bits for compression
 n_samples_kmeans           None        Samples for K-means clustering
 seed                       42          Random seed for reproducibility
 use_triton_kmeans          None        Whether to use Triton-based K-means
+metadata                   None        List of dicts (one per document) for metadata filtering
 ```
 
 > [!IMPORTANT]
@@ -327,6 +335,9 @@ WARP supports incremental index mutations without requiring a full rebuild. Docu
 
 After each `add()`, the engine also checks for *outlier* embeddings (those far from any existing centroid). If enough outliers are found, it runs K-means on them and expands the centroid codebook, keeping cluster quality stable as the distribution shifts. The outlier detection threshold is recalibrated via a weighted average so it adapts to the evolving data.
 
+> [!WARNING]
+> If your index keeps growing with updates and you created the index with less than **3k docs** consider rebuilding when you have at least **3k docs** or when the initial size you used for indexing is less than **50%** of the total size of the index. Retrieval metrics can degrade otherwise due to a bad initialization of the centroids.
+
 #### Delete
 
 ```python
@@ -356,6 +367,7 @@ reload                      True        Auto-reload index after mutation so sear
 min_outliers                50          Minimum outlier count to trigger centroid expansion
 max_growth_rate             0.1         Maximum ratio of new centroids relative to current codebook size
 max_points_per_centroid     256         Points per centroid for expansion K-means
+metadata                    None        List of dicts (one per new document) for metadata filtering
 ```
 
 Returns the list of newly assigned passage IDs.
@@ -389,29 +401,28 @@ reload                      True        Auto-reload index after compaction
 
 Compaction rewrites all chunks to exclude deleted passages, prunes centroids that no longer have any assigned embeddings, rebuilds the centroid-sorted layout, and recalibrates the cluster threshold and average residual. Use it after a batch of deletions or updates to reclaim disk space and keep the index tight.
 
-#### Typical lifecycle
+### Metadata Filtering
+
+WARP supports document-level metadata filtering backed by [DuckDB](https://duckdb.org/). Metadata is stored as a DuckDB database alongside the index. Column types are inferred automatically from Python objects: scalars, lists, dicts (structs), and nested combinations are all supported.
+
+`filter()` accepts a SQL WHERE clause fragment with `?` parameter placeholders. The full [DuckDB function set](https://duckdb.org/docs/sql/functions/overview) is available:
 
 ```python
-idx = XTRWarp(index="my_index")
-
-# 1. Create the initial index
-idx.create(embeddings_source=docs, device="cuda")
-idx.load(device="cpu", dtype=torch.float32)
-
-# 2. Search
-results = idx.search(queries_embeddings=queries, top_k=10)
-
-# 3. Incremental mutations
-new_ids = idx.add(new_docs)                          # new passage IDs assigned
-idx.update(passage_ids=[5], embeddings_source=[upd])  # replace doc 5
-idx.delete(passage_ids=[2, 8])                        # tombstone docs 2 and 8
-
-# 4. Searches immediately reflect all changes
-results = idx.search(queries_embeddings=queries, top_k=10)
-
-# 5. Compact when convenient
-idx.compact()
+idx.filter("category = ?", ["science"])                                      # equality
+idx.filter("year >= ?", [2024])                                              # range
+idx.filter("author.org = ?", ["ACME"])                                       # struct access
+idx.filter("list_contains(tags, ?)", ["ml"])                                 # list operations
+idx.filter("category = ? AND year >= ?", ["science", 2024])                  # combined
+idx.filter("len(list_filter(sections, x -> x.word_count > 500)) > 0")       # lambdas
 ```
+
+```python
+Parameter                   Default     Description
+condition                   required    SQL WHERE clause fragment (e.g. "category = ? AND year > ?")
+parameters                  None        Values for ? placeholders in condition
+```
+
+Metadata is automatically kept in sync with index mutations: `delete()` and `compact()` remove metadata for deleted passages, and documents with different attribute sets coexist (missing fields are stored as `NULL`).
 
 &nbsp;
 
@@ -445,7 +456,6 @@ And for WARP (arXiv entry):
 ## Contributing
 
 This is an active in development project. Contributions are welcome, particularly in:
-- Metadata filtering
 - Adding a reranking step at the end of the search pipeline can stabilize the retrieval metrics, especially for datasets like `fiqa`
 
 ## Acknowledgments
