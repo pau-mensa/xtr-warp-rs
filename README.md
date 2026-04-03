@@ -79,38 +79,44 @@ make build
 
 ## ⚡️ Quick Start
 
-Get started with creating an index and performing a search in just a few lines of Python.
-
-### In-Memory Embeddings
-
 ```python
 import torch
-
 from xtr_warp import XTRWarp
 
-xtr_warp = XTRWarp(index="index")
-
+idx = XTRWarp(index="my_index")
 embedding_dim = 128
 
-# Index 100 documents, each with 300 tokens, each token is a 128-dim vector.
-xtr_warp.create(
+# 1. Create the index with document metadata
+metadata = [
+    {"category": "science", "year": 2024, "tags": ["ml", "search"]},
+    {"category": "history", "year": 2023, "tags": ["medieval"]},
+    # ... one dict per document
+]
+idx.create(
     embeddings_source=[torch.randn(300, embedding_dim) for _ in range(100)],
     device="cpu",
+    metadata=metadata,
 )
+idx.load(device="cpu", dtype=torch.float32)
 
-# Load the index
-xtr_warp.load(device="cpu", dtype=torch.float32)
+# 2. Search (returns list of lists of (passage_id, score) tuples)
+results = idx.search(queries_embeddings=torch.randn(2, 50, embedding_dim), top_k=10)
 
-# Search for 2 queries, each with 50 tokens, each token is a 128-dim vector
-scores = xtr_warp.search(
-    queries_embeddings=torch.randn(2, 50, embedding_dim),
-    top_k=10,
-)
+# 3. Filter by metadata, then search only matching documents
+subset = idx.filter("category = ? AND year >= ?", ["science", 2024])
+results = idx.search(queries_embeddings=torch.randn(2, 50, embedding_dim), top_k=10, subset=subset)
 
-print(scores)
+# 4. Incremental mutations (metadata can be attached to new documents too)
+new_ids = idx.add(new_docs, metadata=[{"category": "art", "year": 2025}])
+idx.update(passage_ids=[5], embeddings_source=[torch.randn(200, embedding_dim)])
+idx.delete(passage_ids=[2, 8])
+
+# 5. Searches immediately reflect all changes
+results = idx.search(queries_embeddings=torch.randn(2, 50, embedding_dim), top_k=10)
+
+# 6. Compact when convenient
+idx.compact()
 ```
-
-The output will be a list of lists, where each inner list contains tuples of (document_index, similarity_score) for the top_k results for each query.
 
 ### Streaming from Disk (Path-Based)
 
@@ -273,6 +279,7 @@ centroid_score_threshold    None        Per-token filter to skip weak tokens, fr
 max_candidates              None        Cap on document candidates before final selection (e.g 64000)
 batch_size                  8192        Batch size for centroid scoring (watch out for VRAM spike in large indices)
 num_threads                 1           Upper bound for CPU parallelism during search (not used on CUDA)
+subset                      None        List of passage IDs to restrict search to (from filter())
 ```
 
 ### Indexing
@@ -292,6 +299,7 @@ nbits                      4           Product quantization bits for compression
 n_samples_kmeans           None        Samples for K-means clustering
 seed                       42          Random seed for reproducibility
 use_triton_kmeans          None        Whether to use Triton-based K-means
+metadata                   None        List of dicts (one per document) for metadata filtering
 ```
 
 > [!IMPORTANT]
@@ -327,6 +335,9 @@ WARP supports incremental index mutations without requiring a full rebuild. Docu
 
 After each `add()`, the engine also checks for *outlier* embeddings (those far from any existing centroid). If enough outliers are found, it runs K-means on them and expands the centroid codebook, keeping cluster quality stable as the distribution shifts. The outlier detection threshold is recalibrated via a weighted average so it adapts to the evolving data.
 
+> [!WARNING]
+> If your index keeps growing with updates and you created the index with less than **3k docs** consider rebuilding when you have at least **3k docs** or when the initial size you used for indexing is less than **50%** of the total size of the index. Retrieval metrics can degrade otherwise due to a bad initialization of the centroids.
+
 #### Delete
 
 ```python
@@ -356,6 +367,7 @@ reload                      True        Auto-reload index after mutation so sear
 min_outliers                50          Minimum outlier count to trigger centroid expansion
 max_growth_rate             0.1         Maximum ratio of new centroids relative to current codebook size
 max_points_per_centroid     256         Points per centroid for expansion K-means
+metadata                    None        List of dicts (one per new document) for metadata filtering
 ```
 
 Returns the list of newly assigned passage IDs.
@@ -389,29 +401,28 @@ reload                      True        Auto-reload index after compaction
 
 Compaction rewrites all chunks to exclude deleted passages, prunes centroids that no longer have any assigned embeddings, rebuilds the centroid-sorted layout, and recalibrates the cluster threshold and average residual. Use it after a batch of deletions or updates to reclaim disk space and keep the index tight.
 
-#### Typical lifecycle
+### Metadata Filtering
+
+WARP supports document-level metadata filtering backed by [DuckDB](https://duckdb.org/). Metadata is stored as a DuckDB database alongside the index. Column types are inferred automatically from Python objects: scalars, lists, dicts (structs), and nested combinations are all supported.
+
+`filter()` accepts a SQL WHERE clause fragment with `?` parameter placeholders. The full [DuckDB function set](https://duckdb.org/docs/sql/functions/overview) is available:
 
 ```python
-idx = XTRWarp(index="my_index")
-
-# 1. Create the initial index
-idx.create(embeddings_source=docs, device="cuda")
-idx.load(device="cpu", dtype=torch.float32)
-
-# 2. Search
-results = idx.search(queries_embeddings=queries, top_k=10)
-
-# 3. Incremental mutations
-new_ids = idx.add(new_docs)                          # new passage IDs assigned
-idx.update(passage_ids=[5], embeddings_source=[upd])  # replace doc 5
-idx.delete(passage_ids=[2, 8])                        # tombstone docs 2 and 8
-
-# 4. Searches immediately reflect all changes
-results = idx.search(queries_embeddings=queries, top_k=10)
-
-# 5. Compact when convenient
-idx.compact()
+idx.filter("category = ?", ["science"])                                      # equality
+idx.filter("year >= ?", [2024])                                              # range
+idx.filter("author.org = ?", ["ACME"])                                       # struct access
+idx.filter("list_contains(tags, ?)", ["ml"])                                 # list operations
+idx.filter("category = ? AND year >= ?", ["science", 2024])                  # combined
+idx.filter("len(list_filter(sections, x -> x.word_count > 500)) > 0")       # lambdas
 ```
+
+```python
+Parameter                   Default     Description
+condition                   required    SQL WHERE clause fragment (e.g. "category = ? AND year > ?")
+parameters                  None        Values for ? placeholders in condition
+```
+
+Metadata is automatically kept in sync with index mutations: `delete()` and `compact()` remove metadata for deleted passages, and documents with different attribute sets coexist (missing fields are stored as `NULL`).
 
 &nbsp;
 
@@ -445,7 +456,6 @@ And for WARP (arXiv entry):
 ## Contributing
 
 This is an active in development project. Contributions are welcome, particularly in:
-- Metadata filtering
 - Adding a reranking step at the end of the search pipeline can stabilize the retrieval metrics, especially for datasets like `fiqa`
 
 ## Acknowledgments
