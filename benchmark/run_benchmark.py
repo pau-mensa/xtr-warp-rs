@@ -5,7 +5,8 @@
 #    "fast_plaid",
 #    "ranx",
 #    "psutil",
-#    "pyyaml"
+#    "pyyaml",
+#    "duckdb"
 # ]
 # ///
 
