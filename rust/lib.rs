@@ -167,13 +167,13 @@ impl LoadedSearcher {
     }
 
     /// Main search entrypoint
-    #[pyo3(signature = (torch_path, queries_embeddings, search_config, subset=None, show_progress=true))]
+    #[pyo3(signature = (torch_path, queries_embeddings, search_config, subsets=None, show_progress=true))]
     fn search(
         &self,
         torch_path: String,
         queries_embeddings: PyTensor,
         search_config: SearchConfig,
-        subset: Option<Vec<i64>>,
+        subsets: Option<Vec<Vec<i64>>>,
         show_progress: bool,
     ) -> PyResult<Vec<SearchResult>> {
         call_torch(torch_path)
@@ -203,7 +203,7 @@ impl LoadedSearcher {
                 Query {
                     embeddings: queries_embeddings.deref().shallow_clone(),
                 },
-                subset.as_deref(),
+                subsets.as_deref(),
                 show_progress,
             )
             .map_err(|e| PyRuntimeError::new_err(format!("Search failed: {}", e)))?;

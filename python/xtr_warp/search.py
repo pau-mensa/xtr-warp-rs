@@ -294,7 +294,7 @@ def search_on_device(
     queries_embeddings: torch.Tensor,
     loaded_index,
     torch_path: str,
-    subset: list[int] | None = None,
+    subsets: list[list[int]] | None = None,
     show_progress: bool = True,
 ) -> list[list[tuple[int, float]]]:
     """Perform a search on a loaded index."""
@@ -302,7 +302,7 @@ def search_on_device(
         torch_path=torch_path,
         queries_embeddings=queries_embeddings,
         search_config=search_config,
-        subset=subset,
+        subsets=subsets,
         show_progress=show_progress,
     )
 
@@ -855,6 +855,30 @@ class XTRWarp:
 
         return self._metadata
 
+    def _prepare_subsets(
+        self,
+        queries_embeddings: torch.Tensor,
+        subset: list[list[int]] | list[int],
+    ) -> list[list[int]]:
+        """Validate and normalize subsets for search."""
+        n_queries = queries_embeddings.shape[0]
+
+        if len(subset) == 0:
+            return [[]]
+
+        # Shared subset: list[int] → wrap for broadcast
+        if isinstance(subset[0], int):
+            return [list(subset)]  # type: ignore[arg-type]
+
+        # Per-query subsets: list[list[int]]
+        if len(subset) != n_queries:
+            error = (
+                f"When passing per-query subsets, the number of subset lists "
+                f"({len(subset)}) must match the number of queries ({n_queries})"
+            )
+            raise ValueError(error)
+        return [list(s) for s in subset]  # type: ignore[arg-type]
+
     def load(
         self,
         device: str | list[str] = "auto",
@@ -1037,7 +1061,7 @@ class XTRWarp:
         max_candidates: int | None = None,
         centroid_score_threshold: float | None = None,
         batch_size: int | None = 8192,
-        subset: list[int] | None = None,
+        subset: list[list[int]] | list[int] | None = None,
         show_progress: bool = True,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
@@ -1063,20 +1087,17 @@ class XTRWarp:
             Threshold for centroid scores, from 0 to 1. Defaults to None.
         batch_size:
             Batch size for the query matmul against the centroids. Defaults to 8192.
+        subset:
+            Passage IDs to restrict the search to. Can be:
+            - ``None``: no filtering (default).
+            - ``list[int]``: a single subset applied to every query.
+            - ``list[list[int]]``: per-query subsets whose length must equal
+              the number of queries.
 
         """
         if self._loaded_searchers is None or self.devices is None:
             error = "Index not loaded, call load() first"
             raise RuntimeError(error)
-
-        # Empty subset → no results possible
-        if subset is not None and len(subset) == 0:
-            n_queries = (
-                len(queries_embeddings)
-                if isinstance(queries_embeddings, list)
-                else queries_embeddings.shape[0]
-            )
-            return [[] for _ in range(n_queries)]
 
         if (
             num_threads is not None
@@ -1112,6 +1133,9 @@ class XTRWarp:
 
         if self.dtype != queries_embeddings.dtype:
             queries_embeddings = queries_embeddings.to(self.dtype)
+
+        if subset is not None:
+            subset = self._prepare_subsets(queries_embeddings, subset)
 
         optimized = self.optimize_hyperparams(top_k, queries_embeddings)
 
@@ -1159,7 +1183,7 @@ class XTRWarp:
                 queries_embeddings=queries_embeddings,
                 search_config=search_config,
                 loaded_index=self._loaded_searchers[0],
-                subset=subset,
+                subsets=subset,
                 show_progress=show_progress,
             )
         else:
@@ -1169,10 +1193,28 @@ class XTRWarp:
                 tensor=queries_embeddings, split_size_or_sections=split_size
             )
 
+            # Split per-query subsets alongside queries; broadcast stays as-is
+            if subset is not None and len(subset) > 1:
+                subset_splits = []
+                offset = 0
+                for dev_queries in queries_embeddings_splits:
+                    n = dev_queries.shape[0]
+                    subset_splits.append(subset[offset : offset + n])
+                    offset += n
+            else:
+                subset_splits = [subset] * len(queries_embeddings_splits)
+
             args_for_starmap = [
-                (search_config, dev_queries, loaded_index, torch_path, subset, show_progress)
-                for loaded_index, dev_queries in zip(
-                    self._loaded_searchers, queries_embeddings_splits
+                (
+                    search_config,
+                    dev_queries,
+                    loaded_index,
+                    torch_path,
+                    dev_subset,
+                    show_progress,
+                )
+                for loaded_index, dev_queries, dev_subset in zip(
+                    self._loaded_searchers, queries_embeddings_splits, subset_splits
                 )
             ]
 
