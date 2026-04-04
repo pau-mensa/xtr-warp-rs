@@ -106,6 +106,98 @@ def test_search_with_full_subset():
         _cleanup()
 
 
+def test_search_with_per_query_subsets():
+    """Each query should only return PIDs from its own subset."""
+    try:
+        idx, _docs, queries = _fresh_index()
+
+        subsets = [
+            list(range(0, 20)),
+            list(range(20, 40)),
+            list(range(40, 60)),
+            list(range(60, 80)),
+            list(range(80, 100)),
+        ]
+
+        results = idx.search(
+            queries_embeddings=queries, subset=subsets, **SEARCH_KWARGS
+        )
+
+        assert len(results) == 5
+        for query_res, query_subset in zip(results, subsets):
+            pids = {pid for pid, _ in query_res}
+            assert pids.issubset(set(query_subset)), (
+                f"Returned PIDs {pids - set(query_subset)} not in query subset"
+            )
+    finally:
+        _cleanup()
+
+
+def test_per_query_subsets_with_empty():
+    """Per-query subsets where some are empty should return empty for those queries."""
+    try:
+        idx, _docs, queries = _fresh_index()
+
+        subsets = [
+            list(range(0, 20)),
+            [],
+            list(range(40, 60)),
+            [],
+            list(range(80, 100)),
+        ]
+
+        results = idx.search(
+            queries_embeddings=queries, subset=subsets, **SEARCH_KWARGS
+        )
+
+        assert len(results) == 5
+        assert len(results[1]) == 0
+        assert len(results[3]) == 0
+
+        for i in [0, 2, 4]:
+            pids = {pid for pid, _ in results[i]}
+            assert pids.issubset(set(subsets[i]))
+    finally:
+        _cleanup()
+
+
+def test_per_query_subsets_length_mismatch():
+    """Mismatched number of subsets and queries should raise ValueError."""
+    try:
+        idx, _docs, queries = _fresh_index()
+
+        subsets = [list(range(0, 20)), list(range(20, 40))]  # 2 subsets, 5 queries
+
+        try:
+            idx.search(queries_embeddings=queries, subset=subsets, **SEARCH_KWARGS)
+            assert False, "Expected ValueError"
+        except ValueError:
+            pass
+    finally:
+        _cleanup()
+
+
+def test_per_query_subsets_match_shared():
+    """Per-query subsets all identical should match a single shared subset."""
+    try:
+        idx, _docs, queries = _fresh_index()
+        shared = list(range(0, 30))
+
+        results_shared = idx.search(
+            queries_embeddings=queries, subset=shared, **SEARCH_KWARGS
+        )
+        results_per_query = idx.search(
+            queries_embeddings=queries, subset=[shared] * 5, **SEARCH_KWARGS
+        )
+
+        for shared_res, pq_res in zip(results_shared, results_per_query):
+            shared_pids = {pid for pid, _ in shared_res}
+            pq_pids = {pid for pid, _ in pq_res}
+            assert shared_pids == pq_pids
+    finally:
+        _cleanup()
+
+
 # ---------------------------------------------------------------------------
 # Metadata store + filtering tests
 # ---------------------------------------------------------------------------
