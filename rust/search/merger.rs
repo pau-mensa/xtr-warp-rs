@@ -227,11 +227,15 @@ impl ResultMerger {
     /// Partial sort results to get top-k candidates
     fn partial_sort_results(stride: &AnnotatedStrideView, num_results: usize) -> Vec<usize> {
         let size = stride.size;
+        let effective = num_results.min(size);
+        if effective == 0 {
+            return vec![];
+        }
         let mut pid_idx: Vec<usize> = (0..size).collect();
 
         let scores = &stride.scores;
-        pid_idx[..num_results.min(size)].select_nth_unstable_by(
-            num_results.min(size) - 1,
+        pid_idx[..effective].select_nth_unstable_by(
+            effective - 1,
             |&idx1, &idx2| {
                 let score1 = scores[idx1];
                 let score2 = scores[idx2];
@@ -244,7 +248,7 @@ impl ResultMerger {
         );
 
         // Sort the top-k elements
-        pid_idx[..num_results.min(size)].sort_unstable_by(|&idx1, &idx2| {
+        pid_idx[..effective].sort_unstable_by(|&idx1, &idx2| {
             let score1 = scores[idx1];
             let score2 = scores[idx2];
             score2
@@ -353,18 +357,13 @@ impl ResultMerger {
             let top_idx = Self::partial_sort_results(&views[0], budget);
 
             // Extract the top-k PIDs and scores
-            let mut result_pids = vec![0i64; budget];
-            let mut result_scores = vec![0.0f32; budget];
             let limit = top_idx.len();
+            let mut result_pids = Vec::with_capacity(limit);
+            let mut result_scores = Vec::with_capacity(limit);
 
-            for i in 0..budget {
-                if i >= limit {
-                    break;
-                }
-                let idx = top_idx[i];
-                // let k_idx = &top_idx[..k.min(top_idx.len())];
-                result_pids[i] = views[0].pids[idx];
-                result_scores[i] = views[0].scores[idx];
+            for &idx in &top_idx {
+                result_pids.push(views[0].pids[idx]);
+                result_scores.push(views[0].scores[idx]);
             }
 
             Ok((result_pids, result_scores))

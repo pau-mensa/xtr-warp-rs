@@ -42,7 +42,15 @@ pub struct WARPScorer {
 }
 
 impl WARPScorer {
-    pub fn new(index: &Arc<ReadOnlyIndex>, config: SearchConfig) -> Result<Self> {
+    pub fn new(index: &Arc<ReadOnlyIndex>, mut config: SearchConfig) -> Result<Self> {
+        let num_centroids = index.metadata.num_centroids as u32;
+        if config.nprobe > num_centroids {
+            config.nprobe = num_centroids;
+        }
+        if config.bound > num_centroids as usize {
+            config.bound = num_centroids as usize;
+        }
+
         let device = parse_device(&config.device)?;
         let batch_size = config.batch_size;
         let centroid_selector = CentroidSelector::new(

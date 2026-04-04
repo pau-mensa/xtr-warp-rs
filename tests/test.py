@@ -7,7 +7,7 @@ from xtr_warp.search import XTRWarp
 
 
 def test():
-    """Ensure that the Fast-PLAiD search index can be created and queried correctly."""
+    """Ensure that the WARP search index can be created and queried correctly."""
     index_name = ".indices/test_index"
 
     if os.path.exists(index_name):
@@ -107,3 +107,82 @@ def test_embeddings_from_path():
 
     shutil.rmtree(index_name, ignore_errors=True)
     shutil.rmtree(emb_dir, ignore_errors=True)
+
+
+def test_nprobe_and_bound_larger_than_num_centroids():
+    """Ensure search does not panic when nprobe or bound exceed the number of centroids."""
+    index_name = ".indices/test_index_clamp"
+
+    if os.path.exists(index_name):
+        shutil.rmtree(index_name)
+    index = XTRWarp(index=index_name)
+
+    # Small corpus → few centroids (well under 1000)
+    documents_embeddings = [torch.randn(50, 128, device="cpu") for _ in range(20)]
+    queries_embeddings = torch.randn(2, 10, 128, device="cpu")
+
+    index.create(
+        embeddings_source=documents_embeddings,
+        kmeans_niters=4,
+        max_points_per_centroid=256,
+        nbits=4,
+        seed=42,
+        device="cpu",
+    )
+
+    index.load("cpu")
+
+    # nprobe and bound far exceed the actual number of centroids
+    results = index.search(
+        queries_embeddings=queries_embeddings,
+        top_k=5,
+        num_threads=1,
+        nprobe=9999,
+        bound=9999,
+    )
+
+    assert len(results) == 2, f"Expected 2 query results, got {len(results)}"
+    assert all(len(r) <= 5 for r in results), "Each query should return at most top_k results"
+
+    print("✅ Test passed: nprobe/bound larger than num_centroids does not panic.")
+
+    shutil.rmtree(index_name, ignore_errors=True)
+
+
+def test_subset_with_nonexistent_pids():
+    """Search with a subset containing only PIDs not in the index should return empty results, not panic."""
+    index_name = ".indices/test_index_bogus_subset"
+
+    if os.path.exists(index_name):
+        shutil.rmtree(index_name)
+    index = XTRWarp(index=index_name)
+
+    documents_embeddings = [torch.randn(50, 128, device="cpu") for _ in range(20)]
+    queries_embeddings = torch.randn(2, 10, 128, device="cpu")
+
+    index.create(
+        embeddings_source=documents_embeddings,
+        kmeans_niters=4,
+        max_points_per_centroid=256,
+        nbits=4,
+        seed=42,
+        device="cpu",
+    )
+
+    index.load("cpu")
+
+    # Subset with PIDs that don't exist in the index — non-empty so it won't short-circuit
+    results = index.search(
+        queries_embeddings=queries_embeddings,
+        top_k=5,
+        num_threads=1,
+        subset=[999999, 999998],
+    )
+
+    assert len(results) == 2, f"Expected 2 query results, got {len(results)}"
+    for r in results:
+        assert len(r) == 0, f"Expected empty results for bogus subset, got {len(r)}"
+
+    print("✅ Test passed: subset with nonexistent PIDs returns empty results.")
+
+    shutil.rmtree(index_name, ignore_errors=True)
