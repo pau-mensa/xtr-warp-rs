@@ -129,11 +129,16 @@ impl WARPScorer {
         })
     }
 
-    /// Main ranking function that scores and ranks passages for a batch of queries
+    /// Main ranking function that scores and ranks passages for a batch of queries.
+    ///
+    /// `subsets` controls per-query passage filtering:
+    /// - `None`                  → no filtering
+    /// - `Some(&[single_list])`  → same subset broadcast to every query
+    /// - `Some(&[l1, l2, …, lN])` → per-query subsets (length must equal `n_queries`)
     pub fn rank(
         &self,
         query: &Query, // [batch, num_tokens, dim]
-        subset: Option<&[i64]>,
+        subsets: Option<&[Vec<i64>]>,
         show_progress: bool,
     ) -> Result<Vec<SearchResult>> {
         let _guard = tch::no_grad_guard();
@@ -164,6 +169,21 @@ impl WARPScorer {
                     .into_par_iter()
                     .enumerate()
                     .map(|(idx, query_embeddings)| {
+                        let subset: Option<&[i64]> = match subsets {
+                            None => None,
+                            Some(lists) if lists.len() == 1 => Some(&lists[0]),
+                            Some(lists) => Some(&lists[idx]),
+                        };
+
+                        if matches!(subset, Some(s) if s.is_empty()) {
+                            bar_clone.inc(1);
+                            return Ok(SearchResult {
+                                passage_ids: vec![],
+                                scores: vec![],
+                                query_id: idx + 1,
+                            });
+                        }
+
                         let query_mask = masks.i(idx as i64);
                         let centroid_scores =
                             query_embeddings.matmul(&index.centroids.transpose(0, 1));
@@ -225,9 +245,26 @@ impl WARPScorer {
                 );
 
                 for b in 0..batch_size {
+                    let query_idx = c + b as usize;
+                    let subset: Option<&[i64]> = match subsets {
+                        None => None,
+                        Some(lists) if lists.len() == 1 => Some(&lists[0]),
+                        Some(lists) => Some(&lists[query_idx]),
+                    };
+
+                    if matches!(subset, Some(s) if s.is_empty()) {
+                        results.push(SearchResult {
+                            passage_ids: vec![],
+                            scores: vec![],
+                            query_id: query_idx + 1,
+                        });
+                        bar.inc(1);
+                        continue;
+                    }
+
                     // TODO this could be vectorized, with some effort
                     let result = self.process_query(
-                        c + b as usize,
+                        query_idx,
                         batch_queries.i(b),
                         centroid_scores.i(b),
                         batch_mask.i(b),
