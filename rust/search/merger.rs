@@ -234,7 +234,7 @@ impl ResultMerger {
         let mut pid_idx: Vec<usize> = (0..size).collect();
 
         let scores = &stride.scores;
-        pid_idx[..effective].select_nth_unstable_by(
+        pid_idx.select_nth_unstable_by(
             effective - 1,
             |&idx1, &idx2| {
                 let score1 = scores[idx1];
