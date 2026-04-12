@@ -294,6 +294,76 @@ impl Clone for ReadOnlyIndex {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sharded index types — for distributing the IVF index across multiple devices
+// ---------------------------------------------------------------------------
+
+/// A single shard of the index: owns a contiguous centroid range and the
+/// corresponding slices of pids_compacted and residuals_compacted.
+///
+/// # Safety
+/// Marked `Sync` because shard tensors are never mutated after load,
+/// same invariant as `ReadOnlyIndex`.
+pub struct IndexShard {
+    /// Inclusive start of the global centroid range owned by this shard.
+    pub centroid_start: usize,
+    /// Exclusive end of the global centroid range owned by this shard.
+    pub centroid_end: usize,
+    /// Device this shard's tensors live on.
+    pub device: Device,
+    /// Sizes per centroid for this shard's range: [shard_num_centroids].
+    pub sizes_compacted: Tensor,
+    /// Passage IDs for embeddings in this shard: [shard_num_embeddings].
+    pub pids_compacted: Tensor,
+    /// Compressed residuals for embeddings in this shard.
+    pub residuals_compacted: Tensor,
+    /// Local offsets (starts at 0): [shard_num_centroids + 1].
+    pub offsets_compacted: Tensor,
+    /// Mmap handles that must outlive the tensors they back.
+    pub _mmap_handles: Arc<Vec<Mmap>>,
+}
+
+// SAFETY: IndexShard tensors are never mutated after load. All search
+// access is read-only (narrow, index_select). Same invariant as ReadOnlyIndex.
+unsafe impl Sync for IndexShard {}
+
+/// Shared state across all shards: small tensors replicated on the scoring
+/// accelerator device.
+pub struct SharedIndexState {
+    /// Centroids tensor on scoring_device: [num_centroids, dim].
+    pub centroids: Tensor,
+    /// Bucket weights on scoring_device.
+    pub bucket_weights: Tensor,
+    /// Full sizes_compacted on CPU (small, needed by CentroidSelector).
+    pub sizes_compacted: Tensor,
+    /// Dummy centroid index (smallest centroid, for masked tokens).
+    pub kdummy_centroid: CentroidId,
+    /// Index metadata.
+    pub metadata: IndexMetadata,
+    /// The device used for centroid scoring (first accelerator).
+    pub scoring_device: Device,
+}
+
+/// A fully sharded index: shared state + per-device shards.
+pub struct ShardedIndex {
+    pub shared: SharedIndexState,
+    pub shards: Vec<IndexShard>,
+}
+
+/// Read-only wrapper for ShardedIndex, analogous to ReadOnlyIndex.
+/// Tensors are never mutated after load, so we treat them as Sync.
+pub struct ReadOnlyShardedIndex(pub ShardedIndex);
+
+impl std::ops::Deref for ReadOnlyShardedIndex {
+    type Target = ShardedIndex;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+unsafe impl Sync for ReadOnlyShardedIndex {}
+
 /// Query representation for search
 pub struct Query {
     pub embeddings: Tensor, // Always [batch, num_tokens, dim]

@@ -331,6 +331,8 @@ class XTRWarp:
         device: str | None = None,
     ) -> None:
         self._loaded_searchers: list | None = None
+        self._sharded_searcher = None
+        self._is_sharded: bool = False
         self.index: str = index
         self.devices: list | None = None
         self.dtype: torch.dtype | None = None
@@ -339,6 +341,7 @@ class XTRWarp:
         self.device: str | None = device
         self._mmap: bool = True
         self._metadata_store: MetadataStore | None = None
+        self._device_arg: str | list[str] | dict[str, float] | None = None
 
     def _ensure_torch_initialized(self, device: str) -> str:
         """Initialize torch once per device type."""
@@ -355,17 +358,23 @@ class XTRWarp:
             for searcher in self._loaded_searchers:
                 searcher.free()
             self._loaded_searchers = None
+        if self._sharded_searcher is not None:
+            self._sharded_searcher.free()
+            self._sharded_searcher = None
+        self._is_sharded = False
         if self._metadata_store is not None:
             self._metadata_store.close()
             self._metadata_store = None
 
     def _reload_if_loaded(self) -> None:
         """Free and re-load the index using the same parameters as the last ``load()`` call."""
-        if self._loaded_searchers is None or self.devices is None:
+        if self._loaded_searchers is None and self._sharded_searcher is None:
+            return
+        if self._device_arg is None:
             return
         self.free()
         self._metadata = None
-        self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
+        self.load(device=self._device_arg, dtype=self.dtype, mmap=self._mmap)
 
     def __del__(self):
         """Destructor."""
@@ -521,7 +530,9 @@ class XTRWarp:
 
         """
         xtr_warp_rs.delete(self.index, passage_ids)
-        if self._loaded_searchers:
+        if self._sharded_searcher is not None:
+            self._sharded_searcher.update_tombstones(passage_ids)
+        elif self._loaded_searchers:
             for s in self._loaded_searchers:
                 s.update_tombstones(passage_ids)
 
@@ -584,7 +595,7 @@ class XTRWarp:
         device = self._resolve_device(None)
         torch_path = self._ensure_torch_initialized(device)
         embeddings = self._prepare_embeddings(embeddings_source)
-        was_loaded = self._loaded_searchers is not None
+        was_loaded = self._loaded_searchers is not None or self._sharded_searcher is not None
         if was_loaded:
             self.free()
         result = xtr_warp_rs.add(
@@ -616,7 +627,7 @@ class XTRWarp:
 
         if reload and was_loaded:
             self._metadata = None
-            self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
+            self.load(device=self._device_arg or self.devices, dtype=self.dtype, mmap=self._mmap)
         else:
             self._metadata = None
         return new_ids
@@ -643,7 +654,7 @@ class XTRWarp:
         device = self._resolve_device(None)
         torch_path = self._ensure_torch_initialized(device)
         embeddings = self._prepare_embeddings(embeddings_source)
-        was_loaded = self._loaded_searchers is not None
+        was_loaded = self._loaded_searchers is not None or self._sharded_searcher is not None
         if was_loaded:
             self.free()
         xtr_warp_rs.update(
@@ -656,7 +667,7 @@ class XTRWarp:
         )
         if reload and was_loaded:
             self._metadata = None
-            self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
+            self.load(device=self._device_arg or self.devices, dtype=self.dtype, mmap=self._mmap)
         else:
             self._metadata = None
         return self
@@ -676,7 +687,7 @@ class XTRWarp:
         """
         device = self._resolve_device(None)
         torch_path = self._ensure_torch_initialized(device)
-        was_loaded = self._loaded_searchers is not None
+        was_loaded = self._loaded_searchers is not None or self._sharded_searcher is not None
         if was_loaded:
             self.free()
 
@@ -701,7 +712,7 @@ class XTRWarp:
             store.close()
         if reload and was_loaded:
             self._metadata = None
-            self.load(device=self.devices, dtype=self.dtype, mmap=self._mmap)
+            self.load(device=self._device_arg or self.devices, dtype=self.dtype, mmap=self._mmap)
         else:
             self._metadata = None
         return self
@@ -881,7 +892,7 @@ class XTRWarp:
 
     def load(
         self,
-        device: str | list[str] = "auto",
+        device: str | list[str] | dict[str, float] = "auto",
         dtype: torch.dtype = torch.float32,
         mmap: bool = True,
     ) -> "XTRWarp":
@@ -890,30 +901,45 @@ class XTRWarp:
         Args:
         ----
         device:
-            'auto', 'cpu', 'cuda', 'mps', or a list of cuda devices
-                (eg. ['cuda:0', 'cuda:1'])
-            auto, cuda, mps and a list of cuda devices keep the index on CPU
-                but run centroid scoring on the accelerator.
+            'auto', 'cpu', 'cuda', 'mps', or a list of devices, or a dict
+            mapping device strings to ratios (e.g. ``{"cuda:0": 0.6, "cpu": 0.4}``).
+
+            - ``str``: single device, same behavior as before.
+            - ``list[str]``: auto-compute ratios (fill accelerator VRAM first,
+              remainder on CPU). Enables index sharding.
+            - ``dict[str, float]``: explicit ratios for each device. Enables
+              index sharding across devices.
         dtype:
             valid torch dtype
         mmap:
             If True, memory-map the large index tensors (codes and residuals)
-            instead of loading them into memory. Only supported on CPU.
+            instead of loading them into memory. Applied to CPU shards only
+            when sharding is enabled.
 
         """
-        if self._loaded_searchers is not None:
+        if self._loaded_searchers is not None or self._sharded_searcher is not None:
             logger.warning(
                 "Index is already loaded, use free() before calling load() again."
             )
             return self
 
-        devices = [device] if isinstance(device, str) else device
+        self._device_arg = device
         dtype_str = str(dtype).split(".")[1]
         self.dtype = dtype
+        self._mmap = mmap
 
         _ = self._load_metadata()
-        self.devices = devices
 
+        # --- Route: dict[str, float] → sharded loading ---
+        if isinstance(device, dict):
+            return self._load_sharded(device, dtype_str)
+
+        # --- Route: list[str] → auto-compute ratios, then sharded loading ---
+        if isinstance(device, list):
+            ratios = self._compute_device_ratios(device)
+            return self._load_sharded(ratios, dtype_str)
+
+        # --- Route: str → single device (backward compatible) ---
         if device == "auto":
             inferred_device = (
                 "cuda"
@@ -924,9 +950,8 @@ class XTRWarp:
             )
             self.devices = [inferred_device]
         else:
-            self.devices = devices
+            self.devices = [device]
 
-        # Store the primary device so mutation methods can default to it
         self.device = self.devices[0]
 
         if mmap and any(d != "cpu" for d in self.devices):
@@ -934,8 +959,8 @@ class XTRWarp:
                 "mmap=True is only supported when device='cpu', disabling it"
             )
             mmap = False
+            self._mmap = mmap
 
-        self._mmap = mmap
         self._loaded_searchers = []
         for d in self.devices:
             _ = self._ensure_torch_initialized(d)
@@ -948,6 +973,170 @@ class XTRWarp:
             self._metadata_store = MetadataStore(self.index)
 
         return self
+
+    def _load_sharded(
+        self,
+        ratios: dict[str, float],
+        dtype_str: str,
+    ) -> "XTRWarp":
+        """Load the index sharded across multiple devices.
+
+        CPU shards always use mmap (the whole point of sharding is that
+        the index doesn't fit in one place). GPU shards ignore mmap.
+        """
+        # Normalize ratios to sum to 1.0
+        total = sum(ratios.values())
+        if total <= 0:
+            raise ValueError("Device ratios must sum to a positive number")
+        ratios = {d: r / total for d, r in ratios.items()}
+
+        # Single device with full ratio → use the original LoadedSearcher
+        # path (zero overhead vs the sharded pipeline).
+        if len(ratios) == 1:
+            device_str = next(iter(ratios))
+            mmap = not device_str.startswith("cuda") and not device_str.startswith("mps")
+            _ = self._ensure_torch_initialized(device_str)
+            self.devices = [device_str]
+            self.device = device_str
+            self._mmap = mmap
+            self._loaded_searchers = []
+            searcher = xtr_warp_rs.LoadedSearcher(
+                self.index, device_str, dtype_str, mmap
+            )
+            searcher.load()
+            self._loaded_searchers.append(searcher)
+            metadata_db = os.path.join(self.index, "metadata.duckdb")
+            if os.path.exists(metadata_db):
+                self._metadata_store = MetadataStore(self.index)
+            return self
+
+        # Soft VRAM check: warn if a GPU ratio implies more memory than available
+        try:
+            mem_est = xtr_warp_rs.estimate_index_memory(self.index)
+            shardable = mem_est.get("pids", 0) + mem_est.get("residuals", 0)
+            for dev, ratio in ratios.items():
+                if dev.startswith("cuda") and torch.cuda.is_available():
+                    dev_idx = int(dev.split(":")[-1]) if ":" in dev else 0
+                    free, _ = torch.cuda.mem_get_info(dev_idx)
+                    needed = ratio * shardable
+                    overhead = mem_est.get("centroids", 0) + mem_est.get(
+                        "bucket_weights", 0
+                    )
+                    if needed + overhead > free:
+                        logger.warning(
+                            "Device %s: estimated shard size %.0f MB + overhead %.0f MB "
+                            "exceeds free VRAM %.0f MB — may OOM",
+                            dev,
+                            needed / 1e6,
+                            overhead / 1e6,
+                            free / 1e6,
+                        )
+        except Exception:
+            pass  # best-effort check
+
+        # Initialize torch for all device types
+        for dev in ratios:
+            _ = self._ensure_torch_initialized(dev)
+
+        device_ratios_list = [(dev, ratio) for dev, ratio in ratios.items()]
+        searcher = xtr_warp_rs.ShardedSearcher(
+            self.index, device_ratios_list, dtype_str, True  # CPU shards always mmap
+        )
+        searcher.load()
+
+        self._sharded_searcher = searcher
+        self._is_sharded = True
+        self.devices = list(ratios.keys())
+        self.device = self.devices[0]
+
+        metadata_db = os.path.join(self.index, "metadata.duckdb")
+        if os.path.exists(metadata_db):
+            self._metadata_store = MetadataStore(self.index)
+
+        return self
+
+    def _compute_device_ratios(self, devices: list[str]) -> dict[str, float]:
+        """Compute shard ratios: fill accelerator VRAM first, remainder to CPU."""
+        try:
+            mem_est = xtr_warp_rs.estimate_index_memory(self.index)
+        except Exception as e:
+            logger.warning("Could not estimate index memory: %s — using equal ratios", e)
+            n = len(devices)
+            return {d: 1.0 / n for d in devices}
+
+        shardable = mem_est.get("pids", 0) + mem_est.get("residuals", 0)
+        if shardable == 0:
+            n = len(devices)
+            return {d: 1.0 / n for d in devices}
+
+        accel_overhead = (
+            mem_est.get("centroids", 0)
+            + mem_est.get("bucket_weights", 0)
+            + 50 * 1024 * 1024  # 50 MB reserve for matmul + allocator
+        )
+
+        accelerators = [d for d in devices if d != "cpu"]
+        has_cpu = "cpu" in devices
+
+        ratios: dict[str, float] = {}
+        remaining = 1.0
+
+        for i, dev in enumerate(accelerators):
+            if remaining <= 0:
+                break
+            try:
+                dev_idx = int(dev.split(":")[-1]) if ":" in dev else 0
+                free, _ = torch.cuda.mem_get_info(dev_idx)
+            except Exception:
+                continue
+
+            usable = free - (accel_overhead if i == 0 else 0)
+            usable = max(0, usable)
+            ratio = min(usable / shardable, remaining)
+            ratios[dev] = ratio
+            remaining -= ratio
+
+        if remaining > 0 and has_cpu:
+            ratios["cpu"] = remaining
+        elif remaining > 0 and not has_cpu:
+            # Distribute remainder proportionally across existing devices
+            if ratios:
+                assigned = sum(ratios.values())
+                if assigned > 0:
+                    for dev in ratios:
+                        ratios[dev] /= assigned
+            else:
+                # Fallback: equal split
+                for dev in devices:
+                    ratios[dev] = 1.0 / len(devices)
+
+        return ratios
+
+    def estimate_index_memory(self) -> dict[str, int]:
+        """Estimate memory in bytes for each index component.
+
+        Returns a dict with keys: 'centroids', 'bucket_weights', 'pids',
+        'residuals', 'sizes_and_offsets', 'total'.
+        """
+        return xtr_warp_rs.estimate_index_memory(self.index)
+
+    def recommend_device_map(
+        self,
+        devices: list[str],
+    ) -> dict[str, float]:
+        """Suggest a device map based on available memory.
+
+        Args:
+        ----
+        devices:
+            List of devices to consider (e.g. ``["cuda:0", "cpu"]``).
+
+        Returns:
+        -------
+        Dict mapping device → ratio.
+
+        """
+        return self._compute_device_ratios(devices)
 
     def optimize_hyperparams(
         self, top_k: int, queries_embeddings: torch.Tensor
@@ -1095,12 +1284,16 @@ class XTRWarp:
               the number of queries.
 
         """
-        if self._loaded_searchers is None or self.devices is None:
+        if (
+            self._loaded_searchers is None
+            and self._sharded_searcher is None
+        ) or self.devices is None:
             error = "Index not loaded, call load() first"
             raise RuntimeError(error)
 
         if (
-            num_threads is not None
+            not self._is_sharded
+            and num_threads is not None
             and num_threads > 1
             and self.devices[0].startswith("cuda")
         ):
@@ -1177,7 +1370,18 @@ class XTRWarp:
             max_candidates=max_candidates,
         )
         torch_path = self._ensure_torch_initialized(device)
-        if len(self.devices) == 1:
+
+        if self._is_sharded:
+            # Sharded path: all queries go through the single sharded searcher
+            scores = search_on_device(
+                torch_path=torch_path,
+                queries_embeddings=queries_embeddings,
+                search_config=search_config,
+                loaded_index=self._sharded_searcher,
+                subsets=subset,
+                show_progress=show_progress,
+            )
+        elif len(self.devices) == 1:
             scores = search_on_device(
                 torch_path=torch_path,
                 queries_embeddings=queries_embeddings,
