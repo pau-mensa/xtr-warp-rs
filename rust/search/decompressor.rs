@@ -418,13 +418,15 @@ impl CentroidDecompressor {
         let query = query_embeddings.to_kind(Kind::Float);
 
         let query_per_candidate = query.index_select(0, &token_indices);
-        let codes_flat = codes.to_kind(Kind::Int64).view([-1]);
+        let codes_flat = codes.to_kind(Kind::Int).view([-1]);
         let weights_flat = bucket_weights.index_select(0, &codes_flat);
         let weights = weights_flat.view([total_capacity, dim]);
 
-        let sum_dim = [1i64];
-        let residual_scores =
-            (&query_per_candidate * &weights).sum_dim_intlist(&sum_dim[..], false, Kind::Float);
+        let residual_scores = Tensor::einsum(
+            "td,td->t",
+            &[&query_per_candidate, &weights],
+            None::<&[i64]>,
+        );
 
         let centroid_scores_f = centroid_scores.to_kind(Kind::Float);
         let centroid_per_candidate = centroid_scores_f.index_select(0, &candidate_cells);
