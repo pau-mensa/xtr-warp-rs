@@ -990,26 +990,6 @@ class XTRWarp:
             raise ValueError("Device ratios must sum to a positive number")
         ratios = {d: r / total for d, r in ratios.items()}
 
-        # Single device with full ratio → use the original LoadedSearcher
-        # path (zero overhead vs the sharded pipeline).
-        if len(ratios) == 1:
-            device_str = next(iter(ratios))
-            mmap = not device_str.startswith("cuda") and not device_str.startswith("mps")
-            _ = self._ensure_torch_initialized(device_str)
-            self.devices = [device_str]
-            self.device = device_str
-            self._mmap = mmap
-            self._loaded_searchers = []
-            searcher = xtr_warp_rs.LoadedSearcher(
-                self.index, device_str, dtype_str, mmap
-            )
-            searcher.load()
-            self._loaded_searchers.append(searcher)
-            metadata_db = os.path.join(self.index, "metadata.duckdb")
-            if os.path.exists(metadata_db):
-                self._metadata_store = MetadataStore(self.index)
-            return self
-
         # Soft VRAM check: warn if a GPU ratio implies more memory than available
         try:
             mem_est = xtr_warp_rs.estimate_index_memory(self.index)
