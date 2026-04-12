@@ -68,14 +68,13 @@ addopts = [
   "--verbose",
   "-ra",
   "--cov-config=.coveragerc",
-  "-m not web and not slow",
+  "-m not sharding",
+]
+markers = [
+  "sharding: marks tests that require an accelerator or the full sharding test suite",
 ]
 doctest_optionflags = ["NORMALIZE_WHITESPACE", "NUMBER"]
 norecursedirs = ["build", "docs", "node_modules"]
-markers = [
-  "web: tests that require using the Internet",
-  "slow: tests that take a long time to run",
-]
 
 [tool.ruff]
 line-length = 88
