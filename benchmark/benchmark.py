@@ -318,7 +318,7 @@ def run_xtr_warp(
 
     large_queries_embeddings = torch.cat(
         ([queries_embeddings] * ((1000 // queries_embeddings.shape[0]) + 1))[:1000]
-    )[:100]
+    )[:10000]
 
     print(
         f"🔍 {large_queries_embeddings.shape[0]} queries on {dataset_name} - {large_queries_embeddings.shape}..."
@@ -333,6 +333,7 @@ def run_xtr_warp(
         t_prime=config.get("t_prime"),
         max_candidates=config.get("max_candidates"),
         centroid_score_threshold=config.get("centroid_score_threshold"),
+        batch_size=config.get("batch_size", 8192),
     )
     end_search = time.time()
     heavy_search_time = end_search - start_search
