@@ -4,8 +4,7 @@ use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
 use crate::utils::types::{
-    DecompressSource, DecompressedCentroidsOutput, IndexShard, PassageBitset, ReadOnlyIndex,
-    ShardSource,
+    DecompressSource, DecompressedCentroidsOutput, IndexShard, PassageBitset, ShardSource,
 };
 
 /// Centroid decompressor for efficient residual decompression
@@ -59,27 +58,6 @@ impl CentroidDecompressor {
             reversed[byte_val as usize] = (reversed_bits & 0xFF) as u8;
         }
         reversed
-    }
-
-    /// Decompress centroids for a non-sharded (whole) index.
-    pub fn decompress_centroids(
-        &self,
-        centroid_ids: &Tensor,
-        centroid_scores: &Tensor,
-        index: &Arc<ReadOnlyIndex>,
-        query_embeddings: &Tensor,
-        nprobe: usize,
-        subset: Option<&[i64]>,
-    ) -> Result<DecompressedCentroidsOutput> {
-        self.decompress(
-            centroid_ids,
-            centroid_scores,
-            index.as_ref(),
-            query_embeddings,
-            nprobe,
-            subset,
-            None,
-        )
     }
 
     /// Decompress centroids for a single shard. Global centroid IDs are

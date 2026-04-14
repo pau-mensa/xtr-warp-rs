@@ -12,7 +12,6 @@ from typing import Protocol
 
 import numpy as np
 import torch
-import torch.multiprocessing as mp
 from fastkmeans import FastKMeans
 
 from . import xtr_warp_rs
@@ -330,9 +329,7 @@ class XTRWarp:
         index: str,
         device: str | None = None,
     ) -> None:
-        self._loaded_searchers: list | None = None
-        self._sharded_searcher = None
-        self._is_sharded: bool = False
+        self._searcher = None
         self.index: str = index
         self.devices: list | None = None
         self.dtype: torch.dtype | None = None
@@ -354,21 +351,16 @@ class XTRWarp:
 
     def free(self) -> None:
         """Free the loaded index from memory."""
-        if self._loaded_searchers is not None:
-            for searcher in self._loaded_searchers:
-                searcher.free()
-            self._loaded_searchers = None
-        if self._sharded_searcher is not None:
-            self._sharded_searcher.free()
-            self._sharded_searcher = None
-        self._is_sharded = False
+        if self._searcher is not None:
+            self._searcher.free()
+            self._searcher = None
         if self._metadata_store is not None:
             self._metadata_store.close()
             self._metadata_store = None
 
     def _reload_if_loaded(self) -> None:
         """Free and re-load the index using the same parameters as the last ``load()`` call."""
-        if self._loaded_searchers is None and self._sharded_searcher is None:
+        if self._searcher is None:
             return
         if self._device_arg is None:
             return
@@ -530,11 +522,8 @@ class XTRWarp:
 
         """
         xtr_warp_rs.delete(self.index, passage_ids)
-        if self._sharded_searcher is not None:
-            self._sharded_searcher.update_tombstones(passage_ids)
-        elif self._loaded_searchers:
-            for s in self._loaded_searchers:
-                s.update_tombstones(passage_ids)
+        if self._searcher is not None:
+            self._searcher.update_tombstones(passage_ids)
 
         if self._metadata_store is not None:
             self._metadata_store.delete(passage_ids)
@@ -595,7 +584,7 @@ class XTRWarp:
         device = self._resolve_device(None)
         torch_path = self._ensure_torch_initialized(device)
         embeddings = self._prepare_embeddings(embeddings_source)
-        was_loaded = self._loaded_searchers is not None or self._sharded_searcher is not None
+        was_loaded = self._searcher is not None
         if was_loaded:
             self.free()
         result = xtr_warp_rs.add(
@@ -627,7 +616,11 @@ class XTRWarp:
 
         if reload and was_loaded:
             self._metadata = None
-            self.load(device=self._device_arg or self.devices, dtype=self.dtype, mmap=self._mmap)
+            self.load(
+                device=self._device_arg or self.devices,
+                dtype=self.dtype,
+                mmap=self._mmap,
+            )
         else:
             self._metadata = None
         return new_ids
@@ -654,7 +647,7 @@ class XTRWarp:
         device = self._resolve_device(None)
         torch_path = self._ensure_torch_initialized(device)
         embeddings = self._prepare_embeddings(embeddings_source)
-        was_loaded = self._loaded_searchers is not None or self._sharded_searcher is not None
+        was_loaded = self._searcher is not None
         if was_loaded:
             self.free()
         xtr_warp_rs.update(
@@ -667,7 +660,11 @@ class XTRWarp:
         )
         if reload and was_loaded:
             self._metadata = None
-            self.load(device=self._device_arg or self.devices, dtype=self.dtype, mmap=self._mmap)
+            self.load(
+                device=self._device_arg or self.devices,
+                dtype=self.dtype,
+                mmap=self._mmap,
+            )
         else:
             self._metadata = None
         return self
@@ -687,7 +684,7 @@ class XTRWarp:
         """
         device = self._resolve_device(None)
         torch_path = self._ensure_torch_initialized(device)
-        was_loaded = self._loaded_searchers is not None or self._sharded_searcher is not None
+        was_loaded = self._searcher is not None
         if was_loaded:
             self.free()
 
@@ -712,7 +709,11 @@ class XTRWarp:
             store.close()
         if reload and was_loaded:
             self._metadata = None
-            self.load(device=self._device_arg or self.devices, dtype=self.dtype, mmap=self._mmap)
+            self.load(
+                device=self._device_arg or self.devices,
+                dtype=self.dtype,
+                mmap=self._mmap,
+            )
         else:
             self._metadata = None
         return self
@@ -917,7 +918,7 @@ class XTRWarp:
             when sharding is enabled.
 
         """
-        if self._loaded_searchers is not None or self._sharded_searcher is not None:
+        if self._searcher is not None:
             logger.warning(
                 "Index is already loaded, use free() before calling load() again."
             )
@@ -930,67 +931,47 @@ class XTRWarp:
 
         _ = self._load_metadata()
 
-        # --- Route: dict[str, float] → sharded loading ---
+        # explicit ratios
         if isinstance(device, dict):
-            return self._load_sharded(device, dtype_str)
+            return self._load_sharded(device, dtype_str, mmap=True)
 
-        # --- Route: list[str] → auto-compute ratios, then sharded loading ---
+        # auto-compute ratios
         if isinstance(device, list):
             ratios = self._compute_device_ratios(device)
-            return self._load_sharded(ratios, dtype_str)
+            return self._load_sharded(ratios, dtype_str, mmap=True)
 
-        # --- Route: str → single device (backward compatible) ---
+        # single device
         if device == "auto":
-            inferred_device = (
+            device = (
                 "cuda"
                 if torch.cuda.is_available()
                 else "mps"
                 if torch.backends.mps.is_available()
                 else "cpu"
             )
-            self.devices = [inferred_device]
-        else:
-            self.devices = [device]
 
-        self.device = self.devices[0]
-
-        if mmap and any(d != "cpu" for d in self.devices):
+        if mmap and device != "cpu":
             logger.warning(
                 "mmap=True is only supported when device='cpu', disabling it"
             )
             mmap = False
             self._mmap = mmap
 
-        self._loaded_searchers = []
-        for d in self.devices:
-            _ = self._ensure_torch_initialized(d)
-            searcher = xtr_warp_rs.LoadedSearcher(self.index, d, dtype_str, mmap)
-            searcher.load()
-            self._loaded_searchers.append(searcher)
-
-        metadata_db = os.path.join(self.index, "metadata.duckdb")
-        if os.path.exists(metadata_db):
-            self._metadata_store = MetadataStore(self.index)
-
-        return self
+        return self._load_sharded({device: 1.0}, dtype_str, mmap=mmap)
 
     def _load_sharded(
         self,
         ratios: dict[str, float],
         dtype_str: str,
+        mmap: bool = True,
     ) -> "XTRWarp":
-        """Load the index sharded across multiple devices.
-
-        CPU shards always use mmap (the whole point of sharding is that
-        the index doesn't fit in one place). GPU shards ignore mmap.
-        """
-        # Normalize ratios to sum to 1.0
+        """Load the index, optionally sharded across multiple devices."""
         total = sum(ratios.values())
         if total <= 0:
             raise ValueError("Device ratios must sum to a positive number")
         ratios = {d: r / total for d, r in ratios.items()}
 
-        # Soft VRAM check: warn if a GPU ratio implies more memory than available
+        # Soft VRAM check
         try:
             mem_est = xtr_warp_rs.estimate_index_memory(self.index)
             shardable = mem_est.get("pids", 0) + mem_est.get("residuals", 0)
@@ -1014,18 +995,16 @@ class XTRWarp:
         except Exception:
             pass  # best-effort check
 
-        # Initialize torch for all device types
         for dev in ratios:
             _ = self._ensure_torch_initialized(dev)
 
-        device_ratios_list = [(dev, ratio) for dev, ratio in ratios.items()]
+        device_ratios_list = list(ratios.items())
         searcher = xtr_warp_rs.ShardedSearcher(
-            self.index, device_ratios_list, dtype_str, True  # Always mmap CPU shards (user's mmap kwarg intentionally overridden)
+            self.index, device_ratios_list, dtype_str, mmap
         )
         searcher.load()
 
-        self._sharded_searcher = searcher
-        self._is_sharded = True
+        self._searcher = searcher
         self.devices = list(ratios.keys())
         self.device = self.devices[0]
 
@@ -1040,7 +1019,9 @@ class XTRWarp:
         try:
             mem_est = xtr_warp_rs.estimate_index_memory(self.index)
         except Exception as e:
-            logger.warning("Could not estimate index memory: %s — using equal ratios", e)
+            logger.warning(
+                "Could not estimate index memory: %s — using equal ratios", e
+            )
             n = len(devices)
             return {d: 1.0 / n for d in devices}
 
@@ -1264,23 +1245,19 @@ class XTRWarp:
               the number of queries.
 
         """
-        if (
-            self._loaded_searchers is None
-            and self._sharded_searcher is None
-        ) or self.devices is None:
+        if self._searcher is None or self.devices is None:
             error = "Index not loaded, call load() first"
             raise RuntimeError(error)
 
         if (
-            not self._is_sharded
+            len(self.devices) == 1
             and num_threads is not None
             and num_threads > 1
             and self.devices[0].startswith("cuda")
         ):
-            warning = (
-                "num_threads > 1 is not supported for cuda devices, defaulting to 1"
+            logger.warning(
+                "num_threads > 1 is not supported for single-device cuda, defaulting to 1"
             )
-            logger.warning(warning)
             num_threads = 1
 
         if isinstance(queries_embeddings, list):
@@ -1351,66 +1328,13 @@ class XTRWarp:
         )
         torch_path = self._ensure_torch_initialized(device)
 
-        if self._is_sharded:
-            # Sharded path: all queries go through the single sharded searcher
-            scores = search_on_device(
-                torch_path=torch_path,
-                queries_embeddings=queries_embeddings,
-                search_config=search_config,
-                loaded_index=self._sharded_searcher,
-                subsets=subset,
-                show_progress=show_progress,
-            )
-        elif len(self.devices) == 1:
-            scores = search_on_device(
-                torch_path=torch_path,
-                queries_embeddings=queries_embeddings,
-                search_config=search_config,
-                loaded_index=self._loaded_searchers[0],
-                subsets=subset,
-                show_progress=show_progress,
-            )
-        else:
-            num_queries = queries_embeddings.shape[0]
-            split_size = (num_queries // len(self.devices)) + 1
-            queries_embeddings_splits = torch.split(
-                tensor=queries_embeddings, split_size_or_sections=split_size
-            )
-
-            # Split per-query subsets alongside queries; broadcast stays as-is
-            if subset is not None and len(subset) > 1:
-                subset_splits = []
-                offset = 0
-                for dev_queries in queries_embeddings_splits:
-                    n = dev_queries.shape[0]
-                    subset_splits.append(subset[offset : offset + n])
-                    offset += n
-            else:
-                subset_splits = [subset] * len(queries_embeddings_splits)
-
-            args_for_starmap = [
-                (
-                    search_config,
-                    dev_queries,
-                    loaded_index,
-                    torch_path,
-                    dev_subset,
-                    show_progress,
-                )
-                for loaded_index, dev_queries, dev_subset in zip(
-                    self._loaded_searchers, queries_embeddings_splits, subset_splits
-                )
-            ]
-
-            scores_devices = []
-
-            context = mp.get_context()
-            with context.Pool(processes=len(args_for_starmap)) as pool:
-                scores_devices = pool.starmap(
-                    func=search_on_device, iterable=args_for_starmap
-                )
-            scores = []
-            for scores_device in scores_devices:
-                scores.extend(scores_device)
+        scores = search_on_device(
+            torch_path=torch_path,
+            queries_embeddings=queries_embeddings,
+            search_config=search_config,
+            loaded_index=self._searcher,
+            subsets=subset,
+            show_progress=show_progress,
+        )
 
         return scores

@@ -233,79 +233,11 @@ impl IndexMetadata {
     }
 }
 
-/// Components of a loaded index
-pub struct LoadedIndex {
-    /// Centroids tensor [num_centroids, dim]
-    pub centroids: Tensor,
-
-    /// Bucket weights for scoring
-    pub bucket_weights: Tensor,
-
-    /// Compacted sizes per centroid
-    pub sizes_compacted: Tensor,
-
-    /// Per-embedding passage IDs in compacted (centroid-sorted) layout
-    pub pids_compacted: Tensor,
-
-    /// Compacted residuals (compressed)
-    pub residuals_compacted: Tensor,
-
-    /// Offsets for each centroid in the compacted arrays
-    pub offsets_compacted: Tensor,
-
-    /// Index of the dummy centroid (smallest)
-    pub kdummy_centroid: CentroidId,
-
-    /// Metadata about the index
-    pub metadata: IndexMetadata,
-
-    /// Mmap handles that must outlive the tensors they back.
-    /// Arc-wrapped for shared ownership across shallow clones.
-    pub _mmap_handles: Arc<Vec<Mmap>>,
-}
-
-impl Clone for LoadedIndex {
-    fn clone(&self) -> Self {
-        Self {
-            centroids: self.centroids.shallow_clone(),
-            bucket_weights: self.bucket_weights.shallow_clone(),
-            sizes_compacted: self.sizes_compacted.shallow_clone(),
-            pids_compacted: self.pids_compacted.shallow_clone(),
-            residuals_compacted: self.residuals_compacted.shallow_clone(),
-            offsets_compacted: self.offsets_compacted.shallow_clone(),
-            kdummy_centroid: self.kdummy_centroid,
-            metadata: self.metadata.clone(),
-            _mmap_handles: Arc::clone(&self._mmap_handles),
-        }
-    }
-}
-
-/// Read-only wrapper that marks the loaded index as safe to share across threads.
-/// The tensors are never mutated after load, so we can treat them as Sync.
-pub struct ReadOnlyIndex(pub LoadedIndex);
-
-impl std::ops::Deref for ReadOnlyIndex {
-    type Target = LoadedIndex;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-unsafe impl Sync for ReadOnlyIndex {}
-
-impl Clone for ReadOnlyIndex {
-    fn clone(&self) -> Self {
-        ReadOnlyIndex(self.0.clone())
-    }
-}
-
 /// A single shard of the index: owns a contiguous centroid range and the
 /// corresponding slices of pids_compacted and residuals_compacted.
 ///
 /// # Safety
-/// Marked `Sync` because shard tensors are never mutated after load,
-/// same invariant as `ReadOnlyIndex`.
+/// Marked `Sync` because shard tensors are never mutated after load.
 pub struct IndexShard {
     /// Inclusive start of the global centroid range owned by this shard.
     pub centroid_start: usize,
@@ -326,7 +258,7 @@ pub struct IndexShard {
 }
 
 // SAFETY: IndexShard tensors are never mutated after load. All search
-// access is read-only (narrow, index_select). Same invariant as ReadOnlyIndex.
+// access is read-only (narrow, index_select).
 unsafe impl Sync for IndexShard {}
 
 /// Shared state across all shards: small tensors replicated on the scoring
@@ -352,7 +284,7 @@ pub struct ShardedIndex {
     pub shards: Vec<IndexShard>,
 }
 
-/// Read-only wrapper for ShardedIndex, analogous to ReadOnlyIndex.
+/// Read-only wrapper for ShardedIndex.
 /// Tensors are never mutated after load, so we treat them as Sync.
 pub struct ReadOnlyShardedIndex(pub ShardedIndex);
 
@@ -521,9 +453,7 @@ impl PassageBitset {
     }
 }
 
-/// Abstraction over index data for decompression. Implemented by both the
-/// whole-index (`ReadOnlyIndex`) and per-shard (`ShardSource`) views so
-/// the decompressor can use a single generic implementation.
+/// Abstraction over index data for decompression, implemented by `ShardSource`.
 pub trait DecompressSource: Sync {
     fn device(&self) -> Device;
     fn pids_compacted(&self) -> &Tensor;
@@ -531,30 +461,9 @@ pub trait DecompressSource: Sync {
     fn offsets_compacted(&self) -> &Tensor;
     fn bucket_weights(&self) -> &Tensor;
     /// Translate global centroid IDs to source-local IDs.
-    /// For the whole index this is a no-op; for a shard it subtracts
+    /// For a shard covering [0, N) this is a no-op; otherwise subtracts
     /// `centroid_start`.
     fn localize_centroid_ids(&self, global_ids: &Tensor) -> Tensor;
-}
-
-impl DecompressSource for ReadOnlyIndex {
-    fn device(&self) -> Device {
-        self.0.pids_compacted.device()
-    }
-    fn pids_compacted(&self) -> &Tensor {
-        &self.0.pids_compacted
-    }
-    fn residuals_compacted(&self) -> &Tensor {
-        &self.0.residuals_compacted
-    }
-    fn offsets_compacted(&self) -> &Tensor {
-        &self.0.offsets_compacted
-    }
-    fn bucket_weights(&self) -> &Tensor {
-        &self.0.bucket_weights
-    }
-    fn localize_centroid_ids(&self, ids: &Tensor) -> Tensor {
-        ids.shallow_clone()
-    }
 }
 
 /// Adapter that presents an `IndexShard` + shared `bucket_weights` as a
@@ -565,7 +474,7 @@ pub struct ShardSource<'a> {
 }
 
 // SAFETY: ShardSource borrows read-only tensors (never mutated after load).
-// Same invariant as IndexShard and ReadOnlyIndex.
+// Same invariant as IndexShard.
 unsafe impl Sync for ShardSource<'_> {}
 
 impl<'a> DecompressSource for ShardSource<'a> {

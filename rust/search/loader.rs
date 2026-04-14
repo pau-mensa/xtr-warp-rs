@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
 use crate::utils::types::{
-    CentroidId, IndexMetadata, IndexShard, LoadedIndex, ShardedIndex, SharedIndexState,
+    CentroidId, IndexMetadata, IndexShard, ShardedIndex, SharedIndexState,
 };
 
 /// Parse a NPY file header, returning (data_offset, shape, tch_kind).
@@ -119,16 +119,18 @@ fn compute_c_strides(shape: &[i64]) -> Vec<i64> {
 /// Index loader responsible for loading WARP index components from disk
 pub struct IndexLoader {
     index_path: PathBuf,
-    device: Device,
     dtype: Kind,
     use_mmap: bool,
 }
 
 impl IndexLoader {
-    /// Create a new index loader
+    /// Create a new index loader.
+    ///
+    /// `device` is accepted for API compatibility but unused — shard
+    /// devices are specified via `load_sharded(device_ratios, …)`.
     pub fn new(
         index_path: impl AsRef<Path>,
-        device: Device,
+        _device: Device,
         dtype: Kind,
         use_mmap: bool,
     ) -> Result<Self> {
@@ -144,134 +146,9 @@ impl IndexLoader {
 
         Ok(Self {
             index_path: path.to_path_buf(),
-            device,
             dtype,
             use_mmap,
         })
-    }
-
-    /// Load the complete index from disk
-    pub fn load(&self) -> Result<LoadedIndex> {
-        let index_path = self.index_path.as_path();
-
-        // Load bucket weights (for scoring)
-        let bucket_weights = self
-            .load_torch_tensor(index_path.join("bucket_weights.npy"))
-            .unwrap()
-            .to_dtype(self.dtype, false, false);
-
-        // Load centroids
-        let centroids = self
-            .load_torch_tensor(index_path.join("centroids.npy"))
-            .unwrap()
-            .to_dtype(self.dtype, false, false);
-
-        // Load compacted sizes per centroid
-        let sizes_compacted = self.load_torch_tensor(index_path.join("sizes.compacted.npy"))?;
-
-        // Load compacted codes and residuals (optionally memory-mapped)
-        let codes_path = index_path.join("codes.compacted.npy");
-        let residuals_path = if index_path.join("residuals.repacked.compacted.npy").exists() {
-            index_path.join("residuals.repacked.compacted.npy")
-        } else {
-            index_path.join("residuals.compacted.npy")
-        };
-
-        let (pids_compacted, residuals_compacted, mmap_handles) = if self.use_mmap {
-            anyhow::ensure!(self.device == Device::Cpu, "mmap is only supported on CPU");
-            let (codes, mmap1) = self.load_tensor_mmap(&codes_path)?;
-            let (residuals, mmap2) = self.load_tensor_mmap(&residuals_path)?;
-            (codes, residuals, vec![mmap1, mmap2])
-        } else {
-            let codes = self.load_torch_tensor(codes_path)?;
-            let residuals = self.load_torch_tensor(residuals_path)?;
-            (codes, residuals, vec![])
-        };
-
-        // Validate dimensions
-        let num_centroids = centroids.size()[0];
-        assert_eq!(
-            sizes_compacted.size()[0],
-            num_centroids,
-            "Sizes tensor must have same length as number of centroids"
-        );
-
-        let num_embeddings = residuals_compacted.size()[0];
-        let sizes_sum: i64 = sizes_compacted.sum(Kind::Int64).int64_value(&[]);
-        assert_eq!(
-            sizes_sum, num_embeddings,
-            "Sum of sizes must equal number of embeddings"
-        );
-        assert_eq!(
-            pids_compacted.size()[0],
-            num_embeddings,
-            "Codes must have same length as residuals"
-        );
-
-        // Compute offsets from sizes using cumulative sum
-        let offsets_compacted = self.compute_offsets(&sizes_compacted)?;
-
-        // Find kdummy_centroid (the centroid with smallest size)
-        let kdummy_centroid = self.find_kdummy_centroid(&sizes_compacted)?;
-
-        // Get metadata
-        let metadata = IndexMetadata::load(index_path)?;
-
-        Ok(LoadedIndex {
-            centroids,
-            bucket_weights,
-            sizes_compacted,
-            pids_compacted,
-            residuals_compacted,
-            offsets_compacted,
-            kdummy_centroid,
-            metadata,
-            _mmap_handles: Arc::new(mmap_handles),
-        })
-    }
-
-    /// Load a PyTorch tensor file
-    ///
-    /// Uses native PyTorch format for efficiency
-    fn load_torch_tensor(&self, path: PathBuf) -> Result<Tensor> {
-        let tensor = Tensor::read_npy(&path)
-            .map_err(|e| anyhow!("Failed to load tensor {:?}: {}", path, e))?;
-
-        Ok(tensor.to_device(self.device))
-    }
-
-    /// Load a tensor via memory-mapping the NPY file (zero-copy).
-    ///
-    /// # Safety
-    /// The returned `Mmap` handle must outlive the tensor — it backs the tensor's data.
-    fn load_tensor_mmap(&self, path: &Path) -> Result<(Tensor, Mmap)> {
-        let (data_offset, shape, kind) = parse_npy_header(path)?;
-        let file =
-            File::open(path).with_context(|| format!("Failed to open {:?} for mmap", path))?;
-        let mmap =
-            unsafe { Mmap::map(&file) }.with_context(|| format!("Failed to mmap {:?}", path))?;
-        let data_ptr = mmap[data_offset as usize..].as_ptr();
-        let strides = compute_c_strides(&shape);
-        let tensor = unsafe { Tensor::from_blob(data_ptr, &shape, &strides, kind, Device::Cpu) };
-        Ok((tensor, mmap))
-    }
-
-    /// Compute offsets from sizes for efficient indexing
-    /// Creates offsets for indexing into compacted arrays
-    fn compute_offsets(&self, sizes: &Tensor) -> Result<Tensor> {
-        use tch::{Kind, Tensor};
-
-        let num_centroids = sizes.size()[0];
-
-        // Create tensor of size [num_centroids + 1]
-        let offsets = Tensor::zeros(&[num_centroids + 1], (Kind::Int64, self.device));
-
-        // Compute cumulative sum into offsets[1:]
-        // First element remains 0
-        let cumsum = sizes.cumsum(0, Kind::Int64);
-        offsets.narrow(0, 1, num_centroids).copy_(&cumsum);
-
-        Ok(offsets)
     }
 
     /// Find the centroid with minimum size (dummy centroid)
