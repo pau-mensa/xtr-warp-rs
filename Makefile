@@ -46,10 +46,6 @@ test:	## Run tests (excludes sharding tests)
 	@test -x $(PYTEST) || { echo "No venv found — run 'make install' first"; exit 1; }
 	$(TORCH_ENV) $(PYTEST) tests/test.py tests/test_index_management.py tests/test_filtering.py
 
-test-sharding:	## Run sharding tests only
-	@test -x $(PYTEST) || { echo "No venv found — run 'make install' first"; exit 1; }
-	$(TORCH_ENV) $(PYTEST) tests/test_sharding.py -m sharding
-
 test-all:	## Run all tests including sharding
 	@test -x $(PYTEST) || { echo "No venv found — run 'make install' first"; exit 1; }
 	$(TORCH_ENV) $(PYTEST) tests/ -m ""
