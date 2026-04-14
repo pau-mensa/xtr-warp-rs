@@ -116,6 +116,32 @@ fn get_dtype(dtype: &str) -> Result<Kind, PyErr> {
     }
 }
 
+/// Filter tombstoned PIDs and truncate to k.
+/// Results arrive sorted by score descending from the merger, so we
+/// stop as soon as we collect k non-deleted entries.
+fn filter_tombstones(results: &mut [SearchResult], deleted_pids: &HashSet<i64>, k: usize) {
+    for result in results {
+        if !deleted_pids.is_empty() {
+            let mut filtered_pids = Vec::with_capacity(k);
+            let mut filtered_scores = Vec::with_capacity(k);
+            for (pid, score) in result.passage_ids.iter().zip(result.scores.iter()) {
+                if !deleted_pids.contains(pid) {
+                    filtered_pids.push(*pid);
+                    filtered_scores.push(*score);
+                    if filtered_pids.len() == k {
+                        break;
+                    }
+                }
+            }
+            result.passage_ids = filtered_pids;
+            result.scores = filtered_scores;
+        } else {
+            result.passage_ids.truncate(k);
+            result.scores.truncate(k);
+        }
+    }
+}
+
 /// Represents a loaded index
 #[pyclass(unsendable)]
 struct LoadedSearcher {
@@ -210,30 +236,7 @@ impl LoadedSearcher {
             )
             .map_err(|e| PyRuntimeError::new_err(format!("Search failed: {}", e)))?;
 
-        // Filter tombstoned PIDs and truncate to k.
-        // Results arrive sorted by score descending from the merger, so we
-        // can stop as soon as we collect k non-deleted entries.
-        for result in &mut results {
-            if !self.deleted_pids.is_empty() {
-                let mut filtered_pids = Vec::with_capacity(k);
-                let mut filtered_scores = Vec::with_capacity(k);
-                for (pid, score) in result.passage_ids.iter().zip(result.scores.iter()) {
-                    if !self.deleted_pids.contains(pid) {
-                        filtered_pids.push(*pid);
-                        filtered_scores.push(*score);
-                        if filtered_pids.len() == k {
-                            break;
-                        }
-                    }
-                }
-                result.passage_ids = filtered_pids;
-                result.scores = filtered_scores;
-            } else {
-                result.passage_ids.truncate(k);
-                result.scores.truncate(k);
-            }
-        }
-
+        filter_tombstones(&mut results, &self.deleted_pids, k);
         Ok(results)
     }
 
@@ -577,28 +580,7 @@ impl ShardedSearcher {
             )
             .map_err(|e| PyRuntimeError::new_err(format!("Sharded search failed: {}", e)))?;
 
-        // Tombstone filtering (identical to LoadedSearcher)
-        for result in &mut results {
-            if !self.deleted_pids.is_empty() {
-                let mut filtered_pids = Vec::with_capacity(k);
-                let mut filtered_scores = Vec::with_capacity(k);
-                for (pid, score) in result.passage_ids.iter().zip(result.scores.iter()) {
-                    if !self.deleted_pids.contains(pid) {
-                        filtered_pids.push(*pid);
-                        filtered_scores.push(*score);
-                        if filtered_pids.len() == k {
-                            break;
-                        }
-                    }
-                }
-                result.passage_ids = filtered_pids;
-                result.scores = filtered_scores;
-            } else {
-                result.passage_ids.truncate(k);
-                result.scores.truncate(k);
-            }
-        }
-
+        filter_tombstones(&mut results, &self.deleted_pids, k);
         Ok(results)
     }
 

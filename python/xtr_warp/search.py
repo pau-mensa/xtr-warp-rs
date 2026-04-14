@@ -1020,7 +1020,7 @@ class XTRWarp:
 
         device_ratios_list = [(dev, ratio) for dev, ratio in ratios.items()]
         searcher = xtr_warp_rs.ShardedSearcher(
-            self.index, device_ratios_list, dtype_str, True  # CPU shards always mmap
+            self.index, device_ratios_list, dtype_str, True  # Always mmap CPU shards (user's mmap kwarg intentionally overridden)
         )
         searcher.load()
 

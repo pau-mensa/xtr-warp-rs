@@ -69,7 +69,6 @@ impl WARPScorer {
         let decompressor = CentroidDecompressor::new(
             index.metadata.nbits,
             index.metadata.dim,
-            device,
             dtype,
             Arc::clone(&thread_pool),
         )?;

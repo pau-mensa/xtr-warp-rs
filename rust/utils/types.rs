@@ -221,8 +221,14 @@ impl IndexMetadata {
         let file = std::fs::File::create(&tmp_path)
             .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", tmp_path.display(), e))?;
         serde_json::to_writer_pretty(std::io::BufWriter::new(file), self)?;
-        std::fs::rename(&tmp_path, &path)
-            .map_err(|e| anyhow::anyhow!("Failed to rename {} -> {}: {}", tmp_path.display(), path.display(), e))?;
+        std::fs::rename(&tmp_path, &path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to rename {} -> {}: {}",
+                tmp_path.display(),
+                path.display(),
+                e
+            )
+        })?;
         Ok(())
     }
 }
@@ -293,10 +299,6 @@ impl Clone for ReadOnlyIndex {
         ReadOnlyIndex(self.0.clone())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Sharded index types — for distributing the IVF index across multiple devices
-// ---------------------------------------------------------------------------
 
 /// A single shard of the index: owns a contiguous centroid range and the
 /// corresponding slices of pids_compacted and residuals_compacted.
@@ -516,6 +518,78 @@ impl PassageBitset {
         }
         let word = pid as usize / 64;
         word < self.bits.len() && (self.bits[word] & (1u64 << (pid as usize % 64))) != 0
+    }
+}
+
+/// Abstraction over index data for decompression. Implemented by both the
+/// whole-index (`ReadOnlyIndex`) and per-shard (`ShardSource`) views so
+/// the decompressor can use a single generic implementation.
+pub trait DecompressSource: Sync {
+    fn device(&self) -> Device;
+    fn pids_compacted(&self) -> &Tensor;
+    fn residuals_compacted(&self) -> &Tensor;
+    fn offsets_compacted(&self) -> &Tensor;
+    fn bucket_weights(&self) -> &Tensor;
+    /// Translate global centroid IDs to source-local IDs.
+    /// For the whole index this is a no-op; for a shard it subtracts
+    /// `centroid_start`.
+    fn localize_centroid_ids(&self, global_ids: &Tensor) -> Tensor;
+}
+
+impl DecompressSource for ReadOnlyIndex {
+    fn device(&self) -> Device {
+        self.0.pids_compacted.device()
+    }
+    fn pids_compacted(&self) -> &Tensor {
+        &self.0.pids_compacted
+    }
+    fn residuals_compacted(&self) -> &Tensor {
+        &self.0.residuals_compacted
+    }
+    fn offsets_compacted(&self) -> &Tensor {
+        &self.0.offsets_compacted
+    }
+    fn bucket_weights(&self) -> &Tensor {
+        &self.0.bucket_weights
+    }
+    fn localize_centroid_ids(&self, ids: &Tensor) -> Tensor {
+        ids.shallow_clone()
+    }
+}
+
+/// Adapter that presents an `IndexShard` + shared `bucket_weights` as a
+/// `DecompressSource`. Short-lived — created per-decompress call.
+pub struct ShardSource<'a> {
+    pub shard: &'a IndexShard,
+    pub bucket_weights: &'a Tensor,
+}
+
+// SAFETY: ShardSource borrows read-only tensors (never mutated after load).
+// Same invariant as IndexShard and ReadOnlyIndex.
+unsafe impl Sync for ShardSource<'_> {}
+
+impl<'a> DecompressSource for ShardSource<'a> {
+    fn device(&self) -> Device {
+        self.shard.device
+    }
+    fn pids_compacted(&self) -> &Tensor {
+        &self.shard.pids_compacted
+    }
+    fn residuals_compacted(&self) -> &Tensor {
+        &self.shard.residuals_compacted
+    }
+    fn offsets_compacted(&self) -> &Tensor {
+        &self.shard.offsets_compacted
+    }
+    fn bucket_weights(&self) -> &Tensor {
+        self.bucket_weights
+    }
+    fn localize_centroid_ids(&self, ids: &Tensor) -> Tensor {
+        if self.shard.centroid_start == 0 {
+            ids.shallow_clone()
+        } else {
+            ids - (self.shard.centroid_start as i64)
+        }
     }
 }
 

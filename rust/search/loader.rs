@@ -6,13 +6,13 @@ use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
 use crate::utils::types::{
-    CentroidId, IndexMetadata, IndexShard, LoadedIndex, SharedIndexState, ShardedIndex,
+    CentroidId, IndexMetadata, IndexShard, LoadedIndex, ShardedIndex, SharedIndexState,
 };
 
 /// Parse a NPY file header, returning (data_offset, shape, tch_kind).
 fn parse_npy_header(path: &Path) -> Result<(u64, Vec<i64>, Kind)> {
-    let data = std::fs::read(path)
-        .with_context(|| format!("Failed to read NPY file {:?}", path))?;
+    let data =
+        std::fs::read(path).with_context(|| format!("Failed to read NPY file {:?}", path))?;
 
     // Magic: \x93NUMPY
     anyhow::ensure!(
@@ -54,8 +54,8 @@ fn parse_npy_header(path: &Path) -> Result<(u64, Vec<i64>, Kind)> {
     };
 
     // Parse 'fortran_order'
-    let fortran = extract_npy_field(header_str, "fortran_order")
-        .unwrap_or_else(|| "False".to_string());
+    let fortran =
+        extract_npy_field(header_str, "fortran_order").unwrap_or_else(|| "False".to_string());
     anyhow::ensure!(
         fortran == "False",
         "Fortran-order NPY files are not supported"
@@ -69,7 +69,11 @@ fn parse_npy_header(path: &Path) -> Result<(u64, Vec<i64>, Kind)> {
         .split(',')
         .filter_map(|s| {
             let s = s.trim();
-            if s.is_empty() { None } else { s.parse().ok() }
+            if s.is_empty() {
+                None
+            } else {
+                s.parse().ok()
+            }
         })
         .collect();
 
@@ -96,7 +100,9 @@ fn extract_npy_field(header: &str, key: &str) -> Option<String> {
         Some(rest[..=end].to_string())
     } else {
         // Bare value (e.g. True/False)
-        let end = rest.find(|c: char| c == ',' || c == '}').unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| c == ',' || c == '}')
+            .unwrap_or(rest.len());
         Some(rest[..end].trim().to_string())
     }
 }
@@ -172,10 +178,7 @@ impl IndexLoader {
         };
 
         let (pids_compacted, residuals_compacted, mmap_handles) = if self.use_mmap {
-            anyhow::ensure!(
-                self.device == Device::Cpu,
-                "mmap is only supported on CPU"
-            );
+            anyhow::ensure!(self.device == Device::Cpu, "mmap is only supported on CPU");
             let (codes, mmap1) = self.load_tensor_mmap(&codes_path)?;
             let (residuals, mmap2) = self.load_tensor_mmap(&residuals_path)?;
             (codes, residuals, vec![mmap1, mmap2])
@@ -243,15 +246,13 @@ impl IndexLoader {
     /// The returned `Mmap` handle must outlive the tensor — it backs the tensor's data.
     fn load_tensor_mmap(&self, path: &Path) -> Result<(Tensor, Mmap)> {
         let (data_offset, shape, kind) = parse_npy_header(path)?;
-        let file = File::open(path)
-            .with_context(|| format!("Failed to open {:?} for mmap", path))?;
-        let mmap = unsafe { Mmap::map(&file) }
-            .with_context(|| format!("Failed to mmap {:?}", path))?;
+        let file =
+            File::open(path).with_context(|| format!("Failed to open {:?} for mmap", path))?;
+        let mmap =
+            unsafe { Mmap::map(&file) }.with_context(|| format!("Failed to mmap {:?}", path))?;
         let data_ptr = mmap[data_offset as usize..].as_ptr();
         let strides = compute_c_strides(&shape);
-        let tensor = unsafe {
-            Tensor::from_blob(data_ptr, &shape, &strides, kind, Device::Cpu)
-        };
+        let tensor = unsafe { Tensor::from_blob(data_ptr, &shape, &strides, kind, Device::Cpu) };
         Ok((tensor, mmap))
     }
 
@@ -281,10 +282,6 @@ impl IndexLoader {
 
         Ok(kdummy_idx as CentroidId)
     }
-
-    // -----------------------------------------------------------------------
-    // Sharded loading
-    // -----------------------------------------------------------------------
 
     /// Load a contiguous row slice from an NPY file into a tensor on
     /// `target_device`. Reads only the needed bytes from disk.
@@ -352,8 +349,8 @@ impl IndexLoader {
 
         let file = File::open(path)
             .with_context(|| format!("Failed to open {:?} for mmap slice", path))?;
-        let mmap = unsafe { Mmap::map(&file) }
-            .with_context(|| format!("Failed to mmap {:?}", path))?;
+        let mmap =
+            unsafe { Mmap::map(&file) }.with_context(|| format!("Failed to mmap {:?}", path))?;
 
         let data_ptr = mmap[slice_byte_offset as usize..].as_ptr();
 
@@ -388,10 +385,9 @@ impl IndexLoader {
             .to_device(scoring_device);
 
         // Sizes on CPU (small, needed for split computation and selector)
-        let sizes_compacted =
-            Tensor::read_npy(index_path.join("sizes.compacted.npy"))
-                .map_err(|e| anyhow!("sizes: {}", e))?
-                .to_device(Device::Cpu);
+        let sizes_compacted = Tensor::read_npy(index_path.join("sizes.compacted.npy"))
+            .map_err(|e| anyhow!("sizes: {}", e))?
+            .to_device(Device::Cpu);
 
         let kdummy_centroid = self.find_kdummy_centroid(&sizes_compacted)?;
         let metadata = IndexMetadata::load(index_path)?;
@@ -439,20 +435,13 @@ impl IndexLoader {
                     vec![],
                 )
             } else if use_mmap {
-                let (p, m1) =
-                    self.load_tensor_mmap_slice(&codes_path, emb_start, emb_count)?;
-                let (r, m2) =
-                    self.load_tensor_mmap_slice(&residuals_path, emb_start, emb_count)?;
+                let (p, m1) = self.load_tensor_mmap_slice(&codes_path, emb_start, emb_count)?;
+                let (r, m2) = self.load_tensor_mmap_slice(&residuals_path, emb_start, emb_count)?;
                 (p, r, vec![m1, m2])
             } else {
-                let p =
-                    self.load_tensor_npy_slice(&codes_path, emb_start, emb_count, *device)?;
-                let r = self.load_tensor_npy_slice(
-                    &residuals_path,
-                    emb_start,
-                    emb_count,
-                    *device,
-                )?;
+                let p = self.load_tensor_npy_slice(&codes_path, emb_start, emb_count, *device)?;
+                let r =
+                    self.load_tensor_npy_slice(&residuals_path, emb_start, emb_count, *device)?;
                 (p, r, vec![])
             };
 

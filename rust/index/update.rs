@@ -4,8 +4,8 @@ use std::path::Path;
 use tch::{Device, IndexOp, Kind, Tensor};
 
 use crate::index::compact::{
-    build_partial_compacted, compact_index, merge_compacted_incremental,
-    prune_empty_centroids, recalibrate_threshold, remove_and_merge_compacted,
+    build_partial_compacted, compact_index, merge_compacted_incremental, prune_empty_centroids,
+    recalibrate_threshold, remove_and_merge_compacted,
 };
 use crate::index::delete::{clear_tombstones, load_tombstones, save_tombstones};
 use crate::index::encode::{
@@ -17,8 +17,6 @@ use crate::utils::types::{AddResult, CompactStats, IndexMetadata, IndexPlan};
 
 /// Threshold below which we append to the last chunk instead of creating a new one.
 const COALESCE_THRESHOLD: usize = 2_000;
-
-// ── Public operations ──
 
 /// Add new documents to an existing index.
 ///
@@ -101,7 +99,13 @@ pub fn add_to_index(
         device,
     )?;
 
-    save_metadata_from_stats(index_path, &meta, &stats, total_chunks, next_pid + num_new_docs as i64)?;
+    save_metadata_from_stats(
+        index_path,
+        &meta,
+        &stats,
+        total_chunks,
+        next_pid + num_new_docs as i64,
+    )?;
 
     Ok(AddResult {
         new_passage_ids,
@@ -181,7 +185,7 @@ pub fn update_in_index(
     let updated_pids_set: HashSet<i64> = passage_ids.iter().copied().collect();
     let partial = build_partial_compacted(
         index_path,
-        meta.num_chunks,   // start from the first new chunk
+        meta.num_chunks, // start from the first new chunk
         total_chunks,
         meta.num_centroids,
         residual_dim,
@@ -201,7 +205,13 @@ pub fn update_in_index(
     )?;
 
     // next_passage_id stays the same: we're replacing, not appending
-    save_metadata_from_stats(index_path, &meta, &stats, total_chunks, meta.next_passage_id)?;
+    save_metadata_from_stats(
+        index_path,
+        &meta,
+        &stats,
+        total_chunks,
+        meta.next_passage_id,
+    )?;
 
     Ok(())
 }
@@ -279,24 +289,25 @@ pub fn append_centroids(index_path: &Path, new_centroids: &Tensor) -> Result<()>
     }
 
     // Append to centroids.npy
-    let old_centroids = Tensor::read_npy(index_path.join("centroids.npy"))?
-        .to_device(Device::Cpu);
+    let old_centroids = Tensor::read_npy(index_path.join("centroids.npy"))?.to_device(Device::Cpu);
     let combined = Tensor::cat(
-        &[old_centroids, new_centroids.to_device(Device::Cpu).to_kind(Kind::Half)],
+        &[
+            old_centroids,
+            new_centroids.to_device(Device::Cpu).to_kind(Kind::Half),
+        ],
         0,
     );
     combined.write_npy(index_path.join("centroids.npy"))?;
 
     // Extend sizes.compacted with zeros
-    let old_sizes = Tensor::read_npy(index_path.join("sizes.compacted.npy"))?
-        .to_device(Device::Cpu);
+    let old_sizes =
+        Tensor::read_npy(index_path.join("sizes.compacted.npy"))?.to_device(Device::Cpu);
     let ext = Tensor::zeros(&[k_new], (old_sizes.kind(), Device::Cpu));
-    Tensor::cat(&[old_sizes, ext], 0)
-        .write_npy(index_path.join("sizes.compacted.npy"))?;
+    Tensor::cat(&[old_sizes, ext], 0).write_npy(index_path.join("sizes.compacted.npy"))?;
 
     // Extend offsets.compacted: new entries equal to old total
-    let old_offsets = Tensor::read_npy(index_path.join("offsets.compacted.npy"))?
-        .to_device(Device::Cpu);
+    let old_offsets =
+        Tensor::read_npy(index_path.join("offsets.compacted.npy"))?.to_device(Device::Cpu);
     let total = old_offsets.i(-1).int64_value(&[]);
     let ext_offsets = Tensor::full(&[k_new], total, (old_offsets.kind(), Device::Cpu));
     Tensor::cat(&[old_offsets, ext_offsets], 0)
@@ -323,8 +334,7 @@ fn should_coalesce(index_path: &Path, meta: &IndexMetadata) -> Result<(usize, bo
         return Ok((meta.num_chunks, false));
     }
     let f = std::fs::File::open(&meta_path)?;
-    let chunk_meta: serde_json::Value =
-        serde_json::from_reader(std::io::BufReader::new(f))?;
+    let chunk_meta: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(f))?;
     let num_passages = chunk_meta
         .get("num_passages")
         .and_then(|v| v.as_u64())
@@ -346,8 +356,11 @@ fn prepend_chunk_data(index_path: &Path, chunk_idx: usize, old: &ChunkData) -> R
     let new_num_embs = new.codes.size()[0];
     Tensor::cat(&[old.codes.shallow_clone(), new.codes.shallow_clone()], 0)
         .write_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?;
-    Tensor::cat(&[old.residuals.shallow_clone(), new.residuals.shallow_clone()], 0)
-        .write_npy(index_path.join(format!("{}.residuals.npy", chunk_idx)))?;
+    Tensor::cat(
+        &[old.residuals.shallow_clone(), new.residuals.shallow_clone()],
+        0,
+    )
+    .write_npy(index_path.join(format!("{}.residuals.npy", chunk_idx)))?;
 
     let combined_doclens: Vec<i64> = old.doclens.iter().chain(&new.doclens).copied().collect();
     Tensor::from_slice(&combined_doclens)
@@ -364,9 +377,7 @@ fn prepend_chunk_data(index_path: &Path, chunk_idx: usize, old: &ChunkData) -> R
         "num_embeddings": total_embs,
         "embedding_offset": 0,
     });
-    let meta_f = std::fs::File::create(
-        index_path.join(format!("{}.metadata.json", chunk_idx)),
-    )?;
+    let meta_f = std::fs::File::create(index_path.join(format!("{}.metadata.json", chunk_idx)))?;
     serde_json::to_writer(std::io::BufWriter::new(meta_f), &chunk_meta)?;
 
     Ok(())
@@ -439,10 +450,11 @@ fn rewrite_chunks_filtered(
                 .to_kind(Kind::Int64);
         let doclens_vec: Vec<i64> = doclens_tensor.try_into()?;
 
-        let pids_vec: Vec<i64> = Tensor::read_npy(index_path.join(format!("{}.passage_ids.npy", chunk_idx)))?
-            .to_device(Device::Cpu)
-            .to_kind(Kind::Int64)
-            .try_into()?;
+        let pids_vec: Vec<i64> =
+            Tensor::read_npy(index_path.join(format!("{}.passage_ids.npy", chunk_idx)))?
+                .to_device(Device::Cpu)
+                .to_kind(Kind::Int64)
+                .try_into()?;
 
         let mut keep_doclens = Vec::new();
         let mut keep_pids = Vec::new();
@@ -488,10 +500,8 @@ fn rewrite_chunks_filtered(
         drop(codes);
         drop(residuals);
 
-        filtered_codes
-            .write_npy(index_path.join(format!("{}.codes.npy.tmp", new_idx)))?;
-        filtered_residuals
-            .write_npy(index_path.join(format!("{}.residuals.npy.tmp", new_idx)))?;
+        filtered_codes.write_npy(index_path.join(format!("{}.codes.npy.tmp", new_idx)))?;
+        filtered_residuals.write_npy(index_path.join(format!("{}.residuals.npy.tmp", new_idx)))?;
 
         Tensor::from_slice(keep_doclens)
             .write_npy(index_path.join(format!("doclens.{}.npy.tmp", new_idx)))?;
