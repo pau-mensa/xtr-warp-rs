@@ -70,48 +70,12 @@ fn call_torch(torch_path: String) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Parses a string identifier into a `tch::Device`.
-///
-/// Supports simple device strings like "cpu", "cuda", and indexed CUDA devices
-/// such as "cuda:0".
 fn get_device(device: &str) -> Result<Device, PyErr> {
-    match device.to_lowercase().as_str() {
-        "cpu" => Ok(Device::Cpu),
-        "mps" => Ok(Device::Mps),
-        "cuda" => Ok(Device::Cuda(0)), // Default to the first CUDA device.
-        s if s.starts_with("cuda:") => {
-            let parts: Vec<&str> = s.split(':').collect();
-            if parts.len() == 2 {
-                parts[1].parse::<usize>().map(Device::Cuda).map_err(|_| {
-                    PyValueError::new_err(format!("Invalid CUDA device index: '{}'", parts[1]))
-                })
-            } else {
-                Err(PyValueError::new_err(
-                    "Invalid CUDA device format. Expected 'cuda:N'.",
-                ))
-            }
-        },
-        _ => Err(PyValueError::new_err(format!(
-            "Unsupported device string: '{}'",
-            device
-        ))),
-    }
+    utils::types::parse_device(device).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// Parses a string identifier into a `tch::Kind`.
-///
-/// Supports simple strings like "float32", "float16"
 fn get_dtype(dtype: &str) -> Result<Kind, PyErr> {
-    match dtype.to_lowercase().as_str() {
-        "float32" => Ok(Kind::Float),
-        "float16" => Ok(Kind::Half),
-        "float64" => Ok(Kind::Double),
-        "bfloat16" => Ok(Kind::BFloat16),
-        _ => Err(PyValueError::new_err(format!(
-            "Unsupported dtype string: '{}', should be 'float32', 'float16', 'float64', or 'bfloat16'",
-            dtype
-        ))),
-    }
+    utils::types::parse_dtype(dtype).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 /// Filter tombstoned PIDs and truncate to k.

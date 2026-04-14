@@ -16,11 +16,6 @@ pub type PassageId = i64;
 /// Represents a centroid ID in the clustering
 pub type CentroidId = i64;
 
-/// Represents an embedding ID in the index
-pub type EmbeddingId = i64;
-
-/// Query ID type
-pub type QueryId = i64;
 
 /// Score type for ranking
 pub type Score = f32;
@@ -303,12 +298,6 @@ pub struct Query {
     pub embeddings: Tensor, // Always [batch, num_tokens, dim]
 }
 
-/// Batch of queries for efficient processing
-pub struct QueryBatch {
-    pub queries: Vec<Query>,
-    pub max_tokens: usize,
-}
-
 /// Read-only tensor wrapper to opt into Sync when we guarantee no mutation.
 pub struct ReadOnlyTensor(pub Tensor);
 
@@ -336,27 +325,12 @@ pub struct SelectedCentroids {
     pub mse_estimate: Tensor,
 }
 
-/// Decompressed centroid data
-pub struct DecompressedCentroid {
-    pub centroid_id: CentroidId,
-    pub passage_ids: Vec<PassageId>,
-    pub scores: Vec<Score>,
-}
-
 pub struct DecompressedCentroidsOutput {
     pub capacities: Tensor, // Total capacity of each centroid (ends - begins)
     pub sizes: Tensor,      // Actual sizes after deduplication
     pub passage_ids: Tensor,
     pub scores: Tensor,
     pub offsets: Tensor,
-}
-
-/// Candidate for final ranking
-#[derive(Debug, Clone)]
-pub struct RankingCandidate {
-    pub passage_id: PassageId,
-    pub score: Score,
-    pub centroid_id: CentroidId,
 }
 
 /// T-prime policy for adaptive early termination
