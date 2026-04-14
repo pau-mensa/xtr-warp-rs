@@ -24,7 +24,7 @@ pub mod utils;
 // Re-exports for convenience
 use crate::index::create::create_index;
 use crate::index::source::{DiskEmbeddingSource, EmbeddingSource, InMemoryEmbeddingSource};
-use search::{IndexLoader, Searcher, ShardedSearcherEngine};
+use search::{IndexLoader, Searcher, ShardedScorer};
 use utils::types::{
     IndexConfig, Query, ReadOnlyIndex, ReadOnlyShardedIndex, SearchConfig, SearchResult,
 };
@@ -557,19 +557,19 @@ impl ShardedSearcher {
             )));
         }
 
-        let engine = ShardedSearcherEngine::new(
+        let scorer = ShardedScorer::new(
             self.sharded_index.as_ref().ok_or_else(|| {
                 PyRuntimeError::new_err("Index not loaded. Call load() first.")
             })?,
-            &search_config,
+            search_config.clone(),
         )
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create scorer: {}", e)))?;
 
         let k = search_config.k;
 
-        let mut results = engine
-            .search(
-                Query {
+        let mut results = scorer
+            .rank(
+                &Query {
                     embeddings: queries_embeddings.deref().shallow_clone(),
                 },
                 subsets.as_deref(),

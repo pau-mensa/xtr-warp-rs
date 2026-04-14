@@ -18,7 +18,7 @@ pub use sharded_scorer::ShardedScorer;
 
 use anyhow::Result;
 
-use crate::utils::types::{Query, ReadOnlyIndex, ReadOnlyShardedIndex, SearchConfig, SearchResult};
+use crate::utils::types::{Query, ReadOnlyIndex, SearchConfig, SearchResult};
 
 /// Main search interface combining all components
 pub struct Searcher {
@@ -34,27 +34,6 @@ impl Searcher {
 
     /// Search for top-k passages given a query
     pub fn search(&self, query: Query, subsets: Option<&[Vec<i64>]>, show_progress: bool) -> Result<Vec<SearchResult>> {
-        self.scorer.rank(&query, subsets, show_progress)
-    }
-}
-
-/// Sharded search interface for multi-device search
-pub struct ShardedSearcherEngine {
-    scorer: ShardedScorer,
-}
-
-impl ShardedSearcherEngine {
-    pub fn new(index: &Arc<ReadOnlyShardedIndex>, config: &SearchConfig) -> Result<Self> {
-        let scorer = ShardedScorer::new(index, config.clone())?;
-        Ok(Self { scorer })
-    }
-
-    pub fn search(
-        &self,
-        query: Query,
-        subsets: Option<&[Vec<i64>]>,
-        show_progress: bool,
-    ) -> Result<Vec<SearchResult>> {
         self.scorer.rank(&query, subsets, show_progress)
     }
 }

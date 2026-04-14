@@ -279,10 +279,10 @@ impl CentroidDecompressor {
         let num_cells = capacities_i64.size()[0];
         let total_capacity = capacities_i64.sum(Kind::Int64).int64_value(&[]).max(0);
 
-        let sizes = capacities_i64.to_kind(Kind::Int);
+        let mut sizes = capacities_i64.to_kind(Kind::Int);
 
         let end_offsets = capacities_i64.cumsum(0, Kind::Int64);
-        let offsets = Tensor::zeros(&[num_cells + 1], (Kind::Int64, device));
+        let mut offsets = Tensor::zeros(&[num_cells + 1], (Kind::Int64, device));
         offsets
             .narrow(0, 1, num_cells)
             .copy_(&end_offsets.contiguous());
@@ -347,6 +347,19 @@ impl CentroidDecompressor {
             let embedding_indices = embedding_indices.index_select(0, &valid_indices);
             let candidate_cells = candidate_cells.index_select(0, &valid_indices);
             let total_capacity = valid_indices.size()[0];
+
+            // Rebuild sizes and offsets to reflect the filtered data so that
+            // downstream consumers index into the flat arrays correctly.
+            let mut filtered_counts =
+                Tensor::zeros(&[num_cells], (Kind::Int64, device));
+            let ones = Tensor::ones(&[total_capacity], (Kind::Int64, device));
+            let _ = filtered_counts.scatter_add_(0, &candidate_cells, &ones);
+            sizes = filtered_counts.to_kind(Kind::Int);
+            offsets = Tensor::zeros(&[num_cells + 1], (Kind::Int64, device));
+            offsets
+                .narrow(0, 1, num_cells)
+                .copy_(&filtered_counts.cumsum(0, Kind::Int64).contiguous());
+
             (embedding_indices, candidate_cells, total_capacity)
         } else {
             (embedding_indices, candidate_cells, total_capacity)
@@ -605,12 +618,10 @@ impl CentroidDecompressor {
 
     /// Decompress centroids for a single shard. Global centroid IDs are
     /// translated to shard-local IDs before indexing into the shard's tensors.
-    /// Decompress centroids for a single shard. Global centroid IDs are
-    /// translated to shard-local IDs before indexing into the shard's tensors.
     ///
-    /// `global_cell_indices` maps each local cell position to its original
-    /// position in the full [num_tokens * nprobe] array. When `None`, local
-    /// indices are used (correct for single-shard case where local == global).
+    /// `per_cell_tokens` maps each local cell position to its query token
+    /// index. When `None`, the decompressor computes `cell_idx / nprobe`
+    /// (correct for single-shard case where local cell == global cell).
     pub fn decompress_centroids_for_shard(
         &self,
         centroid_ids: &Tensor,     // global centroid IDs assigned to this shard
@@ -620,7 +631,7 @@ impl CentroidDecompressor {
         query_embeddings: &Tensor, // [num_tokens, dim]
         nprobe: usize,
         subset: Option<&[i64]>,
-        global_cell_indices: Option<&Tensor>,
+        per_cell_tokens: Option<&Tensor>,
     ) -> Result<DecompressedCentroidsOutput> {
         let centroid_ids = centroid_ids.to_kind(Kind::Int64);
         let num_cells = centroid_ids.size()[0] as usize;
@@ -673,7 +684,7 @@ impl CentroidDecompressor {
                 &query_embeddings,
                 nprobe,
                 subset,
-                global_cell_indices,
+                per_cell_tokens,
             );
         }
 
@@ -697,8 +708,8 @@ impl CentroidDecompressor {
 
         let total_capacity = capacities_vec.iter().sum::<i64>().max(0) as usize;
 
-        // Convert global cell indices for token mapping (None → use local idx)
-        let global_indices_vec: Option<Vec<i64>> = global_cell_indices
+        // Convert per-cell token indices (None → derive from cell_idx / nprobe)
+        let per_cell_tokens_vec: Option<Vec<i64>> = per_cell_tokens
             .map(|t| t.to_device(Device::Cpu).try_into())
             .transpose()?;
 
@@ -712,21 +723,20 @@ impl CentroidDecompressor {
 
         if use_parallel {
             let subset_bitset_ref = subset_bitset.as_ref();
-            let global_ref = global_indices_vec.as_ref();
+            let tokens_ref = per_cell_tokens_vec.as_ref();
             let cell_results: Vec<_> = self.thread_pool.install(|| {
                 (0..num_cells)
                     .into_par_iter()
                     .map(|cell_idx| {
-                        let token_cell_idx =
-                            global_ref.map_or(cell_idx, |v| v[cell_idx] as usize);
+                        let token_idx = tokens_ref
+                            .map_or(cell_idx / nprobe, |v| v[cell_idx] as usize)
+                            .min(num_tokens - 1);
                         self.process_cell_shard(
-                            token_cell_idx,
+                            token_idx,
                             cell_idx,
                             &capacities_vec,
                             &begins_vec,
                             &centroid_scores_vec,
-                            nprobe,
-                            num_tokens,
                             bucket_score_stride,
                             &bucket_scores_flat,
                             shard,
@@ -752,18 +762,17 @@ impl CentroidDecompressor {
             }
         } else {
             for cell_idx in 0..num_cells {
-                let token_cell_idx = global_indices_vec
+                let token_idx = per_cell_tokens_vec
                     .as_ref()
-                    .map_or(cell_idx, |v| v[cell_idx] as usize);
+                    .map_or(cell_idx / nprobe, |v| v[cell_idx] as usize)
+                    .min(num_tokens - 1);
 
                 let (local_pids, local_scores, size) = self.process_cell_shard(
-                    token_cell_idx,
+                    token_idx,
                     cell_idx,
                     &capacities_vec,
                     &begins_vec,
                     &centroid_scores_vec,
-                    nprobe,
-                    num_tokens,
                     bucket_score_stride,
                     &bucket_scores_flat,
                     shard,
@@ -799,18 +808,16 @@ impl CentroidDecompressor {
 
     /// CPU cell processing for shard data.
     ///
-    /// `token_cell_idx` is the global cell index used for token mapping
-    /// (`token = token_cell_idx / nprobe`). `data_cell_idx` is the local
-    /// index into capacities/begins/scores arrays for this shard.
+    /// `token_idx` is the precomputed query token index for this cell.
+    /// `data_cell_idx` is the local index into capacities/begins/scores
+    /// arrays for this shard.
     fn process_cell_shard(
         &self,
-        token_cell_idx: usize,
+        token_idx: usize,
         data_cell_idx: usize,
         capacities_vec: &[i64],
         begins_vec: &[i64],
         centroid_scores_vec: &[f32],
-        nprobe: usize,
-        num_tokens: usize,
         bucket_score_stride: usize,
         bucket_scores_flat: &[f32],
         shard: &IndexShard,
@@ -840,7 +847,6 @@ impl CentroidDecompressor {
             .unwrap_or_default();
 
         let centroid_score = centroid_scores_vec[data_cell_idx];
-        let token_idx = (token_cell_idx / nprobe).min(num_tokens - 1);
         let bucket_scores_offset = token_idx * bucket_score_stride;
         let token_bucket_scores =
             &bucket_scores_flat[bucket_scores_offset..bucket_scores_offset + bucket_score_stride];
@@ -898,8 +904,6 @@ impl CentroidDecompressor {
         (dedup_pids, dedup_scores, size)
     }
 
-
-
     /// CUDA decompression for shard data.
     fn decompress_shard_cuda(
         &self,
@@ -911,7 +915,7 @@ impl CentroidDecompressor {
         query_embeddings: &Tensor,
         nprobe: usize,
         subset: Option<&[i64]>,
-        global_cell_indices: Option<&Tensor>,
+        per_cell_tokens: Option<&Tensor>,
     ) -> Result<DecompressedCentroidsOutput> {
         let device = shard.device;
 
@@ -1054,14 +1058,13 @@ impl CentroidDecompressor {
             Tensor::stack(&[hi, lo], -1).view([total_capacity, dim])
         };
 
-        // Map local cell indices → global cell indices for correct token assignment.
-        // When global_cell_indices is provided, candidate_cells holds local positions
-        // that need to be translated to the original [num_tokens * nprobe] layout.
-        let global_cells = match global_cell_indices {
-            Some(gci) => gci.to_device(device).index_select(0, &candidate_cells),
-            None => candidate_cells.shallow_clone(),
+        // Map each candidate to its query token index.
+        // When per_cell_tokens is provided, it maps cell positions directly to
+        // query tokens. When None, derive from cell_idx / nprobe (single-shard).
+        let token_indices = match per_cell_tokens {
+            Some(ti) => ti.to_device(device).index_select(0, &candidate_cells),
+            None => candidate_cells.divide_scalar_mode(nprobe as i64, "trunc"),
         };
-        let token_indices = global_cells.divide_scalar_mode(nprobe as i64, "trunc");
 
         let bucket_weights_f = bucket_weights.to_kind(Kind::Float);
         let query = query_embeddings.to_kind(Kind::Float);
