@@ -234,18 +234,15 @@ impl ResultMerger {
         let mut pid_idx: Vec<usize> = (0..size).collect();
 
         let scores = &stride.scores;
-        pid_idx.select_nth_unstable_by(
-            effective - 1,
-            |&idx1, &idx2| {
-                let score1 = scores[idx1];
-                let score2 = scores[idx2];
-                // Sort descending by score, with tie-breaking on index
-                score2
-                    .partial_cmp(&score1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| idx1.cmp(&idx2))
-            },
-        );
+        pid_idx.select_nth_unstable_by(effective - 1, |&idx1, &idx2| {
+            let score1 = scores[idx1];
+            let score2 = scores[idx2];
+            // Sort descending by score, with tie-breaking on index
+            score2
+                .partial_cmp(&score1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| idx1.cmp(&idx2))
+        });
 
         // Sort the top-k elements
         pid_idx[..effective].sort_unstable_by(|&idx1, &idx2| {
@@ -307,11 +304,7 @@ impl ResultMerger {
                 let cell_pids = pids_vec[offset..end].to_vec();
                 let cell_scores = scores_vec[offset..end].to_vec();
 
-                views.push(AnnotatedStrideView::from_data(
-                    cell_pids,
-                    cell_scores,
-                    size,
-                ));
+                views.push(AnnotatedStrideView::from_data(cell_pids, cell_scores, size));
                 offset += size;
             }
 
@@ -380,15 +373,50 @@ impl ResultMerger {
         k: usize,
         max_candidates: usize,
     ) -> Result<(Vec<PassageId>, Vec<Score>)> {
-        // I added the optional parameters in some functions
-        // because the torch signatures differ a bit from the cpp ones
+        // Thin wrapper: do the GPU work, then D2H immediately
+        let (top_pids_t, top_scores_t) = self.merge_candidate_scores_cuda_gpu(
+            candidate_sizes,
+            candidate_pids,
+            candidate_scores,
+            mse_estimates,
+            nprobe,
+            k,
+            max_candidates,
+        )?;
+        let top_scores: Vec<f32> = top_scores_t
+            .to_kind(Kind::Float)
+            .to_device(Device::Cpu)
+            .try_into()?;
+        let top_pids: Vec<i64> = top_pids_t.to_device(Device::Cpu).try_into()?;
+        Ok((top_pids, top_scores))
+    }
+
+    /// CUDA merger that returns results as GPU tensors — the final D2H is
+    /// the caller's responsibility. Useful for batch-level pipelining: the
+    /// caller can launch many queries' merges back-to-back (letting CUDA
+    /// kernels queue async) and D2H all results together afterwards,
+    /// collapsing per-query sync points into a single drain at the end.
+    ///
+    /// Identical computation and reduction order to `merge_candidate_scores_cuda`;
+    /// only the D2H placement differs.
+    pub fn merge_candidate_scores_cuda_gpu(
+        &self,
+        candidate_sizes: &Tensor,
+        candidate_pids: &Tensor,
+        candidate_scores: &Tensor,
+        mse_estimates: &Tensor,
+        nprobe: usize,
+        k: usize,
+        max_candidates: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let device = candidate_pids.device();
+
         if candidate_pids.numel() == 0 {
-            let empty_pid: Vec<i64> = Vec::new();
-            let empty_scores: Vec<f32> = Vec::new();
-            return Ok((empty_pid, empty_scores));
+            let empty_pids = Tensor::zeros(&[0], (Kind::Int64, device));
+            let empty_scores = Tensor::zeros(&[0], (Kind::Float, device));
+            return Ok((empty_pids, empty_scores));
         }
 
-        let device = candidate_pids.device();
         let sizes = candidate_sizes.shallow_clone();
         let pids = candidate_pids.shallow_clone();
         let scores = candidate_scores.shallow_clone();
@@ -475,9 +503,9 @@ impl ResultMerger {
         let totals = deltas_per_pid + sum_mse;
 
         if totals.numel() == 0 {
-            let empty_pid: Vec<i64> = Vec::new();
-            let empty_scores_out: Vec<f32> = Vec::new();
-            return Ok((empty_pid, empty_scores_out));
+            let empty_pids = Tensor::zeros(&[0], (Kind::Int64, device));
+            let empty_scores = Tensor::zeros(&[0], (Kind::Float, device));
+            return Ok((empty_pids, empty_scores));
         }
 
         let totals_size = totals.size();
@@ -486,14 +514,37 @@ impl ResultMerger {
         let take_k = (budget as i64).min(*num_candidates);
 
         let topk = totals.topk(take_k, 0, /*largest=*/ true, /*sorted=*/ true);
-        let top_scores: Vec<f32> = topk.0.to_device(Device::Cpu).try_into()?;
+        let top_scores_gpu = topk.0;
         let top_indices = topk.1;
-        let top_pids: Vec<i64> = unique_pids
-            .index_select(0, &top_indices)
-            .to_device(Device::Cpu)
-            .try_into()?;
+        let top_pids_gpu = unique_pids.index_select(0, &top_indices);
 
-        return Ok((top_pids, top_scores));
+        Ok((top_pids_gpu, top_scores_gpu))
+    }
+
+    /// CUDA-only entry point that returns GPU tensors for deferred D2H.
+    /// Errors if the merger is configured for CPU.
+    pub fn merge_candidate_scores_defer_d2h(
+        &self,
+        candidate_sizes: &Tensor,
+        candidate_pids: &Tensor,
+        candidate_scores: &Tensor,
+        mse_estimates: &Tensor,
+        nprobe: usize,
+        k: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        anyhow::ensure!(
+            self.config.device.is_cuda(),
+            "merge_candidate_scores_defer_d2h requires a CUDA merger device"
+        );
+        self.merge_candidate_scores_cuda_gpu(
+            candidate_sizes,
+            candidate_pids,
+            candidate_scores,
+            mse_estimates,
+            nprobe,
+            k,
+            self.config.max_candidates,
+        )
     }
 }
 
