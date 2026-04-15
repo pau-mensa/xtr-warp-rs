@@ -193,9 +193,12 @@ impl ShardedScorer {
             );
 
             // ── Phase 1: Centroid selection + cell partitioning ─────
+            // Centroid IDs, scores, and token indices stored as Vecs so
+            // they can be shared across rayon threads in Phase 2.
             let mut mse_estimates: Vec<Option<Tensor>> = Vec::with_capacity(batch_len);
-            let mut cids_cpu: Vec<Option<Tensor>> = Vec::with_capacity(batch_len);
-            let mut cscores_cpu: Vec<Option<Tensor>> = Vec::with_capacity(batch_len);
+            let mut ids_vecs: Vec<Option<Vec<i64>>> = Vec::with_capacity(batch_len);
+            let mut scores_vecs: Vec<Option<Vec<f32>>> = Vec::with_capacity(batch_len);
+            let mut token_indices_vecs: Vec<Option<Vec<i64>>> = Vec::with_capacity(batch_len);
             let mut shard_cells: Vec<Option<Vec<Vec<usize>>>> =
                 Vec::with_capacity(batch_len);
             let mut num_cells: Vec<usize> = vec![0; batch_len];
@@ -217,8 +220,9 @@ impl ShardedScorer {
                     });
                     bar.inc(1);
                     mse_estimates.push(None);
-                    cids_cpu.push(None);
-                    cscores_cpu.push(None);
+                    ids_vecs.push(None);
+                    scores_vecs.push(None);
+                    token_indices_vecs.push(None);
                     shard_cells.push(None);
                     continue;
                 }
@@ -233,9 +237,10 @@ impl ShardedScorer {
 
                 let centroid_ids = selected.centroid_ids.to_kind(Kind::Int64);
                 let nc = centroid_ids.size()[0] as usize;
-                let ids_cpu = centroid_ids.to_device(Device::Cpu);
-                let ids_vec: Vec<i64> = ids_cpu.shallow_clone().try_into()?;
-                let scores_cpu = selected.scores.to_device(Device::Cpu);
+                let ids_vec: Vec<i64> = centroid_ids.to_device(Device::Cpu).try_into()?;
+                let scores_vec: Vec<f32> =
+                    selected.scores.to_device(Device::Cpu).try_into()?;
+                let tok_vec: Vec<i64> = (0..nc).map(|i| (i / nprobe) as i64).collect();
 
                 let mut per_shard: Vec<Vec<usize>> = vec![Vec::new(); num_shards];
                 for (cell_idx, &cid) in ids_vec.iter().enumerate() {
@@ -250,15 +255,18 @@ impl ShardedScorer {
                 }
 
                 mse_estimates.push(Some(selected.mse_estimate));
-                cids_cpu.push(Some(ids_cpu));
-                cscores_cpu.push(Some(scores_cpu));
+                ids_vecs.push(Some(ids_vec));
+                scores_vecs.push(Some(scores_vec));
+                token_indices_vecs.push(Some(tok_vec));
                 shard_cells.push(Some(per_shard));
                 num_cells[b] = nc;
             }
 
-            // ── Phase 2: Per-shard decompression (CUDA first) ───────
-            // CUDA results kept on-device (no D2H sync) so kernels can
-            // execute asynchronously while CPU shards are processed.
+            // ── Phase 2: Per-shard decompression ────────────────────
+            // CUDA shards: sequential (async kernel launches, no D2H sync).
+            // CPU shards: parallel across queries via rayon — much better
+            // thread utilization than parallelizing across cells within a
+            // single query (32 threads × 64 queries vs 32 threads × 4 cells).
             enum ShardOut {
                 Device(Tensor, Tensor, Tensor, Tensor, Tensor),
                 Vecs(Vec<i64>, Vec<i32>, Vec<i64>, Vec<i64>, Vec<f32>),
@@ -267,12 +275,12 @@ impl ShardedScorer {
                 .map(|_| (0..num_shards).map(|_| None).collect())
                 .collect();
 
-            for is_cuda in [true, false] {
-                for si in 0..num_shards {
-                    let shard = &self.index.shards[si];
-                    if shard.device.is_cuda() != is_cuda {
-                        continue;
-                    }
+            for si in 0..num_shards {
+                let shard = &self.index.shards[si];
+
+                if shard.device.is_cuda() {
+                    // CUDA: sequential — kernel launches are async so
+                    // pipelining across queries happens on the device.
                     for b in 0..batch_len {
                         let cells = match &shard_cells[b] {
                             Some(sc) => &sc[si],
@@ -282,22 +290,25 @@ impl ShardedScorer {
                             continue;
                         }
 
-                        let ids_cpu_b = cids_cpu[b].as_ref().unwrap();
-                        let scores_cpu_b = cscores_cpu[b].as_ref().unwrap();
+                        let ids_vec = ids_vecs[b].as_ref().unwrap();
+                        let sc_vec = scores_vecs[b].as_ref().unwrap();
+                        let tok_vec = token_indices_vecs[b].as_ref().unwrap();
 
-                        let idx_i64: Vec<i64> =
-                            cells.iter().map(|&i| i as i64).collect();
-                        let idx_t = Tensor::from_slice(&idx_i64);
+                        let s_cids_v: Vec<i64> =
+                            cells.iter().map(|&i| ids_vec[i]).collect();
+                        let s_scores_v: Vec<f32> =
+                            cells.iter().map(|&i| sc_vec[i]).collect();
+                        let s_tok_v: Vec<i64> =
+                            cells.iter().map(|&i| tok_vec[i]).collect();
+
                         let s_cids =
-                            ids_cpu_b.index_select(0, &idx_t).to_device(shard.device);
-                        let s_cscores = scores_cpu_b
-                            .index_select(0, &idx_t)
-                            .to_device(shard.device);
+                            Tensor::from_slice(&s_cids_v).to_device(shard.device);
+                        let s_cscores =
+                            Tensor::from_slice(&s_scores_v).to_device(shard.device);
                         let s_query =
                             batch_queries.i(b as i64).to_device(shard.device);
-                        let token_indices = idx_t
-                            .divide_scalar_mode(nprobe as i64, "trunc")
-                            .to_device(shard.device);
+                        let token_indices =
+                            Tensor::from_slice(&s_tok_v).to_device(shard.device);
 
                         let query_idx = c + b;
                         let subset: Option<&[i64]> = match subsets {
@@ -318,23 +329,107 @@ impl ShardedScorer {
                                 Some(&token_indices),
                             )?;
 
-                        shard_outs[b][si] = Some(if shard.device.is_cuda() {
-                            ShardOut::Device(
-                                d.capacities,
-                                d.sizes,
-                                d.offsets,
-                                d.passage_ids,
-                                d.scores,
-                            )
-                        } else {
-                            ShardOut::Vecs(
-                                d.capacities.try_into()?,
-                                d.sizes.to_kind(Kind::Int).try_into()?,
-                                d.offsets.try_into()?,
-                                d.passage_ids.to_kind(Kind::Int64).try_into()?,
-                                d.scores.to_kind(Kind::Float).try_into()?,
-                            )
+                        shard_outs[b][si] = Some(ShardOut::Device(
+                            d.capacities,
+                            d.sizes,
+                            d.offsets,
+                            d.passage_ids,
+                            d.scores,
+                        ));
+                    }
+                } else {
+                    // CPU: parallel across queries — rayon work-stealing
+                    // naturally serializes the per-query cell loop when all
+                    // threads are busy at the query level.
+                    let batch_queries_ro =
+                        ReadOnlyTensor(batch_queries.shallow_clone());
+                    let bw_ro =
+                        ReadOnlyTensor(shared.bucket_weights.shallow_clone());
+                    let decompressor = self.decompressors[si].clone();
+
+                    let cpu_results: Vec<Result<(usize, ShardOut)>> =
+                        self.thread_pool.install(|| {
+                            (0..batch_len)
+                                .into_par_iter()
+                                .filter_map(|b| {
+                                    let cells = match &shard_cells[b] {
+                                        Some(sc) => &sc[si],
+                                        None => return None,
+                                    };
+                                    if cells.is_empty() {
+                                        return None;
+                                    }
+                                    Some((|| -> Result<(usize, ShardOut)> {
+                                        let ids_vec =
+                                            ids_vecs[b].as_ref().unwrap();
+                                        let sc_v =
+                                            scores_vecs[b].as_ref().unwrap();
+                                        let tok_v =
+                                            token_indices_vecs[b].as_ref().unwrap();
+
+                                        let s_cids_v: Vec<i64> =
+                                            cells.iter().map(|&i| ids_vec[i]).collect();
+                                        let s_scores_v: Vec<f32> =
+                                            cells.iter().map(|&i| sc_v[i]).collect();
+                                        let s_tok_v: Vec<i64> =
+                                            cells.iter().map(|&i| tok_v[i]).collect();
+
+                                        let s_cids =
+                                            Tensor::from_slice(&s_cids_v);
+                                        let s_cscores =
+                                            Tensor::from_slice(&s_scores_v);
+                                        let s_query = batch_queries_ro
+                                            .i(b as i64)
+                                            .to_device(shard.device);
+                                        let token_indices =
+                                            Tensor::from_slice(&s_tok_v);
+
+                                        let query_idx = c + b;
+                                        let subset: Option<&[i64]> = match subsets
+                                        {
+                                            None => None,
+                                            Some(lists) if lists.len() == 1 => {
+                                                Some(&lists[0])
+                                            }
+                                            Some(lists) => Some(&lists[query_idx]),
+                                        };
+
+                                        let d = decompressor
+                                            .decompress_centroids_for_shard(
+                                                &s_cids,
+                                                &s_cscores,
+                                                shard,
+                                                &bw_ro,
+                                                &s_query,
+                                                nprobe,
+                                                subset,
+                                                Some(&token_indices),
+                                            )?;
+
+                                        Ok((
+                                            b,
+                                            ShardOut::Vecs(
+                                                d.capacities.try_into()?,
+                                                d.sizes
+                                                    .to_kind(Kind::Int)
+                                                    .try_into()?,
+                                                d.offsets.try_into()?,
+                                                d.passage_ids
+                                                    .to_kind(Kind::Int64)
+                                                    .try_into()?,
+                                                d.scores
+                                                    .to_kind(Kind::Float)
+                                                    .try_into()?,
+                                            ),
+                                        ))
+                                    })())
+                                })
+                                .collect()
                         });
+
+                    for result in cpu_results {
+                        let (b, out) = result?;
+                        shard_outs[b][si] = Some(out);
                     }
                 }
             }
