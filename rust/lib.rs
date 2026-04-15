@@ -25,7 +25,7 @@ pub mod utils;
 use crate::index::create::create_index;
 use crate::index::source::{DiskEmbeddingSource, EmbeddingSource, InMemoryEmbeddingSource};
 use search::{IndexLoader, ShardedScorer};
-use utils::types::{IndexConfig, Query, ReadOnlyShardedIndex, SearchConfig, SearchResult};
+use utils::types::{IndexConfig, Query, SearchConfig, SearchResult, ShardedIndex};
 
 /// Dynamically loads the native Torch shared library (e.g., `libtorch.so` or `torch.dll`).
 ///
@@ -312,7 +312,7 @@ fn compact(
 
 #[pyclass(unsendable)]
 struct ShardedSearcher {
-    sharded_index: Option<Arc<ReadOnlyShardedIndex>>,
+    sharded_index: Option<Arc<ShardedIndex>>,
     index_path: String,
     device_ratios: Vec<(Device, f64)>,
     scoring_device: Device,
@@ -355,7 +355,7 @@ impl ShardedSearcher {
     }
 
     fn load(&mut self) -> PyResult<()> {
-        let loader = IndexLoader::new(&self.index_path, Device::Cpu, self.dtype, self.use_mmap)
+        let loader = IndexLoader::new(&self.index_path, self.dtype, self.use_mmap)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create loader: {}", e)))?;
 
         let sharded_index = loader
@@ -365,7 +365,7 @@ impl ShardedSearcher {
         self.deleted_pids = crate::index::delete::load_tombstones(Path::new(&self.index_path))
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to load tombstones: {}", e)))?;
 
-        self.sharded_index = Some(Arc::new(ReadOnlyShardedIndex(sharded_index)));
+        self.sharded_index = Some(Arc::new(sharded_index));
         Ok(())
     }
 

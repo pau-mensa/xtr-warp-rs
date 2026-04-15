@@ -3,9 +3,7 @@ use rayon::{prelude::*, ThreadPool};
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
-use crate::utils::types::{
-    DecompressSource, DecompressedCentroidsOutput, IndexShard, PassageBitset, ShardSource,
-};
+use crate::utils::types::{DecompressedCentroidsOutput, IndexShard, PassageBitset};
 
 /// Centroid decompressor for efficient residual decompression
 #[derive(Clone)]
@@ -77,35 +75,9 @@ impl CentroidDecompressor {
         subset: Option<&[i64]>,
         per_cell_tokens: Option<&Tensor>,
     ) -> Result<DecompressedCentroidsOutput> {
-        let source = ShardSource {
-            shard,
-            bucket_weights,
-        };
-        self.decompress(
-            centroid_ids,
-            centroid_scores,
-            &source,
-            query_embeddings,
-            nprobe,
-            subset,
-            per_cell_tokens,
-        )
-    }
-
-    /// Core decompression entry point, generic over the data source.
-    fn decompress<S: DecompressSource>(
-        &self,
-        centroid_ids: &Tensor,
-        centroid_scores: &Tensor,
-        source: &S,
-        query_embeddings: &Tensor,
-        nprobe: usize,
-        subset: Option<&[i64]>,
-        per_cell_tokens: Option<&Tensor>,
-    ) -> Result<DecompressedCentroidsOutput> {
         let centroid_ids = centroid_ids.to_kind(Kind::Int64);
         let num_cells = centroid_ids.size()[0] as usize;
-        let device = source.device();
+        let device = shard.device;
 
         // Empty result for zero cells
         if num_cells == 0 {
@@ -119,11 +91,11 @@ impl CentroidDecompressor {
             });
         }
 
-        // Translate global centroid IDs to source-local IDs
-        let local_ids = source.localize_centroid_ids(&centroid_ids);
+        // Translate global centroid IDs to shard-local IDs
+        let local_ids = shard.localize_centroid_ids(&centroid_ids);
 
         // Bounds check
-        let num_source_centroids = source.offsets_compacted().size()[0] - 1;
+        let num_source_centroids = shard.offsets_compacted.size()[0] - 1;
         let max_centroid_id = local_ids.max().int64_value(&[]);
         if max_centroid_id >= num_source_centroids {
             return Err(anyhow!(
@@ -134,10 +106,8 @@ impl CentroidDecompressor {
         }
 
         // Gather begin/end offsets and capacities
-        let begins = source.offsets_compacted().index_select(0, &local_ids);
-        let ends = source
-            .offsets_compacted()
-            .index_select(0, &(&local_ids + 1));
+        let begins = shard.offsets_compacted.index_select(0, &local_ids);
+        let ends = shard.offsets_compacted.index_select(0, &(&local_ids + 1));
         let capacities = &ends - &begins;
 
         anyhow::ensure!(nprobe > 0, "nprobe must be greater than zero");
@@ -151,19 +121,19 @@ impl CentroidDecompressor {
         );
 
         // Resolve bucket_weights to correct device/dtype once
-        let bw = source.bucket_weights();
-        let bucket_weights = if bw.device() == device && bw.kind() == self.dtype {
-            bw.shallow_clone()
-        } else {
-            bw.to_device(device).to_kind(self.dtype)
-        };
+        let bucket_weights =
+            if bucket_weights.device() == device && bucket_weights.kind() == self.dtype {
+                bucket_weights.shallow_clone()
+            } else {
+                bucket_weights.to_device(device).to_kind(self.dtype)
+            };
 
         if device.is_cuda() {
             return self.decompress_cuda(
                 &begins,
                 &capacities,
                 centroid_scores,
-                source,
+                shard,
                 &bucket_weights,
                 &query_embeddings,
                 nprobe,
@@ -235,7 +205,7 @@ impl CentroidDecompressor {
                             &centroid_scores_vec,
                             bucket_score_stride,
                             &bucket_scores_flat,
-                            source,
+                            shard,
                             residual_bytes_per_embedding,
                             bucket_dim_shift,
                             subset_bitset_ref,
@@ -272,7 +242,7 @@ impl CentroidDecompressor {
                     &centroid_scores_vec,
                     bucket_score_stride,
                     &bucket_scores_flat,
-                    source,
+                    shard,
                     residual_bytes_per_embedding,
                     bucket_dim_shift,
                     subset_bitset.as_ref(),
@@ -308,20 +278,20 @@ impl CentroidDecompressor {
         })
     }
 
-    /// CUDA decompression path, generic over the data source.
-    fn decompress_cuda<S: DecompressSource>(
+    /// CUDA decompression path.
+    fn decompress_cuda(
         &self,
         begins: &Tensor,
         capacities: &Tensor,
         centroid_scores: &Tensor,
-        source: &S,
+        shard: &IndexShard,
         bucket_weights: &Tensor,
         query_embeddings: &Tensor,
         nprobe: usize,
         subset: Option<&[i64]>,
         per_cell_tokens: Option<&Tensor>,
     ) -> Result<DecompressedCentroidsOutput> {
-        let device = source.device();
+        let device = shard.device;
         anyhow::ensure!(
             device.is_cuda(),
             "CUDA decompression requested but source is on {:?}",
@@ -369,8 +339,8 @@ impl CentroidDecompressor {
         let intra = &ranges - &candidate_cell_starts;
         let embedding_indices = &candidate_begins + &intra;
 
-        let mut passage_ids = source
-            .pids_compacted()
+        let mut passage_ids = shard
+            .pids_compacted
             .index_select(0, &embedding_indices)
             .to_kind(Kind::Int64);
 
@@ -419,8 +389,8 @@ impl CentroidDecompressor {
             (embedding_indices, candidate_cells, total_capacity)
         };
 
-        let residuals = source
-            .residuals_compacted()
+        let residuals = shard
+            .residuals_compacted
             .index_select(0, &embedding_indices)
             .to_kind(Kind::Uint8);
 
@@ -516,11 +486,11 @@ impl CentroidDecompressor {
         })
     }
 
-    /// Process a single cell on CPU, generic over the data source.
+    /// Process a single cell on CPU.
     ///
     /// `token_idx` is the precomputed query token index for this cell.
     /// `data_cell_idx` is the index into capacities/begins/scores arrays.
-    fn process_cell_impl<S: DecompressSource>(
+    fn process_cell_impl(
         &self,
         token_idx: usize,
         data_cell_idx: usize,
@@ -529,7 +499,7 @@ impl CentroidDecompressor {
         centroid_scores_vec: &[f32],
         bucket_score_stride: usize,
         bucket_scores_flat: &[f32],
-        source: &S,
+        shard: &IndexShard,
         residual_bytes_per_embedding: usize,
         bucket_dim_shift: usize,
         subset_bitset: Option<&PassageBitset>,
@@ -542,13 +512,13 @@ impl CentroidDecompressor {
         let begin = begins_vec[data_cell_idx];
 
         // Use narrow for zero-copy views into compacted data
-        let local_pids_raw: Vec<i64> = source
-            .pids_compacted()
+        let local_pids_raw: Vec<i64> = shard
+            .pids_compacted
             .narrow(0, begin, capacity as i64)
             .try_into()
             .unwrap_or_default();
-        let local_residuals_raw: Vec<u8> = source
-            .residuals_compacted()
+        let local_residuals_raw: Vec<u8> = shard
+            .residuals_compacted
             .narrow(0, begin, capacity as i64)
             .to_kind(Kind::Uint8)
             .contiguous()

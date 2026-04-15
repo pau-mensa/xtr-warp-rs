@@ -274,24 +274,17 @@ pub struct SharedIndexState {
 }
 
 /// A fully sharded index: shared state + per-device shards.
+///
+/// # Safety
+/// Marked `Sync` because shard tensors are never mutated after load — same
+/// invariant as `IndexShard`.
 pub struct ShardedIndex {
     pub shared: SharedIndexState,
     pub shards: Vec<IndexShard>,
 }
 
-/// Read-only wrapper for ShardedIndex.
-/// Tensors are never mutated after load, so we treat them as Sync.
-pub struct ReadOnlyShardedIndex(pub ShardedIndex);
-
-impl std::ops::Deref for ReadOnlyShardedIndex {
-    type Target = ShardedIndex;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-unsafe impl Sync for ReadOnlyShardedIndex {}
+// SAFETY: see struct docs — read-only after load.
+unsafe impl Sync for ShardedIndex {}
 
 /// Query representation for search
 pub struct Query {
@@ -427,51 +420,15 @@ impl PassageBitset {
     }
 }
 
-/// Abstraction over index data for decompression, implemented by `ShardSource`.
-pub trait DecompressSource: Sync {
-    fn device(&self) -> Device;
-    fn pids_compacted(&self) -> &Tensor;
-    fn residuals_compacted(&self) -> &Tensor;
-    fn offsets_compacted(&self) -> &Tensor;
-    fn bucket_weights(&self) -> &Tensor;
-    /// Translate global centroid IDs to source-local IDs.
-    /// For a shard covering [0, N) this is a no-op; otherwise subtracts
+impl IndexShard {
+    /// Translate global centroid IDs into this shard's local ID space.
+    /// For a shard starting at 0 this is a no-op; otherwise subtracts
     /// `centroid_start`.
-    fn localize_centroid_ids(&self, global_ids: &Tensor) -> Tensor;
-}
-
-/// Adapter that presents an `IndexShard` + shared `bucket_weights` as a
-/// `DecompressSource`. Short-lived — created per-decompress call.
-pub struct ShardSource<'a> {
-    pub shard: &'a IndexShard,
-    pub bucket_weights: &'a Tensor,
-}
-
-// SAFETY: ShardSource borrows read-only tensors (never mutated after load).
-// Same invariant as IndexShard.
-unsafe impl Sync for ShardSource<'_> {}
-
-impl<'a> DecompressSource for ShardSource<'a> {
-    fn device(&self) -> Device {
-        self.shard.device
-    }
-    fn pids_compacted(&self) -> &Tensor {
-        &self.shard.pids_compacted
-    }
-    fn residuals_compacted(&self) -> &Tensor {
-        &self.shard.residuals_compacted
-    }
-    fn offsets_compacted(&self) -> &Tensor {
-        &self.shard.offsets_compacted
-    }
-    fn bucket_weights(&self) -> &Tensor {
-        self.bucket_weights
-    }
-    fn localize_centroid_ids(&self, ids: &Tensor) -> Tensor {
-        if self.shard.centroid_start == 0 {
-            ids.shallow_clone()
+    pub fn localize_centroid_ids(&self, global_ids: &Tensor) -> Tensor {
+        if self.centroid_start == 0 {
+            global_ids.shallow_clone()
         } else {
-            ids - (self.shard.centroid_start as i64)
+            global_ids - (self.centroid_start as i64)
         }
     }
 }

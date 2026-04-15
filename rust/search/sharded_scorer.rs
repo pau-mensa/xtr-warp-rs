@@ -10,36 +10,116 @@ use crate::search::centroid_selector::CentroidSelector;
 use crate::search::decompressor::CentroidDecompressor;
 use crate::search::merger::{MergerConfig, ResultMerger};
 use crate::utils::types::{
-    parse_dtype, Query, ReadOnlyShardedIndex, ReadOnlyTensor, SearchConfig, SearchResult,
+    parse_dtype, DecompressedCentroidsOutput, IndexShard, Query, ReadOnlyTensor, SearchConfig,
+    SearchResult, ShardedIndex,
 };
 
-/// Per-shard decompression output. CUDA shards keep tensors on device to
-/// avoid a D2H sync; CPU shards already have the data as Vecs.
-#[allow(clippy::large_enum_variant)]
-enum ShardOut {
-    Device(Tensor, Tensor, Tensor, Tensor, Tensor),
-    Vecs(Vec<i64>, Vec<i32>, Vec<i64>, Vec<i64>, Vec<f32>),
+/// Resolve the subset to apply for `query_idx`:
+/// - `None` → no subset
+/// - `Some(lists)` with a single entry → broadcast to every query
+/// - `Some(lists)` with per-query entries → indexed lookup
+#[inline]
+fn resolve_subset<'a>(subsets: Option<&'a [Vec<i64>]>, query_idx: usize) -> Option<&'a [i64]> {
+    match subsets {
+        None => None,
+        Some(lists) if lists.len() == 1 => Some(&lists[0]),
+        Some(lists) => Some(&lists[query_idx]),
+    }
 }
 
-/// Per-batch data produced by `prepare_batch` (einsum + Phase 1 +
-/// Phase 2 CUDA launches). Consumed by `process_cpu_shards` (fills in
-/// the CPU entries of `shard_outs`) and then by `run_phase3`.
+/// Decompress one query's cells against one shard. Returns `None` when the
+/// shard owns no cells for this query. `.to_device(shard.device)` on the
+/// input tensors is a no-op for CPU shards and a launch for CUDA shards —
+/// lets the same helper serve both paths.
+fn decompress_query_shard(
+    decompressor: &CentroidDecompressor,
+    shard: &IndexShard,
+    bucket_weights: &Tensor,
+    qs: &QueryState,
+    shard_idx: usize,
+    batch_queries: &Tensor,
+    b: usize,
+    nprobe: usize,
+    subset: Option<&[i64]>,
+) -> Result<Option<DecompressedCentroidsOutput>> {
+    let cells = &qs.shard_cells[shard_idx];
+    if cells.is_empty() {
+        return Ok(None);
+    }
+
+    let s_cids_v: Vec<i64> = cells.iter().map(|&i| qs.ids[i]).collect();
+    let s_scores_v: Vec<f32> = cells.iter().map(|&i| qs.scores[i]).collect();
+    let s_tok_v: Vec<i64> = cells.iter().map(|&i| qs.token_indices[i]).collect();
+
+    let s_cids = Tensor::from_slice(&s_cids_v).to_device(shard.device);
+    let s_cscores = Tensor::from_slice(&s_scores_v).to_device(shard.device);
+    let s_query = batch_queries.i(b as i64).to_device(shard.device);
+    let token_indices = Tensor::from_slice(&s_tok_v).to_device(shard.device);
+
+    let d = decompressor.decompress_centroids_for_shard(
+        &s_cids,
+        &s_cscores,
+        shard,
+        bucket_weights,
+        &s_query,
+        nprobe,
+        subset,
+        Some(&token_indices),
+    )?;
+    Ok(Some(d))
+}
+
+/// Per-(query, shard) decompression output, always CPU-resident.
+///
+/// CUDA shards batch their D2H inside `prepare_batch` before populating this;
+/// CPU shards write directly into it.
+struct ShardOut {
+    capacities: Vec<i64>,
+    sizes: Vec<i32>,
+    offsets: Vec<i64>,
+    passage_ids: Vec<i64>,
+    scores: Vec<f32>,
+}
+
+/// Per-query state built during Phase 1 of `prepare_batch`. `None` for
+/// queries with an empty subset — the corresponding `batch_results` slot is
+/// pre-filled with an empty `SearchResult` in that case.
+///
+/// # Safety
+/// Marked `Sync` so the CPU-shard rayon scope can borrow `&[Option<QueryState>]`.
+/// `mse_estimate` is a `Tensor` (not `Sync`) but is never mutated after creation
+/// — same invariant as `ReadOnlyTensor`.
+struct QueryState {
+    mse_estimate: Tensor,
+    /// Selected centroid IDs, on CPU (one entry per cell).
+    ids: Vec<i64>,
+    /// Per-cell centroid scores on CPU.
+    scores: Vec<f32>,
+    /// Per-cell query-token index (cell_idx / nprobe).
+    token_indices: Vec<i64>,
+    /// `shard_cells[si]` is the list of cell indices belonging to shard `si`.
+    shard_cells: Vec<Vec<usize>>,
+    /// Number of selected cells for this query.
+    num_cells: usize,
+}
+
+// SAFETY: see struct docs — `mse_estimate` read-only after creation.
+unsafe impl Sync for QueryState {}
+
+/// Per-batch data produced by `prepare_batch`. Consumed by the CPU-shard
+/// rayon scope in `rank_multi_shard` and then by its Phase 3 assembly.
 struct PreparedBatch {
     c: usize,
     batch_len: usize,
     /// Wrapped in ReadOnlyTensor so it can cross thread boundaries in the
     /// CPU shard par_iter (tch::Tensor is !Sync).
     batch_queries: ReadOnlyTensor,
-    mse_estimates: Vec<Option<Tensor>>,
-    ids_vecs: Vec<Option<Vec<i64>>>,
-    scores_vecs: Vec<Option<Vec<f32>>>,
-    token_indices_vecs: Vec<Option<Vec<i64>>>,
-    shard_cells: Vec<Option<Vec<Vec<usize>>>>,
-    num_cells: Vec<usize>,
+    /// Per-query centroid-selection state.
+    per_query: Vec<Option<QueryState>>,
     /// Pre-populated with empty results for queries with empty subsets.
     batch_results: Vec<Option<SearchResult>>,
     /// Per (query, shard) decompress output. CUDA entries filled by
-    /// `prepare_batch`; CPU entries filled after `process_cpu_shards`.
+    /// `prepare_batch`'s batched D2H; CPU entries filled by the rayon scope.
     shard_outs: Vec<Vec<Option<ShardOut>>>,
 }
 
@@ -49,7 +129,7 @@ struct PreparedBatch {
 /// CPU shard decompression runs on the rayon pool, the main thread prepares
 /// batch N+1 (einsum + Phase 1 + Phase 2 CUDA launches) on GPU.
 pub struct ShardedScorer {
-    index: Arc<ReadOnlyShardedIndex>,
+    index: Arc<ShardedIndex>,
     centroid_selector: CentroidSelector,
     /// One decompressor per shard, configured for the shard's device.
     decompressors: Vec<CentroidDecompressor>,
@@ -63,7 +143,7 @@ pub struct ShardedScorer {
 }
 
 impl ShardedScorer {
-    pub fn new(index: &Arc<ReadOnlyShardedIndex>, mut config: SearchConfig) -> Result<Self> {
+    pub fn new(index: &Arc<ShardedIndex>, mut config: SearchConfig) -> Result<Self> {
         let shared = &index.shared;
         let num_centroids = shared.metadata.num_centroids as u32;
         if config.nprobe > num_centroids {
@@ -214,21 +294,12 @@ impl ShardedScorer {
         );
 
         // Centroid selection + cell partitioning
-        let mut mse_estimates: Vec<Option<Tensor>> = Vec::with_capacity(batch_len);
-        let mut ids_vecs: Vec<Option<Vec<i64>>> = Vec::with_capacity(batch_len);
-        let mut scores_vecs: Vec<Option<Vec<f32>>> = Vec::with_capacity(batch_len);
-        let mut token_indices_vecs: Vec<Option<Vec<i64>>> = Vec::with_capacity(batch_len);
-        let mut shard_cells: Vec<Option<Vec<Vec<usize>>>> = Vec::with_capacity(batch_len);
-        let mut num_cells: Vec<usize> = vec![0; batch_len];
+        let mut per_query: Vec<Option<QueryState>> = Vec::with_capacity(batch_len);
         let mut batch_results: Vec<Option<SearchResult>> = vec![None; batch_len];
 
         for b in 0..batch_len {
             let query_idx = c + b;
-            let subset: Option<&[i64]> = match subsets {
-                None => None,
-                Some(lists) if lists.len() == 1 => Some(&lists[0]),
-                Some(lists) => Some(&lists[query_idx]),
-            };
+            let subset = resolve_subset(subsets, query_idx);
 
             if matches!(subset, Some(s) if s.is_empty()) {
                 batch_results[b] = Some(SearchResult {
@@ -237,11 +308,7 @@ impl ShardedScorer {
                     query_id: query_idx + 1,
                 });
                 bar.inc(1);
-                mse_estimates.push(None);
-                ids_vecs.push(None);
-                scores_vecs.push(None);
-                token_indices_vecs.push(None);
-                shard_cells.push(None);
+                per_query.push(None);
                 continue;
             }
 
@@ -254,28 +321,30 @@ impl ShardedScorer {
             )?;
 
             let centroid_ids = selected.centroid_ids.to_kind(Kind::Int64);
-            let nc = centroid_ids.size()[0] as usize;
-            let ids_vec: Vec<i64> = centroid_ids.to_device(Device::Cpu).try_into()?;
-            let scores_vec: Vec<f32> = selected.scores.to_device(Device::Cpu).try_into()?;
-            let tok_vec: Vec<i64> = (0..nc).map(|i| (i / nprobe) as i64).collect();
+            let num_cells = centroid_ids.size()[0] as usize;
+            let ids: Vec<i64> = centroid_ids.to_device(Device::Cpu).try_into()?;
+            let scores: Vec<f32> = selected.scores.to_device(Device::Cpu).try_into()?;
+            let token_indices: Vec<i64> = (0..num_cells).map(|i| (i / nprobe) as i64).collect();
 
-            let mut per_shard: Vec<Vec<usize>> = vec![Vec::new(); num_shards];
-            for (cell_idx, &cid) in ids_vec.iter().enumerate() {
+            let mut shard_cells: Vec<Vec<usize>> = vec![Vec::new(); num_shards];
+            for (cell_idx, &cid) in ids.iter().enumerate() {
                 for (si, shard) in self.index.shards.iter().enumerate() {
                     if (cid as usize) >= shard.centroid_start && (cid as usize) < shard.centroid_end
                     {
-                        per_shard[si].push(cell_idx);
+                        shard_cells[si].push(cell_idx);
                         break;
                     }
                 }
             }
 
-            mse_estimates.push(Some(selected.mse_estimate));
-            ids_vecs.push(Some(ids_vec));
-            scores_vecs.push(Some(scores_vec));
-            token_indices_vecs.push(Some(tok_vec));
-            shard_cells.push(Some(per_shard));
-            num_cells[b] = nc;
+            per_query.push(Some(QueryState {
+                mse_estimate: selected.mse_estimate,
+                ids,
+                scores,
+                token_indices,
+                shard_cells,
+                num_cells,
+            }));
         }
 
         // CUDA launches
@@ -288,67 +357,17 @@ impl ShardedScorer {
         for si in 0..num_shards {
             let shard = &self.index.shards[si];
             if !shard.device.is_cuda() {
-                continue; // CPU shards are handled by process_cpu_shards
+                continue; // CPU shards are handled by rank_multi_shard's rayon scope
             }
 
-            for b in 0..batch_len {
-                let cells = match &shard_cells[b] {
-                    Some(sc) => &sc[si],
-                    None => continue,
-                };
-                if cells.is_empty() {
-                    continue;
-                }
-
-                let ids_vec = ids_vecs[b].as_ref().unwrap();
-                let sc_vec = scores_vecs[b].as_ref().unwrap();
-                let tok_vec = token_indices_vecs[b].as_ref().unwrap();
-
-                let s_cids_v: Vec<i64> = cells.iter().map(|&i| ids_vec[i]).collect();
-                let s_scores_v: Vec<f32> = cells.iter().map(|&i| sc_vec[i]).collect();
-                let s_tok_v: Vec<i64> = cells.iter().map(|&i| tok_vec[i]).collect();
-
-                let s_cids = Tensor::from_slice(&s_cids_v).to_device(shard.device);
-                let s_cscores = Tensor::from_slice(&s_scores_v).to_device(shard.device);
-                let s_query = batch_queries.i(b as i64).to_device(shard.device);
-                let token_indices = Tensor::from_slice(&s_tok_v).to_device(shard.device);
-
-                let query_idx = c + b;
-                let subset: Option<&[i64]> = match subsets {
-                    None => None,
-                    Some(lists) if lists.len() == 1 => Some(&lists[0]),
-                    Some(lists) => Some(&lists[query_idx]),
-                };
-
-                let d = self.decompressors[si].decompress_centroids_for_shard(
-                    &s_cids,
-                    &s_cscores,
-                    shard,
-                    &shared.bucket_weights,
-                    &s_query,
-                    nprobe,
-                    subset,
-                    Some(&token_indices),
-                )?;
-
-                shard_outs[b][si] = Some(ShardOut::Device(
-                    d.capacities,
-                    d.sizes,
-                    d.offsets,
-                    d.passage_ids,
-                    d.scores,
-                ));
-            }
-
-            // Batched D2H for this CUDA shard: one `cat` + one D2H per
-            // column, then split back to per-query ShardOut::Vecs. Replaces
-            // 5 × batch_len per-query D2Hs in Phase 3 Pass A1 with 4 big
-            // transfers here. Ordering is stable (cat preserves input
-            // order), so Phase 3 reads identical data to before.
+            // Launch all CUDA decompresses for this shard and accumulate
+            // their GPU tensors for a single batched D2H below. We don't
+            // park the results in `shard_outs[b][si]` because they're about
+            // to be replaced with Vec-form ShardOut values anyway.
             //
-            // `offsets` is not transferred — we rebuild it CPU-side from
-            // `sizes` (offsets[i+1] = offsets[i] + sizes[i]), which is
-            // the invariant the decompressor maintains.
+            // `offsets` isn't transferred — it's rebuilt CPU-side from
+            // `sizes` (offsets[i+1] = offsets[i] + sizes[i]), which is the
+            // invariant the decompressor maintains.
             let mut active_bs: Vec<usize> = Vec::new();
             let mut caps_refs: Vec<Tensor> = Vec::new();
             let mut sizes_refs: Vec<Tensor> = Vec::new();
@@ -358,23 +377,44 @@ impl ShardedScorer {
             let mut nt_per: Vec<usize> = Vec::new();
 
             for b in 0..batch_len {
-                if let Some(ShardOut::Device(cap, sz, _off, pid, sc)) = shard_outs[b][si].take() {
-                    let nc = cap.size()[0] as usize;
-                    let nt = pid.size()[0] as usize;
-                    active_bs.push(b);
-                    nc_per.push(nc);
-                    nt_per.push(nt);
-                    caps_refs.push(cap);
-                    sizes_refs.push(sz);
-                    pids_refs.push(pid);
-                    scores_refs.push(sc);
-                }
+                let qs = match &per_query[b] {
+                    Some(qs) => qs,
+                    None => continue,
+                };
+                let subset = resolve_subset(subsets, c + b);
+                let d = match decompress_query_shard(
+                    &self.decompressors[si],
+                    shard,
+                    &shared.bucket_weights,
+                    qs,
+                    si,
+                    &batch_queries,
+                    b,
+                    nprobe,
+                    subset,
+                )? {
+                    Some(d) => d,
+                    None => continue,
+                };
+
+                active_bs.push(b);
+                nc_per.push(d.capacities.size()[0] as usize);
+                nt_per.push(d.passage_ids.size()[0] as usize);
+                caps_refs.push(d.capacities);
+                sizes_refs.push(d.sizes);
+                pids_refs.push(d.passage_ids);
+                scores_refs.push(d.scores);
             }
 
             if active_bs.is_empty() {
                 continue;
             }
 
+            // Batched D2H for this CUDA shard: one `cat` + one D2H per
+            // column, then split back to per-query ShardOut. Replaces
+            // 5 × batch_len per-query D2Hs in Phase 3 with 4 big transfers
+            // here. Ordering is stable (cat preserves input order), so
+            // Phase 3 reads identical data to before.
             let caps_ref_view: Vec<&Tensor> = caps_refs.iter().collect();
             let sizes_ref_view: Vec<&Tensor> = sizes_refs.iter().collect();
             let pids_ref_view: Vec<&Tensor> = pids_refs.iter().collect();
@@ -396,24 +436,24 @@ impl ShardedScorer {
                 let nc = nc_per[i];
                 let nt = nt_per[i];
 
-                let caps_slice = caps_vec[cell_off..cell_off + nc].to_vec();
-                let sizes_slice = sizes_vec[cell_off..cell_off + nc].to_vec();
-                let pids_slice = pids_vec[cand_off..cand_off + nt].to_vec();
-                let scores_slice = scores_vec[cand_off..cand_off + nt].to_vec();
+                let capacities = caps_vec[cell_off..cell_off + nc].to_vec();
+                let sizes = sizes_vec[cell_off..cell_off + nc].to_vec();
+                let passage_ids = pids_vec[cand_off..cand_off + nt].to_vec();
+                let scores = scores_vec[cand_off..cand_off + nt].to_vec();
 
                 // Reconstruct per-query offsets from sizes (0, cumsum).
-                let mut offsets_slice = vec![0i64; nc + 1];
+                let mut offsets = vec![0i64; nc + 1];
                 for j in 0..nc {
-                    offsets_slice[j + 1] = offsets_slice[j] + sizes_slice[j] as i64;
+                    offsets[j + 1] = offsets[j] + sizes[j] as i64;
                 }
 
-                shard_outs[b][si] = Some(ShardOut::Vecs(
-                    caps_slice,
-                    sizes_slice,
-                    offsets_slice,
-                    pids_slice,
-                    scores_slice,
-                ));
+                shard_outs[b][si] = Some(ShardOut {
+                    capacities,
+                    sizes,
+                    offsets,
+                    passage_ids,
+                    scores,
+                });
 
                 cell_off += nc;
                 cand_off += nt;
@@ -430,12 +470,7 @@ impl ShardedScorer {
             c,
             batch_len,
             batch_queries: ReadOnlyTensor(batch_queries),
-            mse_estimates,
-            ids_vecs,
-            scores_vecs,
-            token_indices_vecs,
-            shard_cells,
-            num_cells,
+            per_query,
             batch_results,
             shard_outs,
         })
@@ -493,10 +528,7 @@ impl ShardedScorer {
                 let shards = &self.index.shards;
                 let decompressors = self.decompressors.clone();
                 let bw = ReadOnlyTensor(self.index.shared.bucket_weights.shallow_clone());
-                let shard_cells = &current.shard_cells;
-                let ids_vecs = &current.ids_vecs;
-                let scores_vecs = &current.scores_vecs;
-                let token_indices_vecs = &current.token_indices_vecs;
+                let per_query = &current.per_query;
                 let batch_queries = &current.batch_queries;
                 let batch_len = current.batch_len;
                 let c = current.c;
@@ -516,60 +548,40 @@ impl ShardedScorer {
                             let shard_results: Vec<Result<(usize, ShardOut)>> = (0..batch_len)
                                 .into_par_iter()
                                 .filter_map(|b| {
-                                    let cells = match &shard_cells[b] {
-                                        Some(sc) => &sc[si],
-                                        None => return None,
-                                    };
-                                    if cells.is_empty() {
-                                        return None;
-                                    }
-                                    Some((|| -> Result<(usize, ShardOut)> {
-                                        let ids_vec = ids_vecs[b].as_ref().unwrap();
-                                        let sc_v = scores_vecs[b].as_ref().unwrap();
-                                        let tok_v = token_indices_vecs[b].as_ref().unwrap();
-
-                                        let s_cids_v: Vec<i64> =
-                                            cells.iter().map(|&i| ids_vec[i]).collect();
-                                        let s_scores_v: Vec<f32> =
-                                            cells.iter().map(|&i| sc_v[i]).collect();
-                                        let s_tok_v: Vec<i64> =
-                                            cells.iter().map(|&i| tok_v[i]).collect();
-
-                                        let s_cids = Tensor::from_slice(&s_cids_v);
-                                        let s_cscores = Tensor::from_slice(&s_scores_v);
-                                        let s_query =
-                                            batch_queries.i(b as i64).to_device(shard.device);
-                                        let token_indices = Tensor::from_slice(&s_tok_v);
-
-                                        let query_idx = c + b;
-                                        let subset: Option<&[i64]> = match subsets {
-                                            None => None,
-                                            Some(lists) if lists.len() == 1 => Some(&lists[0]),
-                                            Some(lists) => Some(&lists[query_idx]),
-                                        };
-
-                                        let d = decompressor.decompress_centroids_for_shard(
-                                            &s_cids,
-                                            &s_cscores,
+                                    let qs = per_query[b].as_ref()?;
+                                    (|| -> Result<Option<(usize, ShardOut)>> {
+                                        let d = match decompress_query_shard(
+                                            decompressor,
                                             shard,
                                             &bw,
-                                            &s_query,
-                                            nprobe,
-                                            subset,
-                                            Some(&token_indices),
-                                        )?;
-
-                                        Ok((
+                                            qs,
+                                            si,
+                                            batch_queries,
                                             b,
-                                            ShardOut::Vecs(
-                                                d.capacities.try_into()?,
-                                                d.sizes.to_kind(Kind::Int).try_into()?,
-                                                d.offsets.try_into()?,
-                                                d.passage_ids.to_kind(Kind::Int64).try_into()?,
-                                                d.scores.to_kind(Kind::Float).try_into()?,
-                                            ),
-                                        ))
-                                    })())
+                                            nprobe,
+                                            resolve_subset(subsets, c + b),
+                                        )? {
+                                            Some(d) => d,
+                                            None => return Ok(None),
+                                        };
+                                        Ok(Some((
+                                            b,
+                                            ShardOut {
+                                                capacities: d.capacities.try_into()?,
+                                                sizes: d.sizes.to_kind(Kind::Int).try_into()?,
+                                                offsets: d.offsets.try_into()?,
+                                                passage_ids: d
+                                                    .passage_ids
+                                                    .to_kind(Kind::Int64)
+                                                    .try_into()?,
+                                                scores: d
+                                                    .scores
+                                                    .to_kind(Kind::Float)
+                                                    .try_into()?,
+                                            },
+                                        )))
+                                    })()
+                                    .transpose()
                                 })
                                 .collect();
 
@@ -627,9 +639,7 @@ impl ShardedScorer {
             let PreparedBatch {
                 c,
                 batch_len,
-                mse_estimates,
-                shard_cells,
-                num_cells,
+                per_query,
                 mut batch_results,
                 mut shard_outs,
                 ..
@@ -638,14 +648,14 @@ impl ShardedScorer {
             let use_defer_d2h = merge_device.is_cuda();
 
             // Pass A1a: parallel per-query CPU assembly
-            // After Lever C, shard_outs contains only ShardOut::Vecs for
-            // CUDA shards (D2H already done in prepare_batch). Each query's
-            // assembly is now pure CPU work — independent, embarrassingly
-            // parallel across the rayon pool. We collect per-query flat
-            // Vecs; a quick serial pass afterwards concatenates them into
-            // master arrays (preserving batch order for the merger).
+            // By construction `shard_outs` is always CPU-resident (CUDA D2H
+            // already happened in prepare_batch). Each query's assembly is
+            // pure CPU work — independent, embarrassingly parallel across
+            // the rayon pool. We collect per-query flat Vecs; a quick
+            // serial pass afterwards concatenates them into master arrays
+            // (preserving batch order for the merger).
             type QueryFlats = (Vec<i64>, Vec<i32>, Vec<i64>, Vec<f32>);
-            let per_query: Vec<Option<QueryFlats>> = self.thread_pool.install(|| {
+            let query_flats: Vec<Option<QueryFlats>> = self.thread_pool.install(|| {
                 shard_outs
                     .par_iter_mut()
                     .enumerate()
@@ -653,8 +663,8 @@ impl ShardedScorer {
                         if batch_results[b].is_some() {
                             return None;
                         }
-                        let nc = num_cells[b];
-                        let sc = shard_cells[b].as_ref().unwrap();
+                        let qs = per_query[b].as_ref().unwrap();
+                        let nc = qs.num_cells;
 
                         let mut g_cap = vec![0i64; nc];
                         let mut g_sizes = vec![0i32; nc];
@@ -662,47 +672,22 @@ impl ShardedScorer {
                         let mut g_scores: Vec<Vec<f32>> = vec![Vec::new(); nc];
 
                         for si in 0..num_shards {
-                            let cells = &sc[si];
+                            let cells = &qs.shard_cells[si];
                             if cells.is_empty() {
                                 continue;
                             }
-                            let (cv, sv, ov, pv, scv) = match shard_outs_b[si].take() {
-                                // CUDA-shard Device variants were converted
-                                // to Vecs in prepare_batch — this arm is a
-                                // safety net only.
-                                Some(ShardOut::Device(cap, sz, off, pid, sc)) => {
-                                    let cv: Vec<i64> =
-                                        cap.to_device(Device::Cpu).try_into().ok()?;
-                                    let sv: Vec<i32> = sz
-                                        .to_device(Device::Cpu)
-                                        .to_kind(Kind::Int)
-                                        .try_into()
-                                        .ok()?;
-                                    let ov: Vec<i64> =
-                                        off.to_device(Device::Cpu).try_into().ok()?;
-                                    let pv: Vec<i64> = pid
-                                        .to_device(Device::Cpu)
-                                        .to_kind(Kind::Int64)
-                                        .try_into()
-                                        .ok()?;
-                                    let scv: Vec<f32> = sc
-                                        .to_device(Device::Cpu)
-                                        .to_kind(Kind::Float)
-                                        .try_into()
-                                        .ok()?;
-                                    (cv, sv, ov, pv, scv)
-                                },
-                                Some(ShardOut::Vecs(cv, sv, ov, pv, scv)) => (cv, sv, ov, pv, scv),
+                            let out = match shard_outs_b[si].take() {
+                                Some(out) => out,
                                 None => continue,
                             };
 
                             for (local, &gc) in cells.iter().enumerate() {
-                                g_cap[gc] = cv[local];
-                                g_sizes[gc] = sv[local];
-                                let s = ov[local] as usize;
-                                let e = ov[local + 1] as usize;
-                                g_pids[gc] = pv[s..e].to_vec();
-                                g_scores[gc] = scv[s..e].to_vec();
+                                g_cap[gc] = out.capacities[local];
+                                g_sizes[gc] = out.sizes[local];
+                                let s = out.offsets[local] as usize;
+                                let e = out.offsets[local + 1] as usize;
+                                g_pids[gc] = out.passage_ids[s..e].to_vec();
+                                g_scores[gc] = out.scores[s..e].to_vec();
                             }
                         }
 
@@ -729,7 +714,7 @@ impl ShardedScorer {
             let mut cell_offsets: Vec<usize> = vec![0];
             let mut cand_offsets: Vec<usize> = vec![0];
 
-            for (b, result) in per_query.into_iter().enumerate() {
+            for (b, result) in query_flats.into_iter().enumerate() {
                 if let Some((g_cap, g_sizes, flat_pids, flat_scores)) = result {
                     all_caps.extend_from_slice(&g_cap);
                     all_sizes.extend_from_slice(&g_sizes);
@@ -777,11 +762,11 @@ impl ShardedScorer {
                     let pid_t = pids_all_t.narrow(0, cand_start, cand_len);
                     let sc_t = scores_all_t.narrow(0, cand_start, cand_len);
 
-                    let mse = mse_estimates[b].as_ref().unwrap();
+                    let mse = &per_query[b].as_ref().unwrap().mse_estimate;
                     let mse_dev = mse.to_device(merge_device);
 
                     if use_defer_d2h {
-                        let (pids_gpu, scores_gpu) = self.merger.merge_candidate_scores_defer_d2h(
+                        let (pids_gpu, scores_gpu) = self.merger.merge_candidate_scores_cuda(
                             &sz_t, &pid_t, &sc_t, &mse_dev, nprobe, k,
                         )?;
                         gpu_topk[b] = Some((pids_gpu, scores_gpu));
@@ -871,11 +856,7 @@ impl ShardedScorer {
                     .into_par_iter()
                     .enumerate()
                     .map(|(idx, query_embeddings)| {
-                        let subset: Option<&[i64]> = match subsets {
-                            None => None,
-                            Some(lists) if lists.len() == 1 => Some(&lists[0]),
-                            Some(lists) => Some(&lists[idx]),
-                        };
+                        let subset = resolve_subset(subsets, idx);
 
                         if matches!(subset, Some(s) if s.is_empty()) {
                             bar_clone.inc(1);
@@ -952,11 +933,7 @@ impl ShardedScorer {
 
                 for b in 0..batch_size {
                     let query_idx = c + b as usize;
-                    let subset: Option<&[i64]> = match subsets {
-                        None => None,
-                        Some(lists) if lists.len() == 1 => Some(&lists[0]),
-                        Some(lists) => Some(&lists[query_idx]),
-                    };
+                    let subset = resolve_subset(subsets, query_idx);
 
                     if matches!(subset, Some(s) if s.is_empty()) {
                         results.push(SearchResult {

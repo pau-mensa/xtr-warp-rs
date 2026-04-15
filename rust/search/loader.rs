@@ -124,16 +124,9 @@ pub struct IndexLoader {
 }
 
 impl IndexLoader {
-    /// Create a new index loader.
-    ///
-    /// `device` is accepted for API compatibility but unused — shard
-    /// devices are specified via `load_sharded(device_ratios, …)`.
-    pub fn new(
-        index_path: impl AsRef<Path>,
-        _device: Device,
-        dtype: Kind,
-        use_mmap: bool,
-    ) -> Result<Self> {
+    /// Create a new index loader. Shard devices are specified later via
+    /// `load_sharded(device_ratios, …)`.
+    pub fn new(index_path: impl AsRef<Path>, dtype: Kind, use_mmap: bool) -> Result<Self> {
         let path = index_path.as_ref();
 
         if !path.exists() {

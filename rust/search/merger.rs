@@ -270,16 +270,20 @@ impl ResultMerger {
     ) -> Result<(Vec<PassageId>, Vec<Score>)> {
         // use cuda if possible
         if self.config.device.is_cuda() {
-            if let Ok((pids, scores)) = self.merge_candidate_scores_cuda(
+            if let Ok((top_pids_t, top_scores_t)) = self.merge_candidate_scores_cuda(
                 candidate_sizes,
                 candidate_pids,
                 candidate_scores,
                 mse_estimates,
                 nprobe,
                 k,
-                self.config.max_candidates,
             ) {
-                return Ok((pids, scores));
+                let top_scores: Vec<f32> = top_scores_t
+                    .to_kind(Kind::Float)
+                    .to_device(Device::Cpu)
+                    .try_into()?;
+                let top_pids: Vec<i64> = top_pids_t.to_device(Device::Cpu).try_into()?;
+                return Ok((top_pids, top_scores));
             }
         }
 
@@ -363,7 +367,12 @@ impl ResultMerger {
         })
     }
 
-    fn merge_candidate_scores_cuda(
+    /// CUDA merger. Returns results as GPU tensors — callers that need a
+    /// `Vec<PassageId>, Vec<Score>` should D2H themselves (see
+    /// `merge_candidate_scores`'s CUDA branch). Keeping the output on-device
+    /// lets `sharded_scorer` launch many queries' merges back-to-back
+    /// (CUDA kernels queue async) and drain with a single D2H at the end.
+    pub(crate) fn merge_candidate_scores_cuda(
         &self,
         candidate_sizes: &Tensor,
         candidate_pids: &Tensor,
@@ -371,44 +380,8 @@ impl ResultMerger {
         mse_estimates: &Tensor,
         nprobe: usize,
         k: usize,
-        max_candidates: usize,
-    ) -> Result<(Vec<PassageId>, Vec<Score>)> {
-        // Thin wrapper: do the GPU work, then D2H immediately
-        let (top_pids_t, top_scores_t) = self.merge_candidate_scores_cuda_gpu(
-            candidate_sizes,
-            candidate_pids,
-            candidate_scores,
-            mse_estimates,
-            nprobe,
-            k,
-            max_candidates,
-        )?;
-        let top_scores: Vec<f32> = top_scores_t
-            .to_kind(Kind::Float)
-            .to_device(Device::Cpu)
-            .try_into()?;
-        let top_pids: Vec<i64> = top_pids_t.to_device(Device::Cpu).try_into()?;
-        Ok((top_pids, top_scores))
-    }
-
-    /// CUDA merger that returns results as GPU tensors — the final D2H is
-    /// the caller's responsibility. Useful for batch-level pipelining: the
-    /// caller can launch many queries' merges back-to-back (letting CUDA
-    /// kernels queue async) and D2H all results together afterwards,
-    /// collapsing per-query sync points into a single drain at the end.
-    ///
-    /// Identical computation and reduction order to `merge_candidate_scores_cuda`;
-    /// only the D2H placement differs.
-    pub fn merge_candidate_scores_cuda_gpu(
-        &self,
-        candidate_sizes: &Tensor,
-        candidate_pids: &Tensor,
-        candidate_scores: &Tensor,
-        mse_estimates: &Tensor,
-        nprobe: usize,
-        k: usize,
-        max_candidates: usize,
     ) -> Result<(Tensor, Tensor)> {
+        let max_candidates = self.config.max_candidates;
         let device = candidate_pids.device();
 
         if candidate_pids.numel() == 0 {
@@ -519,32 +492,6 @@ impl ResultMerger {
         let top_pids_gpu = unique_pids.index_select(0, &top_indices);
 
         Ok((top_pids_gpu, top_scores_gpu))
-    }
-
-    /// CUDA-only entry point that returns GPU tensors for deferred D2H.
-    /// Errors if the merger is configured for CPU.
-    pub fn merge_candidate_scores_defer_d2h(
-        &self,
-        candidate_sizes: &Tensor,
-        candidate_pids: &Tensor,
-        candidate_scores: &Tensor,
-        mse_estimates: &Tensor,
-        nprobe: usize,
-        k: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        anyhow::ensure!(
-            self.config.device.is_cuda(),
-            "merge_candidate_scores_defer_d2h requires a CUDA merger device"
-        );
-        self.merge_candidate_scores_cuda_gpu(
-            candidate_sizes,
-            candidate_pids,
-            candidate_scores,
-            mse_estimates,
-            nprobe,
-            k,
-            self.config.max_candidates,
-        )
     }
 }
 
