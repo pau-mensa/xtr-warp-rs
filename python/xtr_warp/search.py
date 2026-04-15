@@ -924,6 +924,13 @@ class XTRWarp:
             )
             return self
 
+        if (
+            (isinstance(device, str) and device == "mps")
+            or (isinstance(device, list) and "mps" in device)
+            or (isinstance(device, dict) and "mps" in device)
+        ):
+            raise ValueError("MPS is not supported")
+
         self._device_arg = device
         dtype_str = str(dtype).split(".")[1]
         self.dtype = dtype
