@@ -827,8 +827,17 @@ impl ShardedScorer {
         let shared = &self.index.shared;
         let bar = maybe_progress(show_progress, n_queries as u64, "Searching");
 
-        // Multi-shard: batch-level shard processing with pipelining.
-        if self.index.shards.len() > 1 {
+        // Multi-shard path: also used when scoring device differs from the
+        // single shard's device (e.g., MPS accelerator + CPU shard) so the
+        // rayon pool parallelizes CPU decompression across queries.
+        let use_multi_shard = self.index.shards.len() > 1
+            || self
+                .index
+                .shards
+                .first()
+                .map_or(false, |s| s.device != self.scoring_device);
+
+        if use_multi_shard {
             let results = self.rank_multi_shard(query, &masks, subsets, k, &bar)?;
             bar.finish_and_clear();
             return Ok(results);
