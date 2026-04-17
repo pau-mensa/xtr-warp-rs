@@ -926,15 +926,21 @@ impl ShardedScorer {
             // pre-computed centroid scores, each thread skips the per-query
             // matmul and indexes into the pre-computed tensor instead.
             //
-            // Queries and masks may live on the accelerator (MPS) — bulk
-            // transfer to CPU so rayon threads don't touch MPS.
-            let (query_embs, masks) = if precomputed_scores.is_some() {
+            // Queries, masks, and bucket_weights may live on the accelerator
+            // (MPS) — bulk transfer everything to CPU so rayon threads never
+            // touch MPS tensors.
+            let (query_embs, masks, bucket_weights) = if precomputed_scores.is_some() {
                 (
                     query.embeddings.to_device(Device::Cpu),
                     ReadOnlyTensor(masks.to_device(Device::Cpu)),
+                    ReadOnlyTensor(shared.bucket_weights.to_device(Device::Cpu)),
                 )
             } else {
-                (query.embeddings.shallow_clone(), masks)
+                (
+                    query.embeddings.shallow_clone(),
+                    masks,
+                    ReadOnlyTensor(shared.bucket_weights.shallow_clone()),
+                )
             };
             let queries: Vec<ReadOnlyTensor> = (0..n_queries)
                 .map(|b| ReadOnlyTensor(query_embs.select(0, b as i64)))
@@ -989,7 +995,7 @@ impl ShardedScorer {
                             &cids,
                             &selected.scores,
                             shard,
-                            &index.shared.bucket_weights,
+                            &bucket_weights,
                             &query_f32,
                             nprobe,
                             subset,
