@@ -4,6 +4,28 @@ use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use std::sync::Arc;
 use tch::{Device, IndexOp, Kind, Tensor};
 
+/// RAII guard that sets libtorch's internal BLAS thread count to 1 and
+/// restores the previous value on drop.  Prevents catastrophic
+/// oversubscription when rayon handles the outer parallelism (rayon
+/// threads × BLAS threads).
+struct BlasThreadGuard {
+    prev: i32,
+}
+
+impl BlasThreadGuard {
+    fn single_threaded() -> Self {
+        let prev = tch::get_num_threads();
+        tch::set_num_threads(1);
+        Self { prev }
+    }
+}
+
+impl Drop for BlasThreadGuard {
+    fn drop(&mut self) {
+        tch::set_num_threads(self.prev);
+    }
+}
+
 use crate::utils::maybe_progress;
 
 use crate::search::centroid_selector::CentroidSelector;
@@ -854,6 +876,17 @@ impl ShardedScorer {
         show_progress: bool,
     ) -> Result<Vec<SearchResult>> {
         let _guard = tch::no_grad_guard();
+
+        // When rayon handles outer parallelism, constrain libtorch's
+        // internal BLAS threading to 1.  On macOS (Accelerate/GCD) this
+        // prevents catastrophic oversubscription; on Linux (OpenMP) it's
+        // a harmless no-op since OpenMP already disables nested parallelism.
+        let num_threads = self.config.num_threads.unwrap_or(1);
+        let _blas_guard = if num_threads > 1 {
+            Some(BlasThreadGuard::single_threaded())
+        } else {
+            None
+        };
 
         let k = self.config.k;
         let n_queries = query.embeddings.size()[0] as usize;
