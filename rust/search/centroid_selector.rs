@@ -1,7 +1,7 @@
 use anyhow::Result;
-use tch::{no_grad, Kind, Tensor};
+use tch::{no_grad, Device, Kind, Tensor};
 
-use crate::utils::types::{SearchConfig, SelectedCentroids, TPrimePolicy};
+use crate::utils::types::{parse_device, SearchConfig, SelectedCentroids, TPrimePolicy};
 
 /// WARP centroid selection for efficient top-k retrieval
 #[derive(Clone)]
@@ -9,6 +9,7 @@ pub struct CentroidSelector {
     nprobe: u32,
     t_prime_policy: TPrimePolicy,
     bound: usize,
+    device: Device,
     centroid_score_threshold: f32,
 }
 
@@ -16,6 +17,7 @@ impl CentroidSelector {
     /// Create a new centroid selector with the given configuration
     pub fn new(config: &SearchConfig, num_embeddings: usize, num_centroids: usize) -> Self {
         let nprobe = config.nprobe;
+        let device = parse_device(&config.device).expect("Invalid device string");
 
         let t_prime_policy = match config.t_prime {
             Some(value) => TPrimePolicy::Fixed(value),
@@ -34,6 +36,7 @@ impl CentroidSelector {
             nprobe,
             t_prime_policy,
             bound,
+            device,
             centroid_score_threshold: config.centroid_score_threshold.unwrap_or(0.4),
         }
     }
@@ -47,11 +50,6 @@ impl CentroidSelector {
         k: usize,
     ) -> Result<SelectedCentroids> {
         no_grad(|| {
-            // Derive device from input tensors so the selector operates on
-            // whatever device the caller placed the scores on (CPU for MPS
-            // accelerator path, GPU for CUDA).
-            let device = centroid_scores.device();
-
             let num_query_tokens = query_mask.size()[0];
             let num_centroids = centroid_scores.size()[1] as i64;
 
@@ -73,10 +71,10 @@ impl CentroidSelector {
             let nprobe_i64 = nprobe;
 
             let mut cells =
-                Tensor::zeros(&[num_query_tokens, nprobe_i64], (Kind::Int, device));
+                Tensor::zeros(&[num_query_tokens, nprobe_i64], (Kind::Int, self.device));
             let mut scores =
-                Tensor::zeros(&[num_query_tokens, nprobe_i64], (Kind::Float, device));
-            let mut mse = Tensor::zeros(&[num_query_tokens], (Kind::Float, device));
+                Tensor::zeros(&[num_query_tokens, nprobe_i64], (Kind::Float, self.device));
+            let mut mse = Tensor::zeros(&[num_query_tokens], (Kind::Float, self.device));
 
             // We only want to treat the non-zero tokens
             // Note that this skips tensors padded with 0, not with the pad token

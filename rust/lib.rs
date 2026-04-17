@@ -320,26 +320,22 @@ struct ShardedSearcher {
 #[pymethods]
 impl ShardedSearcher {
     #[new]
-    #[pyo3(signature = (index_path, device_ratios, use_mmap=true, accelerator=None))]
+    #[pyo3(signature = (index_path, device_ratios, use_mmap=true))]
     fn new(
         index_path: String,
         device_ratios: Vec<(String, f64)>,
         use_mmap: bool,
-        accelerator: Option<String>,
     ) -> PyResult<Self> {
         let parsed: Vec<(Device, f64)> = device_ratios
             .iter()
             .map(|(d, r)| get_device(d).map(|dev| (dev, *r)))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let scoring_device = match accelerator {
-            Some(ref accel) => get_device(accel)?,
-            None => parsed
-                .iter()
-                .find(|(d, _)| d.is_cuda())
-                .map(|(d, _)| *d)
-                .unwrap_or(parsed[0].0),
-        };
+        let scoring_device = parsed
+            .iter()
+            .find(|(d, _)| d.is_cuda())
+            .map(|(d, _)| *d)
+            .unwrap_or(parsed[0].0);
 
         Ok(Self {
             sharded_index: None,

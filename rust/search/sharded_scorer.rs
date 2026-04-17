@@ -4,28 +4,6 @@ use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use std::sync::Arc;
 use tch::{Device, IndexOp, Kind, Tensor};
 
-/// RAII guard that sets libtorch's internal BLAS thread count to 1 and
-/// restores the previous value on drop.  Prevents catastrophic
-/// oversubscription when rayon handles the outer parallelism (rayon
-/// threads × BLAS threads).
-struct BlasThreadGuard {
-    prev: i32,
-}
-
-impl BlasThreadGuard {
-    fn single_threaded() -> Self {
-        let prev = tch::get_num_threads();
-        tch::set_num_threads(1);
-        Self { prev }
-    }
-}
-
-impl Drop for BlasThreadGuard {
-    fn drop(&mut self) {
-        tch::set_num_threads(self.prev);
-    }
-}
-
 use crate::utils::maybe_progress;
 
 use crate::search::centroid_selector::CentroidSelector;
@@ -314,33 +292,6 @@ impl ShardedScorer {
             None::<&[i64]>,
         );
 
-        // For non-CUDA accelerators (e.g. MPS): the einsum above is the
-        // only operation that benefits from GPU acceleration.  Bulk-transfer
-        // the scores (and queries) to CPU so centroid selection + downstream
-        // work avoids per-query accelerator→CPU sync overhead.
-        let selection_on_cpu =
-            !self.scoring_device.is_cuda() && self.scoring_device != Device::Cpu;
-        let centroid_scores = if selection_on_cpu {
-            centroid_scores.to_device(Device::Cpu)
-        } else {
-            centroid_scores
-        };
-        let batch_queries = if selection_on_cpu {
-            batch_queries.to_device(Device::Cpu)
-        } else {
-            batch_queries
-        };
-        let selection_device = if selection_on_cpu {
-            Device::Cpu
-        } else {
-            self.scoring_device
-        };
-        let selection_sizes = if selection_on_cpu {
-            &shared.sizes_compacted
-        } else {
-            &self.sizes_on_scoring_device
-        };
-
         // Centroid selection + cell partitioning
         let mut per_query: Vec<Option<QueryState>> = Vec::with_capacity(batch_len);
         let mut batch_results: Vec<Option<SearchResult>> = vec![None; batch_len];
@@ -361,9 +312,9 @@ impl ShardedScorer {
             }
 
             let selected = self.centroid_selector.select_centroids(
-                &batch_mask.i(b as i64).to_device(selection_device),
+                &batch_mask.i(b as i64).to_device(self.scoring_device),
                 &centroid_scores.i(b as i64),
-                selection_sizes,
+                &self.sizes_on_scoring_device,
                 shared.kdummy_centroid,
                 k,
             )?;
@@ -550,14 +501,7 @@ impl ShardedScorer {
             return Ok(all_results);
         }
 
-        // Merge on CPU unless we have CUDA shards that benefit from GPU merge.
-        // For MPS accelerator + CPU shards, decompress outputs are CPU-resident
-        // and transferring to MPS for merge would add needless overhead.
-        let merge_device = if self.scoring_device.is_cuda() {
-            self.scoring_device
-        } else {
-            Device::Cpu
-        };
+        let merge_device = self.scoring_device;
         let nprobe = self.config.nprobe as usize;
         let num_shards = self.index.shards.len();
 
@@ -877,17 +821,6 @@ impl ShardedScorer {
     ) -> Result<Vec<SearchResult>> {
         let _guard = tch::no_grad_guard();
 
-        // When rayon handles outer parallelism, constrain libtorch's
-        // internal BLAS threading to 1.  On macOS (Accelerate/GCD) this
-        // prevents catastrophic oversubscription; on Linux (OpenMP) it's
-        // a harmless no-op since OpenMP already disables nested parallelism.
-        let num_threads = self.config.num_threads.unwrap_or(1);
-        let _blas_guard = if num_threads > 1 {
-            Some(BlasThreadGuard::single_threaded())
-        } else {
-            None
-        };
-
         let k = self.config.k;
         let n_queries = query.embeddings.size()[0] as usize;
         let masks = ReadOnlyTensor(query.embeddings.ne(0).any_dim(2, false));
@@ -901,49 +834,11 @@ impl ShardedScorer {
             return Ok(results);
         }
 
-        // Single-shard path.  When an accelerator (MPS) differs from the
-        // shard device (CPU), pre-compute centroid scores on the accelerator
-        // in one batched einsum, bulk-transfer to CPU, then feed into the
-        // fully-parallel rayon path below.  This gives us GPU matmul speed
-        // with full per-query parallelism for selection + decompress + merge.
-        let precomputed_scores = if self.scoring_device != Device::Cpu
-            && self.index.shards.first().map_or(false, |s| s.device == Device::Cpu)
-        {
-            let all_f32 = query.embeddings.to_kind(Kind::Float);
-            let scores = Tensor::einsum(
-                "btd,cd->btc",
-                &[&all_f32, &shared.centroids],
-                None::<&[i64]>,
-            );
-            Some(ReadOnlyTensor(scores.to_device(Device::Cpu)))
-        } else {
-            None
-        };
-
-        if self.scoring_device == Device::Cpu || precomputed_scores.is_some() {
+        if self.scoring_device == Device::Cpu {
             // CPU scoring: rayon parallel across queries (single-shard only,
-            // multi-shard returned early above).  When an accelerator
-            // pre-computed centroid scores, each thread skips the per-query
-            // matmul and indexes into the pre-computed tensor instead.
-            //
-            // Queries, masks, and bucket_weights may live on the accelerator
-            // (MPS) — bulk transfer everything to CPU so rayon threads never
-            // touch MPS tensors.
-            let (query_embs, masks, bucket_weights) = if precomputed_scores.is_some() {
-                (
-                    query.embeddings.to_device(Device::Cpu),
-                    ReadOnlyTensor(masks.to_device(Device::Cpu)),
-                    ReadOnlyTensor(shared.bucket_weights.to_device(Device::Cpu)),
-                )
-            } else {
-                (
-                    query.embeddings.shallow_clone(),
-                    masks,
-                    ReadOnlyTensor(shared.bucket_weights.shallow_clone()),
-                )
-            };
+            // multi-shard returned early above).
             let queries: Vec<ReadOnlyTensor> = (0..n_queries)
-                .map(|b| ReadOnlyTensor(query_embs.select(0, b as i64)))
+                .map(|b| ReadOnlyTensor(query.embeddings.select(0, b as i64)))
                 .collect();
 
             let centroid_selector = self.centroid_selector.clone();
@@ -951,6 +846,7 @@ impl ShardedScorer {
             let merger = self.merger.clone();
             let index = Arc::clone(&self.index);
             let nprobe = self.config.nprobe as usize;
+            let scoring_device = self.scoring_device;
             let bar_clone = bar.clone();
 
             let results = self.thread_pool.install(move || {
@@ -969,19 +865,15 @@ impl ShardedScorer {
                             });
                         }
 
+                        // CPU: compute in Float32 (x86 has no native FP16 ALU)
                         let query_f32 = query_embeddings.to_kind(Kind::Float);
-                        let centroid_scores = match &precomputed_scores {
-                            Some(scores) => scores.i(idx as i64),
-                            None => {
-                                let centroids_f32 =
-                                    index.shared.centroids.to_kind(Kind::Float);
-                                query_f32.matmul(&centroids_f32.transpose(0, 1))
-                            },
-                        };
+                        let centroids_f32 = index.shared.centroids.to_kind(Kind::Float);
+                        let centroid_scores =
+                            query_f32.matmul(&centroids_f32.transpose(0, 1));
                         let query_mask = masks.i(idx as i64);
 
                         let selected = centroid_selector.select_centroids(
-                            &query_mask,
+                            &query_mask.to_device(scoring_device),
                             &centroid_scores,
                             &index.shared.sizes_compacted,
                             index.shared.kdummy_centroid,
@@ -995,7 +887,7 @@ impl ShardedScorer {
                             &cids,
                             &selected.scores,
                             shard,
-                            &bucket_weights,
+                            &index.shared.bucket_weights,
                             &query_f32,
                             nprobe,
                             subset,

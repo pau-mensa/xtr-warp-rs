@@ -12,7 +12,7 @@ TORCH_ENV = \
 	LIBTORCH_BYPASS_VERSION_CHECK=1 \
 	LIBTORCH=$$($(PYTHON) -c "import torch,os;print(os.path.dirname(torch.__file__))")
 
-.PHONY: help install-gpu install clean build test test-sharding test-all
+.PHONY: help install-gpu install clean build test test-all
 
 help:	## Show all Makefile targets.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[33m%-30s\033[0m %s\n", $$1, $$2}'

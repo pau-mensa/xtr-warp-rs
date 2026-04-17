@@ -339,8 +339,6 @@ class XTRWarp:
         self._mmap: bool = True
         self._metadata_store: MetadataStore | None = None
         self._device_arg: str | list[str] | dict[str, float] | None = None
-        self._accelerator: str | None = None
-        self._accelerator_arg: str | None = None
 
     def _ensure_torch_initialized(self, device: str) -> str:
         """Initialize torch once per device type."""
@@ -368,12 +366,7 @@ class XTRWarp:
             return
         self.free()
         self._metadata = None
-        self.load(
-            device=self._device_arg,
-            dtype=self.dtype,
-            mmap=self._mmap,
-            accelerator=self._accelerator_arg,
-        )
+        self.load(device=self._device_arg, dtype=self.dtype, mmap=self._mmap)
 
     def __del__(self):
         """Destructor."""
@@ -627,7 +620,6 @@ class XTRWarp:
                 device=self._device_arg or self.devices,
                 dtype=self.dtype,
                 mmap=self._mmap,
-                accelerator=self._accelerator_arg,
             )
         else:
             self._metadata = None
@@ -672,7 +664,6 @@ class XTRWarp:
                 device=self._device_arg or self.devices,
                 dtype=self.dtype,
                 mmap=self._mmap,
-                accelerator=self._accelerator_arg,
             )
         else:
             self._metadata = None
@@ -722,7 +713,6 @@ class XTRWarp:
                 device=self._device_arg or self.devices,
                 dtype=self.dtype,
                 mmap=self._mmap,
-                accelerator=self._accelerator_arg,
             )
         else:
             self._metadata = None
@@ -906,7 +896,6 @@ class XTRWarp:
         device: str | list[str] | dict[str, float] = "auto",
         dtype: torch.dtype = torch.float32,
         mmap: bool = True,
-        accelerator: str | None = None,
     ) -> "XTRWarp":
         """Load an index to a specific device with the specified precision.
 
@@ -916,21 +905,11 @@ class XTRWarp:
             'auto', 'cpu', 'cuda', 'mps', or a list of devices, or a dict
             mapping device strings to ratios (e.g. ``{"cuda:0": 0.6, "cpu": 0.4}``).
 
-            - ``str``: single device, same behavior as before.  When ``"mps"``
-              is specified the data shards live on CPU and MPS is used as the
-              accelerator for the IVF centroid lookup.
+            - ``str``: single device, same behavior as before.
             - ``list[str]``: auto-compute ratios (fill accelerator VRAM first,
-              remainder on CPU). ``"mps"`` in the list is extracted as the
-              accelerator — it does not become a shard device.
+              remainder on CPU). Enables index sharding.
             - ``dict[str, float]``: explicit ratios for each device. Enables
               index sharding across devices.
-        accelerator:
-            Device used for the IVF centroid lookup (einsum + centroid
-            selection).  When ``None`` (default) it is auto-inferred: the
-            first CUDA device among the shard devices, or ``"mps"`` if it
-            appears in the device spec, otherwise the first shard device.
-            Set explicitly to override (e.g. ``accelerator="mps"`` with
-            ``device="cpu"``).
         dtype:
             valid torch dtype
         mmap:
@@ -945,74 +924,51 @@ class XTRWarp:
             )
             return self
 
+        if (
+            (isinstance(device, str) and device == "mps")
+            or (isinstance(device, list) and "mps" in device)
+            or (isinstance(device, dict) and "mps" in device)
+        ):
+            raise ValueError("MPS is not supported")
+
         self._device_arg = device
-        self._accelerator_arg = accelerator
         self.dtype = dtype
         self._mmap = mmap
 
         _ = self._load_metadata()
 
-        # Resolve "auto"
-        if isinstance(device, str) and device == "auto":
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
-
-        # Normalize device spec into shard ratios, extracting MPS as
-        # accelerator (MPS uses unified memory — sharding to it is a no-op).
+        # explicit ratios
         if isinstance(device, dict):
-            ratios = dict(device)
-        elif isinstance(device, list):
-            has_mps = "mps" in device
-            shard_devices = [d for d in device if d != "mps"]
-            if not shard_devices:
-                shard_devices = ["cpu"]
-            ratios = self._compute_device_ratios(shard_devices)
-            if has_mps and accelerator is None:
-                accelerator = "mps"
-        elif device == "mps":
-            ratios = {"cpu": 1.0}
-            if accelerator is None:
-                accelerator = "mps"
-        else:
-            ratios = {device: 1.0}
+            return self._load_sharded(device, mmap=True)
 
-        # Handle MPS appearing in a ratios dict
-        if "mps" in ratios:
-            if accelerator is None:
-                accelerator = "mps"
-            del ratios["mps"]
-            if not ratios:
-                ratios = {"cpu": 1.0}
+        # auto-compute ratios
+        if isinstance(device, list):
+            ratios = self._compute_device_ratios(device)
+            return self._load_sharded(ratios, mmap=True)
 
-        # Auto-infer accelerator: first CUDA > MPS (if present) > first shard
-        if accelerator is None:
-            cuda_devs = [d for d in ratios if d.startswith("cuda")]
-            if cuda_devs:
-                accelerator = cuda_devs[0]
-            else:
-                accelerator = next(iter(ratios))
+        # single device
+        if device == "auto":
+            device = (
+                "cuda"
+                if torch.cuda.is_available()
+                else "mps"
+                if torch.backends.mps.is_available()
+                else "cpu"
+            )
 
-        # mmap only makes sense for CPU shards
-        if mmap and all(not d.startswith("cpu") for d in ratios):
+        if mmap and device != "cpu":
             logger.warning(
                 "mmap=True is only supported when device='cpu', disabling it"
             )
             mmap = False
             self._mmap = mmap
 
-        self._accelerator = accelerator
-
-        return self._load_sharded(ratios, mmap=mmap, accelerator=accelerator)
+        return self._load_sharded({device: 1.0}, mmap=mmap)
 
     def _load_sharded(
         self,
         ratios: dict[str, float],
         mmap: bool = True,
-        accelerator: str | None = None,
     ) -> "XTRWarp":
         """Load the index, optionally sharded across multiple devices."""
         total = sum(ratios.values())
@@ -1046,13 +1002,10 @@ class XTRWarp:
 
         for dev in ratios:
             _ = self._ensure_torch_initialized(dev)
-        if accelerator:
-            _ = self._ensure_torch_initialized(accelerator)
 
         device_ratios_list = list(ratios.items())
         searcher = xtr_warp_rs.ShardedSearcher(
-            self.index, device_ratios_list, mmap,
-            accelerator=accelerator,
+            self.index, device_ratios_list, mmap
         )
         searcher.load()
 
@@ -1328,13 +1281,10 @@ class XTRWarp:
             error = f"Expected 2D or 3D tensor, got {queries_embeddings.dim()}D tensor"
             raise ValueError(error)
 
-        # Queries must live on the accelerator device (where centroids are)
-        # so the einsum in the scorer doesn't cross devices.
-        accel_device = self._accelerator or self.devices[0]
-        accel_device_type = accel_device.split(":")[0]
+        device = self.devices[0].split(":")[0]
 
-        if accel_device_type != queries_embeddings.device.type:
-            queries_embeddings = queries_embeddings.to(accel_device)
+        if device != queries_embeddings.device.type:
+            queries_embeddings = queries_embeddings.to(device)
 
         if self.dtype != queries_embeddings.dtype:
             queries_embeddings = queries_embeddings.to(self.dtype)
@@ -1370,7 +1320,7 @@ class XTRWarp:
 
         search_config = xtr_warp_rs.SearchConfig(
             k=top_k,
-            device=accel_device,
+            device=device,
             nprobe=nprobe,
             t_prime=t_prime,
             bound=bound,
@@ -1380,7 +1330,7 @@ class XTRWarp:
             max_codes_per_centroid=None,
             max_candidates=max_candidates,
         )
-        torch_path = self._ensure_torch_initialized(accel_device)
+        torch_path = self._ensure_torch_initialized(device)
 
         scores = search_on_device(
             torch_path=torch_path,
