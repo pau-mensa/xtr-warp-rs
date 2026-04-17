@@ -925,8 +925,19 @@ impl ShardedScorer {
             // multi-shard returned early above).  When an accelerator
             // pre-computed centroid scores, each thread skips the per-query
             // matmul and indexes into the pre-computed tensor instead.
+            //
+            // Queries and masks may live on the accelerator (MPS) — bulk
+            // transfer to CPU so rayon threads don't touch MPS.
+            let (query_embs, masks) = if precomputed_scores.is_some() {
+                (
+                    query.embeddings.to_device(Device::Cpu),
+                    ReadOnlyTensor(masks.to_device(Device::Cpu)),
+                )
+            } else {
+                (query.embeddings.shallow_clone(), masks)
+            };
             let queries: Vec<ReadOnlyTensor> = (0..n_queries)
-                .map(|b| ReadOnlyTensor(query.embeddings.select(0, b as i64)))
+                .map(|b| ReadOnlyTensor(query_embs.select(0, b as i64)))
                 .collect();
 
             let centroid_selector = self.centroid_selector.clone();
