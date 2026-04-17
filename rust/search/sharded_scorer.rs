@@ -292,6 +292,33 @@ impl ShardedScorer {
             None::<&[i64]>,
         );
 
+        // For non-CUDA accelerators (e.g. MPS): the einsum above is the
+        // only operation that benefits from GPU acceleration.  Bulk-transfer
+        // the scores (and queries) to CPU so centroid selection + downstream
+        // work avoids per-query accelerator→CPU sync overhead.
+        let selection_on_cpu =
+            !self.scoring_device.is_cuda() && self.scoring_device != Device::Cpu;
+        let centroid_scores = if selection_on_cpu {
+            centroid_scores.to_device(Device::Cpu)
+        } else {
+            centroid_scores
+        };
+        let batch_queries = if selection_on_cpu {
+            batch_queries.to_device(Device::Cpu)
+        } else {
+            batch_queries
+        };
+        let selection_device = if selection_on_cpu {
+            Device::Cpu
+        } else {
+            self.scoring_device
+        };
+        let selection_sizes = if selection_on_cpu {
+            &shared.sizes_compacted
+        } else {
+            &self.sizes_on_scoring_device
+        };
+
         // Centroid selection + cell partitioning
         let mut per_query: Vec<Option<QueryState>> = Vec::with_capacity(batch_len);
         let mut batch_results: Vec<Option<SearchResult>> = vec![None; batch_len];
@@ -312,9 +339,9 @@ impl ShardedScorer {
             }
 
             let selected = self.centroid_selector.select_centroids(
-                &batch_mask.i(b as i64).to_device(self.scoring_device),
+                &batch_mask.i(b as i64).to_device(selection_device),
                 &centroid_scores.i(b as i64),
-                &self.sizes_on_scoring_device,
+                selection_sizes,
                 shared.kdummy_centroid,
                 k,
             )?;
@@ -501,7 +528,14 @@ impl ShardedScorer {
             return Ok(all_results);
         }
 
-        let merge_device = self.scoring_device;
+        // Merge on CPU unless we have CUDA shards that benefit from GPU merge.
+        // For MPS accelerator + CPU shards, decompress outputs are CPU-resident
+        // and transferring to MPS for merge would add needless overhead.
+        let merge_device = if self.scoring_device.is_cuda() {
+            self.scoring_device
+        } else {
+            Device::Cpu
+        };
         let nprobe = self.config.nprobe as usize;
         let num_shards = self.index.shards.len();
 
