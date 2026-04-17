@@ -894,25 +894,37 @@ impl ShardedScorer {
         let shared = &self.index.shared;
         let bar = maybe_progress(show_progress, n_queries as u64, "Searching");
 
-        // Multi-shard path: also used when scoring device differs from the
-        // single shard's device (e.g., MPS accelerator + CPU shard) so the
-        // rayon pool parallelizes CPU decompression across queries.
-        let use_multi_shard = self.index.shards.len() > 1
-            || self
-                .index
-                .shards
-                .first()
-                .map_or(false, |s| s.device != self.scoring_device);
-
-        if use_multi_shard {
+        // Multi-shard: batch-level shard processing with pipelining.
+        if self.index.shards.len() > 1 {
             let results = self.rank_multi_shard(query, &masks, subsets, k, &bar)?;
             bar.finish_and_clear();
             return Ok(results);
         }
 
-        if self.scoring_device == Device::Cpu {
+        // Single-shard path.  When an accelerator (MPS) differs from the
+        // shard device (CPU), pre-compute centroid scores on the accelerator
+        // in one batched einsum, bulk-transfer to CPU, then feed into the
+        // fully-parallel rayon path below.  This gives us GPU matmul speed
+        // with full per-query parallelism for selection + decompress + merge.
+        let precomputed_scores = if self.scoring_device != Device::Cpu
+            && self.index.shards.first().map_or(false, |s| s.device == Device::Cpu)
+        {
+            let all_f32 = query.embeddings.to_kind(Kind::Float);
+            let scores = Tensor::einsum(
+                "btd,cd->btc",
+                &[&all_f32, &shared.centroids],
+                None::<&[i64]>,
+            );
+            Some(ReadOnlyTensor(scores.to_device(Device::Cpu)))
+        } else {
+            None
+        };
+
+        if self.scoring_device == Device::Cpu || precomputed_scores.is_some() {
             // CPU scoring: rayon parallel across queries (single-shard only,
-            // multi-shard returned early above).
+            // multi-shard returned early above).  When an accelerator
+            // pre-computed centroid scores, each thread skips the per-query
+            // matmul and indexes into the pre-computed tensor instead.
             let queries: Vec<ReadOnlyTensor> = (0..n_queries)
                 .map(|b| ReadOnlyTensor(query.embeddings.select(0, b as i64)))
                 .collect();
@@ -922,7 +934,6 @@ impl ShardedScorer {
             let merger = self.merger.clone();
             let index = Arc::clone(&self.index);
             let nprobe = self.config.nprobe as usize;
-            let scoring_device = self.scoring_device;
             let bar_clone = bar.clone();
 
             let results = self.thread_pool.install(move || {
@@ -941,15 +952,19 @@ impl ShardedScorer {
                             });
                         }
 
-                        // CPU: compute in Float32 (x86 has no native FP16 ALU)
                         let query_f32 = query_embeddings.to_kind(Kind::Float);
-                        let centroids_f32 = index.shared.centroids.to_kind(Kind::Float);
-                        let centroid_scores =
-                            query_f32.matmul(&centroids_f32.transpose(0, 1));
+                        let centroid_scores = match &precomputed_scores {
+                            Some(scores) => scores.i(idx as i64),
+                            None => {
+                                let centroids_f32 =
+                                    index.shared.centroids.to_kind(Kind::Float);
+                                query_f32.matmul(&centroids_f32.transpose(0, 1))
+                            },
+                        };
                         let query_mask = masks.i(idx as i64);
 
                         let selected = centroid_selector.select_centroids(
-                            &query_mask.to_device(scoring_device),
+                            &query_mask,
                             &centroid_scores,
                             &index.shared.sizes_compacted,
                             index.shared.kdummy_centroid,
