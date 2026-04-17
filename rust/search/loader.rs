@@ -119,14 +119,13 @@ fn compute_c_strides(shape: &[i64]) -> Vec<i64> {
 /// Index loader responsible for loading WARP index components from disk
 pub struct IndexLoader {
     index_path: PathBuf,
-    dtype: Kind,
     use_mmap: bool,
 }
 
 impl IndexLoader {
     /// Create a new index loader. Shard devices are specified later via
     /// `load_sharded(device_ratios, …)`.
-    pub fn new(index_path: impl AsRef<Path>, dtype: Kind, use_mmap: bool) -> Result<Self> {
+    pub fn new(index_path: impl AsRef<Path>, use_mmap: bool) -> Result<Self> {
         let path = index_path.as_ref();
 
         if !path.exists() {
@@ -139,7 +138,6 @@ impl IndexLoader {
 
         Ok(Self {
             index_path: path.to_path_buf(),
-            dtype,
             use_mmap,
         })
     }
@@ -243,15 +241,18 @@ impl IndexLoader {
     ) -> Result<ShardedIndex> {
         let index_path = self.index_path.as_path();
 
-        // Shared small tensors — load onto scoring device
+        // Shared small tensors — always Float32. The per-query ops (topk,
+        // index_reduce, etc.) are faster in Float32 even on Blackwell; only
+        // matmul benefits from FP16 Tensor Cores, but the einsum is <1% of
+        // total search time so the trade-off isn't worth it.
         let bucket_weights = Tensor::read_npy(index_path.join("bucket_weights.npy"))
             .map_err(|e| anyhow!("bucket_weights: {}", e))?
-            .to_dtype(self.dtype, false, false)
+            .to_kind(Kind::Float)
             .to_device(scoring_device);
 
         let centroids = Tensor::read_npy(index_path.join("centroids.npy"))
             .map_err(|e| anyhow!("centroids: {}", e))?
-            .to_dtype(self.dtype, false, false)
+            .to_kind(Kind::Float)
             .to_device(scoring_device);
 
         // Sizes on CPU (small, needed for split computation and selector)

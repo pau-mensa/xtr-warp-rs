@@ -932,7 +932,6 @@ class XTRWarp:
             raise ValueError("MPS is not supported")
 
         self._device_arg = device
-        dtype_str = str(dtype).split(".")[1]
         self.dtype = dtype
         self._mmap = mmap
 
@@ -940,12 +939,12 @@ class XTRWarp:
 
         # explicit ratios
         if isinstance(device, dict):
-            return self._load_sharded(device, dtype_str, mmap=True)
+            return self._load_sharded(device, mmap=True)
 
         # auto-compute ratios
         if isinstance(device, list):
             ratios = self._compute_device_ratios(device)
-            return self._load_sharded(ratios, dtype_str, mmap=True)
+            return self._load_sharded(ratios, mmap=True)
 
         # single device
         if device == "auto":
@@ -964,12 +963,11 @@ class XTRWarp:
             mmap = False
             self._mmap = mmap
 
-        return self._load_sharded({device: 1.0}, dtype_str, mmap=mmap)
+        return self._load_sharded({device: 1.0}, mmap=mmap)
 
     def _load_sharded(
         self,
         ratios: dict[str, float],
-        dtype_str: str,
         mmap: bool = True,
     ) -> "XTRWarp":
         """Load the index, optionally sharded across multiple devices."""
@@ -1007,7 +1005,7 @@ class XTRWarp:
 
         device_ratios_list = list(ratios.items())
         searcher = xtr_warp_rs.ShardedSearcher(
-            self.index, device_ratios_list, dtype_str, mmap
+            self.index, device_ratios_list, mmap
         )
         searcher.load()
 
@@ -1323,7 +1321,6 @@ class XTRWarp:
         search_config = xtr_warp_rs.SearchConfig(
             k=top_k,
             device=device,
-            dtype=str(self.dtype).split(".")[1],
             nprobe=nprobe,
             t_prime=t_prime,
             bound=bound,

@@ -9,7 +9,6 @@ use crate::utils::types::{DecompressedCentroidsOutput, IndexShard, PassageBitset
 #[derive(Clone)]
 pub struct CentroidDecompressor {
     nbits: u8,
-    dtype: Kind,
     dim: usize,
     reversed_bit_map: [u8; 256],
     thread_pool: Arc<ThreadPool>,
@@ -17,7 +16,7 @@ pub struct CentroidDecompressor {
 
 impl CentroidDecompressor {
     /// Create a new centroid decompressor
-    pub fn new(nbits: u8, dim: usize, dtype: Kind, thread_pool: Arc<ThreadPool>) -> Result<Self> {
+    pub fn new(nbits: u8, dim: usize, thread_pool: Arc<ThreadPool>) -> Result<Self> {
         if nbits != 2 && nbits != 4 {
             return Err(anyhow!("nbits must be 2 or 4, got {}", nbits));
         }
@@ -26,7 +25,6 @@ impl CentroidDecompressor {
 
         Ok(Self {
             nbits,
-            dtype,
             dim,
             reversed_bit_map,
             thread_pool,
@@ -86,7 +84,7 @@ impl CentroidDecompressor {
                 capacities: Tensor::zeros(&[0], (Kind::Int64, device)),
                 sizes: empty,
                 passage_ids: Tensor::zeros(&[0], (Kind::Int64, device)),
-                scores: Tensor::zeros(&[0], (self.dtype, device)),
+                scores: Tensor::zeros(&[0], (Kind::Float, device)),
                 offsets: Tensor::zeros(&[1], (Kind::Int64, device)),
             });
         }
@@ -112,7 +110,6 @@ impl CentroidDecompressor {
 
         anyhow::ensure!(nprobe > 0, "nprobe must be greater than zero");
 
-        let query_embeddings = query_embeddings.to_kind(self.dtype);
         anyhow::ensure!(
             query_embeddings.size()[1] == self.dim as i64,
             "Query embedding dim ({}) does not match index dim ({})",
@@ -120,13 +117,12 @@ impl CentroidDecompressor {
             self.dim
         );
 
-        // Resolve bucket_weights to correct device/dtype once
-        let bucket_weights =
-            if bucket_weights.device() == device && bucket_weights.kind() == self.dtype {
-                bucket_weights.shallow_clone()
-            } else {
-                bucket_weights.to_device(device).to_kind(self.dtype)
-            };
+        // Resolve bucket_weights to correct device once
+        let bucket_weights = if bucket_weights.device() == device {
+            bucket_weights.shallow_clone()
+        } else {
+            bucket_weights.to_device(device)
+        };
 
         if device.is_cuda() {
             return self.decompress_cuda(
@@ -135,7 +131,7 @@ impl CentroidDecompressor {
                 centroid_scores,
                 shard,
                 &bucket_weights,
-                &query_embeddings,
+                query_embeddings,
                 nprobe,
                 subset,
                 per_cell_tokens,
@@ -144,11 +140,16 @@ impl CentroidDecompressor {
 
         let subset_bitset = subset.map(PassageBitset::new);
 
+        // CPU: always compute bucket scores in Float32.
+        // x86 CPUs lack native FP16 ALU so Half tensor ops are emulated
+        // and very slow. The inner scoring loop works with f32 anyway.
+        let query_f32 = query_embeddings.to_kind(Kind::Float);
+        let bw_f32 = bucket_weights.to_kind(Kind::Float);
         let vt_bucket_scores =
-            (query_embeddings.unsqueeze(2) * bucket_weights.unsqueeze(0)).contiguous();
+            (query_f32.unsqueeze(2) * bw_f32.unsqueeze(0)).contiguous();
 
         let bucket_scores_flat: Vec<f32> = vt_bucket_scores.flatten(0, -1).try_into()?;
-        let centroid_scores_vec: Vec<f32> = centroid_scores.flatten(0, -1).try_into()?;
+        let centroid_scores_vec: Vec<f32> = centroid_scores.to_kind(Kind::Float).flatten(0, -1).try_into()?;
 
         anyhow::ensure!(
             centroid_scores_vec.len() == num_cells,
@@ -263,8 +264,7 @@ impl CentroidDecompressor {
             .to_device(device)
             .to_kind(Kind::Int64);
         let scores_tensor = Tensor::from_slice(&candidate_scores)
-            .to_device(device)
-            .to_kind(self.dtype);
+            .to_device(device);
         let offsets_tensor = Tensor::from_slice(&offsets)
             .to_device(device)
             .to_kind(Kind::Int64);

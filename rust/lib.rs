@@ -9,7 +9,7 @@ use std::ffi::CString;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
-use tch::{Device, Kind};
+use tch::Device;
 
 #[cfg(windows)]
 use winapi::um::errhandlingapi::GetLastError;
@@ -74,9 +74,6 @@ fn get_device(device: &str) -> Result<Device, PyErr> {
     utils::types::parse_device(device).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-fn get_dtype(dtype: &str) -> Result<Kind, PyErr> {
-    utils::types::parse_dtype(dtype).map_err(|e| PyValueError::new_err(e.to_string()))
-}
 
 /// Filter tombstoned PIDs and truncate to k.
 /// Results arrive sorted by score descending from the merger, so we
@@ -316,7 +313,6 @@ struct ShardedSearcher {
     index_path: String,
     device_ratios: Vec<(Device, f64)>,
     scoring_device: Device,
-    dtype: Kind,
     use_mmap: bool,
     deleted_pids: HashSet<i64>,
 }
@@ -324,14 +320,12 @@ struct ShardedSearcher {
 #[pymethods]
 impl ShardedSearcher {
     #[new]
-    #[pyo3(signature = (index_path, device_ratios, dtype, use_mmap=true))]
+    #[pyo3(signature = (index_path, device_ratios, use_mmap=true))]
     fn new(
         index_path: String,
         device_ratios: Vec<(String, f64)>,
-        dtype: String,
         use_mmap: bool,
     ) -> PyResult<Self> {
-        let dtype = get_dtype(&dtype)?;
         let parsed: Vec<(Device, f64)> = device_ratios
             .iter()
             .map(|(d, r)| get_device(d).map(|dev| (dev, *r)))
@@ -348,14 +342,13 @@ impl ShardedSearcher {
             index_path,
             device_ratios: parsed,
             scoring_device,
-            dtype,
             use_mmap,
             deleted_pids: HashSet::new(),
         })
     }
 
     fn load(&mut self) -> PyResult<()> {
-        let loader = IndexLoader::new(&self.index_path, self.dtype, self.use_mmap)
+        let loader = IndexLoader::new(&self.index_path, self.use_mmap)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create loader: {}", e)))?;
 
         let sharded_index = loader

@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tch::{Device, Kind, Tensor};
+use tch::{Device, Tensor};
 
 /// Represents a passage/document ID in the index
 pub type PassageId = i64;
@@ -59,10 +59,6 @@ pub struct SearchConfig {
     #[pyo3(get, set)]
     pub device: String,
 
-    /// Dtype to use for the search
-    #[pyo3(get, set)]
-    pub dtype: String,
-
     /// Number of centroids to probe during search
     #[pyo3(get, set)]
     pub nprobe: u32,
@@ -104,7 +100,6 @@ impl SearchConfig {
     #[pyo3(signature = (
         k,
         device,
-        dtype=None,
         nprobe=None,
         t_prime=None,
         bound=None,
@@ -117,7 +112,6 @@ impl SearchConfig {
     fn new(
         k: usize,
         device: String,
-        dtype: Option<String>,
         nprobe: Option<u32>,
         t_prime: Option<usize>,
         bound: Option<usize>,
@@ -130,7 +124,6 @@ impl SearchConfig {
         Self {
             k,
             device: device,
-            dtype: dtype.unwrap_or("float32".to_string()),
             nprobe: nprobe.unwrap_or(4),
             t_prime,
             bound: bound.unwrap_or(128),
@@ -148,7 +141,6 @@ impl Default for SearchConfig {
         Self {
             k: 100,
             device: "cpu".to_string(),
-            dtype: "float32".to_string(),
             nprobe: 4,
             t_prime: None,
             bound: 128,
@@ -433,15 +425,4 @@ impl IndexShard {
     }
 }
 
-/// Parses a string identifier into a `tch::Kind`.
-///
-/// Supports simple strings like "float32", "float16"
-pub fn parse_dtype(dtype: &str) -> anyhow::Result<Kind> {
-    match dtype.to_lowercase().as_str() {
-        "float32" => Ok(Kind::Float),
-        "float16" => Ok(Kind::Half),
-        "float64" => Ok(Kind::Double),
-        "bfloat16" => Ok(Kind::BFloat16),
-        _ => Err(anyhow::anyhow!("Unsupported dtype string: '{}', should be 'float32', 'float16', 'float64', or 'bfloat16'", dtype)),
-    }
-}
+

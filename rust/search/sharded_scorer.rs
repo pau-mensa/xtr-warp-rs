@@ -10,7 +10,7 @@ use crate::search::centroid_selector::CentroidSelector;
 use crate::search::decompressor::CentroidDecompressor;
 use crate::search::merger::{MergerConfig, ResultMerger};
 use crate::utils::types::{
-    parse_dtype, DecompressedCentroidsOutput, IndexShard, Query, ReadOnlyTensor, SearchConfig,
+    DecompressedCentroidsOutput, IndexShard, Query, ReadOnlyTensor, SearchConfig,
     SearchResult, ShardedIndex,
 };
 
@@ -155,7 +155,6 @@ impl ShardedScorer {
 
         let scoring_device = shared.scoring_device;
         let batch_size = config.batch_size;
-        let dtype = parse_dtype(&config.dtype)?;
 
         let centroid_selector = CentroidSelector::new(
             &config,
@@ -177,7 +176,6 @@ impl ShardedScorer {
                 CentroidDecompressor::new(
                     shared.metadata.nbits,
                     shared.metadata.dim,
-                    dtype,
                     Arc::clone(&thread_pool),
                 )
             })
@@ -285,8 +283,9 @@ impl ShardedScorer {
         let batch_size = self.batch_size as usize;
         let batch_len = batch_size.min(n_queries - c);
 
-        let batch_queries = query.embeddings.narrow(0, c as i64, batch_len as i64);
+        let batch_queries_raw = query.embeddings.narrow(0, c as i64, batch_len as i64);
         let batch_mask = masks.narrow(0, c as i64, batch_len as i64);
+        let batch_queries = batch_queries_raw.to_kind(Kind::Float);
         let centroid_scores = Tensor::einsum(
             "btd,cd->btc",
             &[&batch_queries, &shared.centroids],
@@ -826,7 +825,6 @@ impl ShardedScorer {
         let n_queries = query.embeddings.size()[0] as usize;
         let masks = ReadOnlyTensor(query.embeddings.ne(0).any_dim(2, false));
         let shared = &self.index.shared;
-
         let bar = maybe_progress(show_progress, n_queries as u64, "Searching");
 
         // Multi-shard: batch-level shard processing with pipelining.
@@ -867,8 +865,11 @@ impl ShardedScorer {
                             });
                         }
 
+                        // CPU: compute in Float32 (x86 has no native FP16 ALU)
+                        let query_f32 = query_embeddings.to_kind(Kind::Float);
+                        let centroids_f32 = index.shared.centroids.to_kind(Kind::Float);
                         let centroid_scores =
-                            query_embeddings.matmul(&index.shared.centroids.transpose(0, 1));
+                            query_f32.matmul(&centroids_f32.transpose(0, 1));
                         let query_mask = masks.i(idx as i64);
 
                         let selected = centroid_selector.select_centroids(
@@ -887,7 +888,7 @@ impl ShardedScorer {
                             &selected.scores,
                             shard,
                             &index.shared.bucket_weights,
-                            &query_embeddings,
+                            &query_f32,
                             nprobe,
                             subset,
                             None,
@@ -925,9 +926,10 @@ impl ShardedScorer {
                 let batch_queries = query.embeddings.narrow(0, c as i64, batch_size);
                 let batch_mask = masks.narrow(0, c as i64, batch_size);
 
+                let batch_queries_f32 = batch_queries.to_kind(Kind::Float);
                 let centroid_scores = Tensor::einsum(
                     "btd,cd->btc",
-                    &[&batch_queries, &shared.centroids],
+                    &[&batch_queries_f32, &shared.centroids],
                     None::<&[i64]>,
                 );
 
@@ -947,7 +949,7 @@ impl ShardedScorer {
 
                     let result = self.process_query(
                         query_idx,
-                        batch_queries.i(b),
+                        batch_queries_f32.i(b),
                         centroid_scores.i(b),
                         batch_mask.i(b),
                         k,
