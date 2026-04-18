@@ -946,64 +946,171 @@ impl ShardedScorer {
 
                 // Pass A3: per-query slice + merger launch.
                 //
-                // When `merger_streams` is populated, we submit each
-                // query's merger on stream `ai % N`. We snapshot the
-                // default stream ONCE via `SavedStream` and restore at end
-                // of A3; inside the loop each query just calls
-                // `set_current_stream` (one FFI call per query instead of
-                // the two per query that a per-iteration RAII guard would
-                // require). Pass B (D2H) syncs each query against its own
-                // stream before copying back.
+                // When `merger_streams` is populated, we dispatch A3 in
+                // parallel across `num_streams` rayon lanes, each pinned
+                // to its own CUDA stream. Every lane's queries ran
+                // serially inside the lane (sync-free merger makes each
+                // call a non-blocking launch), but the N lanes run
+                // concurrently on separate rayon threads — so host-side
+                // launch time drops from `T_launch × num_queries` toward
+                // `T_launch × num_queries / N`. Each query records the
+                // stream it landed on so Pass B can sync against it.
                 //
-                // Cross-stream RAW safety: master tensors were uploaded on
-                // the default stream; the A2→A3 device sync above ensures
-                // the H2Ds have completed before any pool stream reads.
+                // When streams are disabled (no shim / pool empty), or
+                // we're on the CPU scoring path, fall back to the serial
+                // loop below.
+                //
+                // Cross-stream RAW safety: master tensors were uploaded
+                // on the default stream; the A2→A3 device sync above
+                // ensures the H2Ds have completed before any pool stream
+                // reads.
                 #[cfg(xtr_has_cuda_shim)]
-                let _saved_stream = match (merge_device, self.merger_streams.as_ref()) {
-                    (Device::Cuda(ix), Some(pool)) if !pool.is_empty() => {
-                        Some(SavedStream::save(ix as i32))
-                    },
-                    _ => None,
-                };
+                let parallel_a3 = use_defer_d2h
+                    && num_streams > 0
+                    && matches!(merge_device, Device::Cuda(_));
+                #[cfg(not(xtr_has_cuda_shim))]
+                let parallel_a3 = false;
 
-                for (ai, &b) in active.iter().enumerate() {
-                    let cell_start = cell_offsets[ai] as i64;
-                    let cell_len = (cell_offsets[ai + 1] - cell_offsets[ai]) as i64;
-                    let cand_start = cand_offsets[ai] as i64;
-                    let cand_len = (cand_offsets[ai + 1] - cand_offsets[ai]) as i64;
+                if parallel_a3 {
+                    #[cfg(xtr_has_cuda_shim)]
+                    {
+                        let device_ix = match merge_device {
+                            Device::Cuda(ix) => ix as i32,
+                            _ => unreachable!("parallel_a3 implies CUDA"),
+                        };
+                        let pool = self
+                            .merger_streams
+                            .as_ref()
+                            .expect("parallel_a3 implies pool exists");
 
-                    let cap_t = caps_all_t.narrow(0, cell_start, cell_len);
-                    let sz_t = sizes_all_t.narrow(0, cell_start, cell_len);
-                    let pid_t = pids_all_t.narrow(0, cand_start, cand_len);
-                    let sc_t = scores_all_t.narrow(0, cand_start, cand_len);
-
-                    let mse = &per_query[b].as_ref().unwrap().mse_estimate;
-                    let mse_dev = mse.to_device(merge_device);
-
-                    let stream_idx = if num_streams > 0 { ai % num_streams } else { 0 };
-
-                    if use_defer_d2h {
-                        #[cfg(xtr_has_cuda_shim)]
-                        if let Some(pool) = self.merger_streams.as_ref() {
-                            if let Some(s) = pool.get(stream_idx) {
-                                set_current_stream(s);
-                            }
+                        // Split `active` into `num_streams` round-robin lanes.
+                        let mut lanes: Vec<Vec<(usize, usize)>> =
+                            (0..num_streams).map(|_| Vec::new()).collect();
+                        for (ai, &b) in active.iter().enumerate() {
+                            lanes[ai % num_streams].push((ai, b));
                         }
 
-                        let (pids_gpu, scores_gpu) = self.merger.merge_candidate_scores_cuda(
-                            &sz_t, &pid_t, &sc_t, &mse_dev, nprobe, k,
-                        )?;
-                        gpu_topk[b] = Some((pids_gpu, scores_gpu, stream_idx));
-                    } else {
-                        let (pids, scores) = self.merger.merge_candidate_scores(
-                            &cap_t, &sz_t, &pid_t, &sc_t, &mse_dev, nprobe, k,
-                        )?;
-                        batch_results[b] = Some(SearchResult {
-                            passage_ids: pids,
-                            scores,
-                            query_id: c + b + 1,
-                        });
-                        bar.inc(1);
+                        // Wrap master tensors so they can cross rayon
+                        // thread boundaries (tch::Tensor is !Sync).
+                        let sizes_ro = ReadOnlyTensor(sizes_all_t.shallow_clone());
+                        let pids_ro = ReadOnlyTensor(pids_all_t.shallow_clone());
+                        let scores_ro = ReadOnlyTensor(scores_all_t.shallow_clone());
+
+                        let cell_offsets_ref = &cell_offsets;
+                        let cand_offsets_ref = &cand_offsets;
+                        let per_query_ref = &per_query;
+                        let merger = &self.merger;
+
+                        type LaneOut = Vec<(usize, Tensor, Tensor, usize)>;
+                        let lane_results: Vec<LaneOut> =
+                            self.thread_pool.install(|| -> Result<Vec<LaneOut>> {
+                                lanes
+                                    .into_par_iter()
+                                    .enumerate()
+                                    .map(|(lane_idx, lane)| -> Result<LaneOut> {
+                                        // Force whole-struct capture of the
+                                        // Sync wrappers. Without this, Rust
+                                        // 2021 disjoint closure captures would
+                                        // grab `&sizes_ro.0` (= `&Tensor`,
+                                        // not Sync), bypassing the wrappers'
+                                        // unsafe-Sync impl and failing rayon's
+                                        // Send+Sync bound on the map closure.
+                                        let _force_capture =
+                                            (&sizes_ro, &pids_ro, &scores_ro);
+
+                                        // Pin this rayon thread to lane's stream
+                                        // for the duration of the lane. SavedStream
+                                        // restores the default stream on drop.
+                                        let _saved = SavedStream::save(device_ix);
+                                        if let Some(s) = pool.get(lane_idx) {
+                                            set_current_stream(s);
+                                        }
+
+                                        let mut out: LaneOut =
+                                            Vec::with_capacity(lane.len());
+                                        for (ai, b) in lane {
+                                            let cell_start = cell_offsets_ref[ai] as i64;
+                                            let cell_len = (cell_offsets_ref[ai + 1]
+                                                - cell_offsets_ref[ai])
+                                                as i64;
+                                            let cand_start = cand_offsets_ref[ai] as i64;
+                                            let cand_len = (cand_offsets_ref[ai + 1]
+                                                - cand_offsets_ref[ai])
+                                                as i64;
+
+                                            let sz_t = sizes_ro
+                                                .0
+                                                .narrow(0, cell_start, cell_len);
+                                            let pid_t = pids_ro
+                                                .0
+                                                .narrow(0, cand_start, cand_len);
+                                            let sc_t = scores_ro
+                                                .0
+                                                .narrow(0, cand_start, cand_len);
+
+                                            let mse = &per_query_ref[b]
+                                                .as_ref()
+                                                .unwrap()
+                                                .mse_estimate;
+                                            let mse_dev = mse.to_device(merge_device);
+
+                                            let (pids_gpu, scores_gpu) = merger
+                                                .merge_candidate_scores_cuda(
+                                                    &sz_t, &pid_t, &sc_t, &mse_dev,
+                                                    nprobe, k,
+                                                )?;
+                                            out.push((
+                                                b,
+                                                pids_gpu,
+                                                scores_gpu,
+                                                lane_idx,
+                                            ));
+                                        }
+                                        Ok(out)
+                                    })
+                                    .collect()
+                            })?;
+
+                        for lane in lane_results {
+                            for (b, pids_gpu, scores_gpu, lane_idx) in lane {
+                                gpu_topk[b] = Some((pids_gpu, scores_gpu, lane_idx));
+                            }
+                        }
+                    }
+                } else {
+                    // Serial fallback: no streams / CPU scoring device.
+                    for (ai, &b) in active.iter().enumerate() {
+                        let cell_start = cell_offsets[ai] as i64;
+                        let cell_len = (cell_offsets[ai + 1] - cell_offsets[ai]) as i64;
+                        let cand_start = cand_offsets[ai] as i64;
+                        let cand_len = (cand_offsets[ai + 1] - cand_offsets[ai]) as i64;
+
+                        let cap_t = caps_all_t.narrow(0, cell_start, cell_len);
+                        let sz_t = sizes_all_t.narrow(0, cell_start, cell_len);
+                        let pid_t = pids_all_t.narrow(0, cand_start, cand_len);
+                        let sc_t = scores_all_t.narrow(0, cand_start, cand_len);
+
+                        let mse = &per_query[b].as_ref().unwrap().mse_estimate;
+                        let mse_dev = mse.to_device(merge_device);
+
+                        if use_defer_d2h {
+                            let (pids_gpu, scores_gpu) = self
+                                .merger
+                                .merge_candidate_scores_cuda(
+                                    &sz_t, &pid_t, &sc_t, &mse_dev, nprobe, k,
+                                )?;
+                            gpu_topk[b] = Some((pids_gpu, scores_gpu, 0));
+                        } else {
+                            let (pids, scores) = self.merger.merge_candidate_scores(
+                                &cap_t, &sz_t, &pid_t, &sc_t, &mse_dev, nprobe, k,
+                            )?;
+                            batch_results[b] = Some(SearchResult {
+                                passage_ids: pids,
+                                scores,
+                                query_id: c + b + 1,
+                            });
+                            bar.inc(1);
+                        }
                     }
                 }
                 drop(a3_t);
