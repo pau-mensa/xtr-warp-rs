@@ -1,3 +1,4 @@
+pub mod cuda_stream;
 pub mod residual_codec;
 pub mod types;
 
