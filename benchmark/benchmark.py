@@ -465,6 +465,7 @@ def run_xtr_warp(
         "size": len(documents),
         "queries": len(queries),
         "scores": evaluation_scores,
+        "latency": latency_stats,
         "memory": {
             "indexing": {
                 "cpu_increase_mb": index_memory["cpu_increase_mb"],
