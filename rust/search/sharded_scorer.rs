@@ -135,8 +135,8 @@ use crate::search::centroid_selector::CentroidSelector;
 use crate::search::decompressor::CentroidDecompressor;
 use crate::search::merger::{MergerConfig, ResultMerger};
 use crate::utils::types::{
-    DecompressedCentroidsOutput, IndexShard, Query, ReadOnlyTensor, SearchConfig,
-    SearchResult, ShardedIndex,
+    DecompressedCentroidsOutput, IndexShard, Query, ReadOnlyTensor, SearchConfig, SearchResult,
+    ShardedIndex,
 };
 
 #[cfg(xtr_has_cuda_shim)]
@@ -517,6 +517,15 @@ impl ShardedScorer {
             // `offsets` isn't transferred — it's rebuilt CPU-side from
             // `sizes` (offsets[i+1] = offsets[i] + sizes[i]), which is the
             // invariant the decompressor maintains.
+            //
+            // Per-query decompresses are highly parallellizable (each reads
+            // the shard's shared codes/residuals, writes its own output
+            // tensors). Profile showed the serial loop on the default stream
+            // leaves the GPU ~75% idle — tiny back-to-back kernels bound by
+            // host launch overhead. We dispatch across `merger_streams`
+            // lanes, each rayon thread pinned to a pool stream, same pattern
+            // as Pass A3. Cross-stream RAW safety: lane-stream kernels are
+            // drained via `pool.synchronize_all()` before the `cat` below.
             let mut active_bs: Vec<usize> = Vec::new();
             let mut caps_refs: Vec<Tensor> = Vec::new();
             let mut sizes_refs: Vec<Tensor> = Vec::new();
@@ -525,34 +534,170 @@ impl ShardedScorer {
             let mut nc_per: Vec<usize> = Vec::new();
             let mut nt_per: Vec<usize> = Vec::new();
 
+            // Pre-filter queries to those with work on this shard. This
+            // mirrors the serial loop's `None` skips (per_query[b] is None
+            // for empty-subset queries; shard_cells[si] is empty for queries
+            // whose selected cells don't overlap this shard's centroid range).
+            let mut candidates: Vec<usize> = Vec::with_capacity(batch_len);
             for b in 0..batch_len {
                 let qs = match &per_query[b] {
                     Some(qs) => qs,
                     None => continue,
                 };
-                let subset = resolve_subset(subsets, c + b);
-                let d = match decompress_query_shard(
-                    &self.decompressors[si],
-                    shard,
-                    &shared.bucket_weights,
-                    qs,
-                    si,
-                    &batch_queries,
-                    b,
-                    nprobe,
-                    subset,
-                )? {
-                    Some(d) => d,
-                    None => continue,
-                };
+                if qs.shard_cells[si].is_empty() {
+                    continue;
+                }
+                candidates.push(b);
+            }
 
-                active_bs.push(b);
-                nc_per.push(d.capacities.size()[0] as usize);
-                nt_per.push(d.passage_ids.size()[0] as usize);
-                caps_refs.push(d.capacities);
-                sizes_refs.push(d.sizes);
-                pids_refs.push(d.passage_ids);
-                scores_refs.push(d.scores);
+            let parallel_available;
+            #[cfg(xtr_has_cuda_shim)]
+            {
+                let env_off = std::env::var_os("XTR_WARP_DECOMPRESS_STREAMS")
+                    .map(|v| v == "0" || v == "1")
+                    .unwrap_or(false);
+                parallel_available =
+                    !env_off && self.merger_streams.as_ref().map_or(false, |p| p.len() > 1);
+            }
+            #[cfg(not(xtr_has_cuda_shim))]
+            {
+                parallel_available = false;
+            }
+
+            if parallel_available && !candidates.is_empty() {
+                #[cfg(xtr_has_cuda_shim)]
+                {
+                    let pool = self.merger_streams.as_ref().unwrap();
+                    let num_streams = pool.len();
+                    let device_ix = match shard.device {
+                        Device::Cuda(ix) => ix as i32,
+                        _ => unreachable!("shard.device.is_cuda() checked above"),
+                    };
+
+                    // Round-robin partition queries across lanes.
+                    let mut lanes: Vec<Vec<(usize, usize)>> =
+                        (0..num_streams).map(|_| Vec::new()).collect();
+                    for (ai, &b) in candidates.iter().enumerate() {
+                        lanes[ai % num_streams].push((ai, b));
+                    }
+
+                    // Tensor is !Sync; wrap to cross rayon thread boundaries.
+                    let bq_ro = ReadOnlyTensor(batch_queries.shallow_clone());
+                    let bw_ro = ReadOnlyTensor(shared.bucket_weights.shallow_clone());
+
+                    let per_query_ref = &per_query;
+                    let decompressor = &self.decompressors[si];
+                    let shard_ref: &IndexShard = shard;
+                    type LaneOut = Vec<(usize, Tensor, Tensor, Tensor, Tensor)>;
+
+                    let lane_results: Vec<LaneOut> =
+                        self.thread_pool.install(|| -> Result<Vec<LaneOut>> {
+                            lanes
+                                .into_par_iter()
+                                .enumerate()
+                                .map(|(lane_idx, lane)| -> Result<LaneOut> {
+                                    // Whole-struct capture of the Sync wrappers
+                                    // (same dance as Pass A3 — see comment there).
+                                    let _force_capture = (&bq_ro, &bw_ro);
+
+                                    let _saved = SavedStream::save(device_ix);
+                                    if let Some(s) = pool.get(lane_idx) {
+                                        set_current_stream(s);
+                                    }
+
+                                    let mut out: LaneOut = Vec::with_capacity(lane.len());
+                                    for (ai, b) in lane {
+                                        let qs = per_query_ref[b]
+                                            .as_ref()
+                                            .expect("candidate b has per_query Some");
+                                        let subset = resolve_subset(subsets, c + b);
+                                        let d = decompress_query_shard(
+                                            decompressor,
+                                            shard_ref,
+                                            &bw_ro.0,
+                                            qs,
+                                            si,
+                                            &bq_ro.0,
+                                            b,
+                                            nprobe,
+                                            subset,
+                                        )?
+                                        .expect("candidate pre-filtered to have cells");
+                                        out.push((
+                                            ai,
+                                            d.capacities,
+                                            d.sizes,
+                                            d.passage_ids,
+                                            d.scores,
+                                        ));
+                                    }
+                                    Ok(out)
+                                })
+                                .collect()
+                        })?;
+
+                    // Drain all pool streams before the cat below, which will
+                    // run on the main thread's current stream (typically the
+                    // default stream). Without this, cat reads would race
+                    // against lane-stream writes.
+                    pool.synchronize_all();
+
+                    // Flatten in original order. Each lane's entries are
+                    // already ai-ascending; flattening preserves this per
+                    // lane, and sorting by ai reinstates the global order
+                    // that the subsequent cat + split expects.
+                    let mut flat: Vec<(usize, Tensor, Tensor, Tensor, Tensor)> =
+                        Vec::with_capacity(candidates.len());
+                    for lane in lane_results {
+                        flat.extend(lane);
+                    }
+                    flat.sort_by_key(|e| e.0);
+
+                    active_bs.reserve(flat.len());
+                    caps_refs.reserve(flat.len());
+                    sizes_refs.reserve(flat.len());
+                    pids_refs.reserve(flat.len());
+                    scores_refs.reserve(flat.len());
+                    nc_per.reserve(flat.len());
+                    nt_per.reserve(flat.len());
+                    for (ai, caps, sizes, pids, scores) in flat {
+                        nc_per.push(caps.size()[0] as usize);
+                        nt_per.push(pids.size()[0] as usize);
+                        active_bs.push(candidates[ai]);
+                        caps_refs.push(caps);
+                        sizes_refs.push(sizes);
+                        pids_refs.push(pids);
+                        scores_refs.push(scores);
+                    }
+                }
+            } else {
+                // Serial fallback: no shim, pool disabled, or user opt-out.
+                // Behaviour identical to the pre-parallelization code.
+                for &b in &candidates {
+                    let qs = per_query[b]
+                        .as_ref()
+                        .expect("candidate b has per_query Some");
+                    let subset = resolve_subset(subsets, c + b);
+                    let d = decompress_query_shard(
+                        &self.decompressors[si],
+                        shard,
+                        &shared.bucket_weights,
+                        qs,
+                        si,
+                        &batch_queries,
+                        b,
+                        nprobe,
+                        subset,
+                    )?
+                    .expect("candidate pre-filtered to have cells");
+                    active_bs.push(b);
+                    nc_per.push(d.capacities.size()[0] as usize);
+                    nt_per.push(d.passage_ids.size()[0] as usize);
+                    caps_refs.push(d.capacities);
+                    sizes_refs.push(d.sizes);
+                    pids_refs.push(d.passage_ids);
+                    scores_refs.push(d.scores);
+                }
             }
 
             if active_bs.is_empty() {
@@ -730,10 +875,7 @@ impl ShardedScorer {
                                                     .passage_ids
                                                     .to_kind(Kind::Int64)
                                                     .try_into()?,
-                                                scores: d
-                                                    .scores
-                                                    .to_kind(Kind::Float)
-                                                    .try_into()?,
+                                                scores: d.scores.to_kind(Kind::Float).try_into()?,
                                             },
                                         )))
                                     })()
@@ -901,11 +1043,7 @@ impl ShardedScorer {
             // How many merger streams are we using this batch? 0/1 →
             // default-stream (legacy) path. N → round-robin pool.
             #[cfg(xtr_has_cuda_shim)]
-            let num_streams = self
-                .merger_streams
-                .as_ref()
-                .map(|p| p.len())
-                .unwrap_or(0);
+            let num_streams = self.merger_streams.as_ref().map(|p| p.len()).unwrap_or(0);
             #[cfg(not(xtr_has_cuda_shim))]
             let num_streams: usize = 0;
 
@@ -965,9 +1103,8 @@ impl ShardedScorer {
                 // ensures the H2Ds have completed before any pool stream
                 // reads.
                 #[cfg(xtr_has_cuda_shim)]
-                let parallel_a3 = use_defer_d2h
-                    && num_streams > 0
-                    && matches!(merge_device, Device::Cuda(_));
+                let parallel_a3 =
+                    use_defer_d2h && num_streams > 0 && matches!(merge_device, Device::Cuda(_));
                 #[cfg(not(xtr_has_cuda_shim))]
                 let parallel_a3 = false;
 
@@ -1015,8 +1152,7 @@ impl ShardedScorer {
                                         // not Sync), bypassing the wrappers'
                                         // unsafe-Sync impl and failing rayon's
                                         // Send+Sync bound on the map closure.
-                                        let _force_capture =
-                                            (&sizes_ro, &pids_ro, &scores_ro);
+                                        let _force_capture = (&sizes_ro, &pids_ro, &scores_ro);
 
                                         // Pin this rayon thread to lane's stream
                                         // for the duration of the lane. SavedStream
@@ -1026,8 +1162,7 @@ impl ShardedScorer {
                                             set_current_stream(s);
                                         }
 
-                                        let mut out: LaneOut =
-                                            Vec::with_capacity(lane.len());
+                                        let mut out: LaneOut = Vec::with_capacity(lane.len());
                                         for (ai, b) in lane {
                                             let cell_start = cell_offsets_ref[ai] as i64;
                                             let cell_len = (cell_offsets_ref[ai + 1]
@@ -1038,33 +1173,19 @@ impl ShardedScorer {
                                                 - cand_offsets_ref[ai])
                                                 as i64;
 
-                                            let sz_t = sizes_ro
-                                                .0
-                                                .narrow(0, cell_start, cell_len);
-                                            let pid_t = pids_ro
-                                                .0
-                                                .narrow(0, cand_start, cand_len);
-                                            let sc_t = scores_ro
-                                                .0
-                                                .narrow(0, cand_start, cand_len);
+                                            let sz_t = sizes_ro.0.narrow(0, cell_start, cell_len);
+                                            let pid_t = pids_ro.0.narrow(0, cand_start, cand_len);
+                                            let sc_t = scores_ro.0.narrow(0, cand_start, cand_len);
 
-                                            let mse = &per_query_ref[b]
-                                                .as_ref()
-                                                .unwrap()
-                                                .mse_estimate;
+                                            let mse =
+                                                &per_query_ref[b].as_ref().unwrap().mse_estimate;
                                             let mse_dev = mse.to_device(merge_device);
 
                                             let (pids_gpu, scores_gpu) = merger
                                                 .merge_candidate_scores_cuda(
-                                                    &sz_t, &pid_t, &sc_t, &mse_dev,
-                                                    nprobe, k,
+                                                    &sz_t, &pid_t, &sc_t, &mse_dev, nprobe, k,
                                                 )?;
-                                            out.push((
-                                                b,
-                                                pids_gpu,
-                                                scores_gpu,
-                                                lane_idx,
-                                            ));
+                                            out.push((b, pids_gpu, scores_gpu, lane_idx));
                                         }
                                         Ok(out)
                                     })
@@ -1094,11 +1215,9 @@ impl ShardedScorer {
                         let mse_dev = mse.to_device(merge_device);
 
                         if use_defer_d2h {
-                            let (pids_gpu, scores_gpu) = self
-                                .merger
-                                .merge_candidate_scores_cuda(
-                                    &sz_t, &pid_t, &sc_t, &mse_dev, nprobe, k,
-                                )?;
+                            let (pids_gpu, scores_gpu) = self.merger.merge_candidate_scores_cuda(
+                                &sz_t, &pid_t, &sc_t, &mse_dev, nprobe, k,
+                            )?;
                             gpu_topk[b] = Some((pids_gpu, scores_gpu, 0));
                         } else {
                             let (pids, scores) = self.merger.merge_candidate_scores(
@@ -1247,8 +1366,7 @@ impl ShardedScorer {
                         // CPU: compute in Float32 (x86 has no native FP16 ALU)
                         let query_f32 = query_embeddings.to_kind(Kind::Float);
                         let centroids_f32 = index.shared.centroids.to_kind(Kind::Float);
-                        let centroid_scores =
-                            query_f32.matmul(&centroids_f32.transpose(0, 1));
+                        let centroid_scores = query_f32.matmul(&centroids_f32.transpose(0, 1));
                         let query_mask = masks.i(idx as i64);
 
                         let selected = centroid_selector.select_centroids(
