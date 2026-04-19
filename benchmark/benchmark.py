@@ -239,6 +239,78 @@ def _load_documents_embeddings(embeddings_dir: Path) -> list[torch.Tensor]:
     return documents_embeddings
 
 
+def measure_single_query_latency(
+    index,
+    queries_embeddings,
+    config,
+    *,
+    num_samples: int = 200,
+    warmup: int = 20,
+):
+    """Measure per-query latency over `num_samples` sequential 1-query searches.
+
+    Each iteration submits exactly one query and waits for its result before
+    starting the next — this is the opposite of the throughput benchmark's
+    batch_size=1024 concurrent search. For GPU runs we `cuda.synchronize()`
+    before starting and after finishing each measurement so the timer
+    captures end-to-end latency (submission + kernels + D2H), not just
+    async submission.
+
+    `warmup` iterations are run first and discarded; they're noisy from
+    CUDA context/JIT init, caching-allocator warmup, and cold page faults.
+
+    Note: 200 samples gives decent p50/p95, only marginal p99 (two samples
+    in the tail). Fine as a rough picture; raise `num_samples` to 1000+
+    for tight p99.
+
+    Returns a dict of stats in milliseconds.
+    """
+    n_queries = queries_embeddings.shape[0]
+    if n_queries == 0:
+        return None
+
+    cuda = torch.cuda.is_available()
+    latencies_ms: list[float] = []
+    total_iters = num_samples + warmup
+
+    for i in range(total_iters):
+        # Cycle through available queries so the same one isn't reused,
+        # which could unfairly benefit any caching path.
+        q = queries_embeddings[i % n_queries : (i % n_queries) + 1]
+
+        if cuda:
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        _ = index.search(
+            queries_embeddings=q,
+            top_k=config["top_k"],
+            num_threads=config.get("num_threads", 1),
+            nprobe=config.get("nprobe"),
+            bound=config.get("bound"),
+            t_prime=config.get("t_prime"),
+            max_candidates=config.get("max_candidates"),
+            centroid_score_threshold=config.get("centroid_score_threshold"),
+            batch_size=1,
+        )
+        if cuda:
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+        if i >= warmup:
+            latencies_ms.append((t1 - t0) * 1000.0)
+
+    arr = np.array(latencies_ms)
+    return {
+        "samples": int(len(latencies_ms)),
+        "mean_ms": float(arr.mean()),
+        "p50_ms": float(np.percentile(arr, 50)),
+        "p95_ms": float(np.percentile(arr, 95)),
+        "p99_ms": float(np.percentile(arr, 99)),
+        "min_ms": float(arr.min()),
+        "max_ms": float(arr.max()),
+    }
+
+
 def run_xtr_warp(
     config,
     documents,
@@ -341,6 +413,26 @@ def run_xtr_warp(
     print(
         f"\t✅ {dataset_name} search: {heavy_search_time:.2f} seconds ({queries_per_second:.2f} QPS)"
     )
+
+    # Single-query latency: 200 sequential searches, 20 warmup.
+    print(
+        f"🔬 Measuring single-query latency on {dataset_name} "
+        f"(200 sequential searches, 20 warmup)..."
+    )
+    latency_stats = measure_single_query_latency(
+        index, queries_embeddings, config, num_samples=200, warmup=20
+    )
+    if latency_stats is not None:
+        print(
+            f"\t✅ {dataset_name} latency (ms): "
+            f"p50={latency_stats['p50_ms']:.2f}  "
+            f"p95={latency_stats['p95_ms']:.2f}  "
+            f"p99={latency_stats['p99_ms']:.2f}  "
+            f"mean={latency_stats['mean_ms']:.2f}  "
+            f"min={latency_stats['min_ms']:.2f}  "
+            f"max={latency_stats['max_ms']:.2f}  "
+            f"(n={latency_stats['samples']})"
+        )
 
     results = []
     for (query_id, _), query_scores in zip(queries.items(), scores, strict=True):
