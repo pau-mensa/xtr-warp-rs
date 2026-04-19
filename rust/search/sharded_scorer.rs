@@ -4,109 +4,6 @@ use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use std::sync::Arc;
 use tch::{Device, IndexOp, Kind, Tensor};
 
-/// Env-gated per-phase timing for `rank_multi_shard`'s Phase 3.
-///
-/// Enabled by setting `XTR_WARP_PROFILE_P3=1`; off by default (zero cost
-/// when disabled — no allocations, no time reads). Emits a summary via
-/// `eprintln!` when the profiler is dropped.
-///
-/// Measured sub-phases (see `rank_multi_shard` for what they do):
-/// - `a1a`: parallel per-query CPU assembly
-/// - `a1b`: serial merge into master flats
-/// - `a2` : batched H2D of master flats
-/// - `a3` : per-query merger launches
-/// - `a3_drain`: explicit `Cuda::synchronize` right after A3, measures
-///   how much GPU work was pending at end of A3 loop. Small → host-bound.
-///   Large → GPU lagging host, streams are pipelining kernels.
-/// - `b`  : D2H drain of top-k tensors
-#[derive(Default)]
-struct Phase3Profiler {
-    a1a_us: Vec<u128>,
-    a1b_us: Vec<u128>,
-    a2_us: Vec<u128>,
-    a3_us: Vec<u128>,
-    a3_drain_us: Vec<u128>,
-    b_us: Vec<u128>,
-}
-
-/// Lifetimed handle — used as `let _g = profiler.time(Phase::A3)` and
-/// pushes an elapsed-micros sample into the right bucket on drop.
-struct Phase3Timer<'p> {
-    profiler: &'p mut Phase3Profiler,
-    phase: Phase3Phase,
-    start: std::time::Instant,
-}
-
-#[derive(Copy, Clone)]
-enum Phase3Phase {
-    A1a,
-    A1b,
-    A2,
-    A3,
-    B,
-}
-
-impl Phase3Profiler {
-    fn enabled() -> bool {
-        std::env::var_os("XTR_WARP_PROFILE_P3").is_some()
-    }
-
-    fn time(&mut self, phase: Phase3Phase) -> Phase3Timer<'_> {
-        Phase3Timer {
-            profiler: self,
-            phase,
-            start: std::time::Instant::now(),
-        }
-    }
-
-    /// Record how long an explicit CUDA synchronize at end of A3 took
-    /// (see `a3_drain` above).
-    fn record_a3_drain(&mut self, micros: u128) {
-        self.a3_drain_us.push(micros);
-    }
-}
-
-impl Drop for Phase3Timer<'_> {
-    fn drop(&mut self) {
-        let us = self.start.elapsed().as_micros();
-        let bucket = match self.phase {
-            Phase3Phase::A1a => &mut self.profiler.a1a_us,
-            Phase3Phase::A1b => &mut self.profiler.a1b_us,
-            Phase3Phase::A2 => &mut self.profiler.a2_us,
-            Phase3Phase::A3 => &mut self.profiler.a3_us,
-            Phase3Phase::B => &mut self.profiler.b_us,
-        };
-        bucket.push(us);
-    }
-}
-
-impl Drop for Phase3Profiler {
-    fn drop(&mut self) {
-        // Only report if any data was collected (i.e. profiling was
-        // active). When disabled all vecs are empty.
-        if self.a3_us.is_empty() {
-            return;
-        }
-        let sum = |v: &[u128]| v.iter().sum::<u128>();
-        eprintln!(
-            "[phase3] batches={} a1a_us={} a1b_us={} a2_us={} a3_us={} a3_drain_us={} b_us={}",
-            self.a3_us.len(),
-            sum(&self.a1a_us),
-            sum(&self.a1b_us),
-            sum(&self.a2_us),
-            sum(&self.a3_us),
-            sum(&self.a3_drain_us),
-            sum(&self.b_us),
-        );
-        eprintln!("[phase3] per-batch a1a_us={:?}", self.a1a_us);
-        eprintln!("[phase3] per-batch a1b_us={:?}", self.a1b_us);
-        eprintln!("[phase3] per-batch a2_us={:?}", self.a2_us);
-        eprintln!("[phase3] per-batch a3_us={:?}", self.a3_us);
-        eprintln!("[phase3] per-batch a3_drain_us={:?}", self.a3_drain_us);
-        eprintln!("[phase3] per-batch b_us={:?}", self.b_us);
-    }
-}
-
 /// RAII guard that sets libtorch's internal BLAS thread count to 1 and
 /// restores the previous value on drop.  Prevents catastrophic
 /// oversubscription when rayon handles the outer parallelism (rayon
@@ -800,13 +697,6 @@ impl ShardedScorer {
         let nprobe = self.config.nprobe as usize;
         let num_shards = self.index.shards.len();
 
-        // Phase 3 profiler — zero-cost when disabled. Reports on drop.
-        let mut profiler = if Phase3Profiler::enabled() {
-            Some(Phase3Profiler::default())
-        } else {
-            None
-        };
-
         // Kick off the first batch. Subsequent batches are prepared inside
         // the scope (pipelined with the previous batch's CPU work).
         let mut prepared: Option<PreparedBatch> =
@@ -952,8 +842,6 @@ impl ShardedScorer {
             // the rayon pool. We collect per-query flat Vecs; a quick
             // serial pass afterwards concatenates them into master arrays
             // (preserving batch order for the merger).
-            let a1a_t = profiler.as_mut().map(|p| p.time(Phase3Phase::A1a));
-
             type QueryFlats = (Vec<i64>, Vec<i32>, Vec<i64>, Vec<f32>);
             let query_flats: Vec<Option<QueryFlats>> = self.thread_pool.install(|| {
                 shard_outs
@@ -1003,9 +891,6 @@ impl ShardedScorer {
                     .collect()
             });
 
-            drop(a1a_t);
-            let a1b_t = profiler.as_mut().map(|p| p.time(Phase3Phase::A1b));
-
             // Pass A1b: serial merge into master arrays
             // Fast: just Vec::extend in batch order. Preserves the
             // per-query order that the merger sees.
@@ -1029,8 +914,6 @@ impl ShardedScorer {
                 }
             }
 
-            drop(a1b_t);
-
             // Pass A results (CUDA path only): GPU tensors + the index of
             // the stream each query was submitted on, so Pass B can sync
             // against the right stream before D2H.
@@ -1048,8 +931,6 @@ impl ShardedScorer {
             let num_streams: usize = 0;
 
             if !active.is_empty() {
-                let a2_t = profiler.as_mut().map(|p| p.time(Phase3Phase::A2));
-
                 // Pass A2: batched H2D
                 // Empty-array `from_slice` → empty tensors, handled by
                 // `active.is_empty()` guard above.
@@ -1066,8 +947,6 @@ impl ShardedScorer {
                     .to_kind(Kind::Float)
                     .to_device(merge_device);
 
-                drop(a2_t);
-
                 // Cross-stream RAW safety: master input tensors were
                 // uploaded on the default stream. If we then read them on
                 // pool streams in A3 without a sync, the reads can race
@@ -1079,8 +958,6 @@ impl ShardedScorer {
                         tch::Cuda::synchronize(ix as i64);
                     }
                 }
-
-                let a3_t = profiler.as_mut().map(|p| p.time(Phase3Phase::A3));
 
                 // Pass A3: per-query slice + merger launch.
                 //
@@ -1232,26 +1109,7 @@ impl ShardedScorer {
                         }
                     }
                 }
-                drop(a3_t);
-
-                // a3_drain: explicit CUDA sync to measure pending GPU work
-                // at end of A3. With streams enabled this is large (kernels
-                // still running async); without streams it's ~0 (host-bound,
-                // each query's .size() sync inside the merger drained inline).
-                if let Some(p) = profiler.as_mut() {
-                    if use_defer_d2h {
-                        let start = std::time::Instant::now();
-                        if let Device::Cuda(ix) = merge_device {
-                            tch::Cuda::synchronize(ix as i64);
-                        }
-                        p.record_a3_drain(start.elapsed().as_micros());
-                    } else {
-                        p.record_a3_drain(0);
-                    }
-                }
             }
-
-            let b_t = profiler.as_mut().map(|p| p.time(Phase3Phase::B));
 
             // Pass B: D2H the deferred GPU results (CUDA path only).
             // Each query's D2H forces a sync on its own stream (the `.to_device(Cpu)`
@@ -1286,16 +1144,11 @@ impl ShardedScorer {
                     bar.inc(1);
                 }
             }
-            drop(b_t);
-
             for r in batch_results {
                 all_results.push(r.unwrap());
             }
         }
 
-        // `profiler` drops here: if enabled, emits the per-phase summary
-        // to stderr. If disabled, it's `None` and does nothing.
-        drop(profiler);
         Ok(all_results)
     }
 
