@@ -1004,9 +1004,7 @@ class XTRWarp:
             _ = self._ensure_torch_initialized(dev)
 
         device_ratios_list = list(ratios.items())
-        searcher = xtr_warp_rs.ShardedSearcher(
-            self.index, device_ratios_list, mmap
-        )
+        searcher = xtr_warp_rs.ShardedSearcher(self.index, device_ratios_list, mmap)
         searcher.load()
 
         self._searcher = searcher
@@ -1254,16 +1252,25 @@ class XTRWarp:
             error = "Index not loaded, call load() first"
             raise RuntimeError(error)
 
+        # Single-device CUDA uses rayon threads to fan per-query merger
+        # launches across a CUDA stream pool, so num_threads > 1 lifts
+        # throughput substantially. For single-query workloads it adds a
+        # small per-call overhead (thread-pool dispatch + BLAS guard)
         if (
-            len(self.devices) == 1
+            not getattr(self, "_warned_cuda_threads_latency", False)
+            and len(self.devices) == 1
             and num_threads is not None
             and num_threads > 1
             and self.devices[0].startswith("cuda")
         ):
             logger.warning(
-                "num_threads > 1 is not supported for single-device cuda, defaulting to 1"
+                "num_threads=%d on single-device cuda maximizes batch "
+                "throughput but adds ~0.3-0.4 ms overhead per search vs "
+                "num_threads=1; use num_threads=1 if you are optimizing for",
+                "latency serving",
+                num_threads,
             )
-            num_threads = 1
+            self._warned_cuda_threads_latency = True
 
         if isinstance(queries_embeddings, list):
             queries_embeddings = torch.nn.utils.rnn.pad_sequence(
