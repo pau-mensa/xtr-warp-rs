@@ -1264,11 +1264,10 @@ class XTRWarp:
             and self.devices[0].startswith("cuda")
         ):
             logger.warning(
-                "num_threads=%d on single-device cuda maximizes batch "
+                f"num_threads={num_threads} on single-device cuda maximizes batch "
                 "throughput but adds ~0.3-0.4 ms overhead per search vs "
-                "num_threads=1; use num_threads=1 if you are optimizing for",
-                "latency serving",
-                num_threads,
+                "num_threads=1; use num_threads=1 if you are optimizing for "
+                "latency serving"
             )
             self._warned_cuda_threads_latency = True
 
