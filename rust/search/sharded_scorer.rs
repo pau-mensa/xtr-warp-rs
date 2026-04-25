@@ -37,7 +37,7 @@ use crate::utils::types::{
 };
 
 #[cfg(xtr_has_cuda_shim)]
-use crate::utils::cuda_stream::{set_current_stream, SavedStream, StreamPool};
+use crate::utils::cuda_stream::{set_current_stream, SavedStream, StreamPool, DEFAULT_MERGER_STREAMS};
 
 /// Round-robin-partition `items` across the pool's streams, dispatch each
 /// lane on its own rayon thread pinned to its stream via `SavedStream` +
@@ -386,7 +386,7 @@ pub struct ShardedScorer {
     /// sizes_compacted pre-moved to scoring_device (avoids per-query transfer).
     sizes_on_scoring_device: Tensor,
     /// Pool of CUDA streams for Pass A3 round-robin submission. Empty
-    /// when the shim isn't available or `XTR_WARP_MERGER_STREAMS=0`.
+    /// when the shim isn't available or `config.merger_streams` is 0.
     /// Per-query merger kernels are submitted to `streams[i % N]` so
     /// the mid-merger `unique_consecutive` syncs don't serialize the
     /// whole batch on the default stream.
@@ -462,9 +462,11 @@ impl ShardedScorer {
         let sizes_on_scoring_device = shared.sizes_compacted.to_device(scoring_device);
 
         #[cfg(xtr_has_cuda_shim)]
+        let merger_pool_size = config.merger_streams.unwrap_or(DEFAULT_MERGER_STREAMS);
+        #[cfg(xtr_has_cuda_shim)]
         let merger_streams = match scoring_device {
             Device::Cuda(ix) => {
-                let pool = StreamPool::for_device(ix as i32);
+                let pool = StreamPool::for_device(ix as i32, merger_pool_size);
                 if pool.is_empty() {
                     None
                 } else {
@@ -488,7 +490,7 @@ impl ShardedScorer {
                     .iter()
                     .map(|shard| match shard.device {
                         Device::Cuda(ix) => {
-                            let pool = StreamPool::for_device(ix as i32);
+                            let pool = StreamPool::for_device(ix as i32, merger_pool_size);
                             if pool.is_empty() {
                                 None
                             } else {
@@ -802,10 +804,8 @@ impl ShardedScorer {
         let parallel_available;
         #[cfg(xtr_has_cuda_shim)]
         {
-            let env_off = std::env::var_os("XTR_WARP_DECOMPRESS_STREAMS")
-                .map(|v| v == "0" || v == "1")
-                .unwrap_or(false);
-            parallel_available = !env_off && parallel_pool.map_or(false, |p| p.len() > 1);
+            parallel_available = self.config.decompress_parallel
+                && parallel_pool.map_or(false, |p| p.len() > 1);
         }
         #[cfg(not(xtr_has_cuda_shim))]
         {

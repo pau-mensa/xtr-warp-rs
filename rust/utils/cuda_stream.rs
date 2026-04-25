@@ -99,21 +99,20 @@ pub fn set_current_stream(stream: &CudaStream) {
     unsafe { xtr_cuda_set_current_stream(stream.raw()) };
 }
 
+/// Default size of the per-device merger stream pool when the caller
+/// passes `None`.
+pub const DEFAULT_MERGER_STREAMS: usize = 8;
+
 /// Pool of CUDAStreams for a single device, used by Pass A3 to submit
-/// per-query merger work round-robin. Size is read from
-/// `XTR_WARP_MERGER_STREAMS` (default 8). Set to 0 or 1 to disable
-/// (fall back to default stream).
+/// per-query merger work round-robin. A pool sized 0 or 1 disables
+/// fan-out (the merger falls back to the default stream).
 pub struct StreamPool {
     streams: Vec<CudaStream>,
 }
 
 impl StreamPool {
-    pub fn for_device(device: i32) -> Self {
-        let n = std::env::var("XTR_WARP_MERGER_STREAMS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(8);
-        let streams = (0..n)
+    pub fn for_device(device: i32, size: usize) -> Self {
+        let streams = (0..size)
             .map(|_| CudaStream::from_pool(device, false))
             .collect();
         StreamPool { streams }

@@ -186,6 +186,7 @@ class XTRWarp:
         use_triton_kmeans: bool | None = None,
         metadata: list[dict] | None = None,
         show_progress: bool = True,
+        sample_workers: int | None = None,
     ) -> "XTRWarp":
         """Create and saves the XTRWarp index.
 
@@ -244,6 +245,7 @@ class XTRWarp:
             n_samples_kmeans=n_samples_kmeans,
             seed=seed,
             use_triton_kmeans=use_triton_kmeans,
+            sample_workers=sample_workers,
         )
 
         xtr_warp_rs.create(

@@ -17,7 +17,7 @@ from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Optional, Protocol
 
 import numpy as np
 import torch
@@ -52,6 +52,9 @@ class DiskSource:
     """Source for embeddings stored as ``.npy`` files with ``.doclens.npy`` sidecars."""
 
     path: Path
+    # Max threads for parallel mmap reads during k-means sampling. ``None``
+    # picks ``min(num_files, cpu_count, 8)``.
+    sample_workers: Optional[int] = None
     _files_and_doclens: list[tuple[Path, np.ndarray]] | None = None
     _doclens: list[int] | None = None
     _num_passages: int = 0
@@ -95,6 +98,11 @@ class DiskSource:
     def get_num_passages(self) -> int:
         self._load_metadata()
         return self._num_passages
+
+    def _resolve_sample_workers(self, num_files: int) -> int:
+        if self.sample_workers is not None:
+            return max(1, int(self.sample_workers))
+        return min(num_files, os.cpu_count() or 1, 8)
 
     def sample_embeddings(
         self, pids: list[int]
@@ -142,7 +150,7 @@ class DiskSource:
 
         tensors = torch.empty((total_tokens, dim), dtype=dtype)
 
-        max_workers = _resolve_sample_workers(len(active_file_indices))
+        max_workers = self._resolve_sample_workers(len(active_file_indices))
 
         def _copy_file_samples(file_idx: int) -> None:
             file_path, _ = self._files_and_doclens[file_idx]
@@ -170,21 +178,18 @@ class DiskSource:
         return tensors, total_tokens, dim
 
 
-def create_source(embeddings_source: list[torch.Tensor] | Path) -> EmbeddingSource:
-    """Wrap *embeddings_source* in the appropriate :class:`EmbeddingSource`."""
+def create_source(
+    embeddings_source: list[torch.Tensor] | Path,
+    *,
+    sample_workers: Optional[int] = None,
+) -> EmbeddingSource:
+    """Wrap *embeddings_source* in the appropriate :class:`EmbeddingSource`.
+
+    ``sample_workers`` only applies to the disk-backed branch.
+    """
     if isinstance(embeddings_source, list):
         return InMemorySource(embeddings_source)
-    return DiskSource(embeddings_source)
-
-
-def _resolve_sample_workers(num_files: int) -> int:
-    env_val = os.environ.get("XTR_WARP_DISK_SAMPLE_WORKERS", "").strip()
-    if env_val:
-        try:
-            return max(1, int(env_val))
-        except ValueError:
-            pass
-    return min(num_files, os.cpu_count() or 1, 8)
+    return DiskSource(embeddings_source, sample_workers=sample_workers)
 
 
 def _doclens_path_for(emb_path: Path) -> Path:

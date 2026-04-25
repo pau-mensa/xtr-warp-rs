@@ -20,6 +20,7 @@ def compute_kmeans(  # noqa: PLR0913
     n_samples_kmeans: int | None = None,
     use_triton_kmeans: bool | None = None,
     num_partitions_override: int | None = None,
+    sample_workers: int | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Compute K-means centroids for document embeddings.
 
@@ -38,7 +39,7 @@ def compute_kmeans(  # noqa: PLR0913
             1, total_tokens // max_points_per_centroid
         )
     else:
-        source = create_source(embeddings_source)
+        source = create_source(embeddings_source, sample_workers=sample_workers)
         num_passages = source.get_num_passages()
 
         if n_samples_kmeans is None:
