@@ -69,8 +69,8 @@ where
         lanes[ai % num_streams].push((ai, item));
     }
 
-    let per_lane: Vec<Vec<(usize, R)>> = thread_pool.install(
-        || -> Result<Vec<Vec<(usize, R)>>> {
+    let per_lane: Vec<Vec<(usize, R)>> =
+        thread_pool.install(|| -> Result<Vec<Vec<(usize, R)>>> {
             lanes
                 .into_par_iter()
                 .enumerate()
@@ -86,8 +86,7 @@ where
                     Ok(out)
                 })
                 .collect()
-        },
-    )?;
+        })?;
 
     let mut results: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
     for lane in per_lane {
@@ -234,7 +233,21 @@ pub struct ShardedScorer {
     /// whole batch on the default stream.
     #[cfg(xtr_has_cuda_shim)]
     merger_streams: Option<StreamPool>,
+    /// Per-shard stream pools, populated only when there are 2+ CUDA
+    /// shards. Each CUDA shard's slot holds a pool on that shard's
+    /// device so Phase 2 can fan its decompresses across multiple
+    /// devices concurrently. CPU shards and single-CUDA configs hold
+    /// `None` (the latter keeps using `merger_streams` from the
+    /// existing fast path). Indexed by shard position.
+    #[cfg(xtr_has_cuda_shim)]
+    shard_streams: Vec<Option<StreamPool>>,
 }
+
+// SAFETY: ShardedScorer's tensor fields (sizes_on_scoring_device) are
+// read-only after `new()`, the same invariant ShardedIndex / IndexShard
+// rely on for their Sync impls. Required so multi-CUDA Phase 2 can
+// dispatch one rayon task per CUDA shard while sharing &self.
+unsafe impl Sync for ShardedScorer {}
 
 impl ShardedScorer {
     pub fn new(index: &Arc<ShardedIndex>, mut config: SearchConfig) -> Result<Self> {
@@ -302,6 +315,35 @@ impl ShardedScorer {
             _ => None,
         };
 
+        // Per-shard stream pools for multi-CUDA Phase 2 fan-out. Only
+        // built when there are 2+ CUDA shards — single-CUDA configs
+        // continue to use `merger_streams` for Phase 2.
+        // Each pool is bound to its shard's device so kernels
+        // launched on it land on the right GPU.
+        #[cfg(xtr_has_cuda_shim)]
+        let shard_streams: Vec<Option<StreamPool>> = {
+            let cuda_count = index.shards.iter().filter(|s| s.device.is_cuda()).count();
+            if cuda_count >= 2 {
+                index
+                    .shards
+                    .iter()
+                    .map(|shard| match shard.device {
+                        Device::Cuda(ix) => {
+                            let pool = StreamPool::for_device(ix as i32);
+                            if pool.is_empty() {
+                                None
+                            } else {
+                                Some(pool)
+                            }
+                        },
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+
         Ok(Self {
             index: Arc::clone(index),
             centroid_selector,
@@ -314,6 +356,8 @@ impl ShardedScorer {
             sizes_on_scoring_device,
             #[cfg(xtr_has_cuda_shim)]
             merger_streams,
+            #[cfg(xtr_has_cuda_shim)]
+            shard_streams,
         })
     }
 
@@ -348,7 +392,7 @@ impl ShardedScorer {
             &cids,
             &selected.scores,
             shard,
-            &shared.bucket_weights,
+            &shard.bucket_weights,
             &query_embeddings,
             nprobe,
             subset,
@@ -492,229 +536,286 @@ impl ShardedScorer {
         c: usize,
         batch_len: usize,
     ) -> Result<()> {
-        let shared = &self.index.shared;
-        let nprobe = self.config.nprobe as usize;
         let num_shards = self.index.shards.len();
+        let cuda_shards: Vec<usize> = (0..num_shards)
+            .filter(|&si| self.index.shards[si].device.is_cuda())
+            .collect();
+
+        // Multi-CUDA-shard path: spawn one rayon task per CUDA shard so
+        // multiple GPUs run their decompress concurrently. Each task
+        // uses its own device-bound `shard_streams[si]` pool for the
+        // within-shard Path C lane fan-out. Outputs are collected and
+        // spliced into shard_outs after the join. Single-CUDA configs
+        // (incl. {cuda, cpu}) take the serial fallback below — no
+        // behavior change since the existing per-shard stream fan-out
+        // already does Path C parallelism on one device.
+        #[cfg(xtr_has_cuda_shim)]
+        if cuda_shards.len() >= 2 && !self.shard_streams.is_empty() {
+            // `tch::Tensor` is `!Sync`; wrap to cross rayon boundaries.
+            let bq_ro = ReadOnlyTensor(batch_queries.shallow_clone());
+            let per_shard: Vec<Result<(usize, Vec<(usize, ShardOut)>)>> =
+                self.thread_pool.install(|| {
+                    cuda_shards
+                        .par_iter()
+                        .map(|&si| -> Result<(usize, Vec<(usize, ShardOut)>)> {
+                            let _force_capture = &bq_ro;
+                            let pool = self.shard_streams[si].as_ref();
+                            let items = self.phase_2_one_cuda_shard(
+                                si, pool, per_query, &bq_ro.0, subsets, c, batch_len,
+                            )?;
+                            Ok((si, items))
+                        })
+                        .collect()
+                });
+            for r in per_shard {
+                let (si, items) = r?;
+                for (b, out) in items {
+                    shard_outs[b][si] = Some(out);
+                }
+            }
+            return Ok(());
+        }
+
+        // Single-CUDA / non-shim serial path. Each CUDA shard fans out
+        // across `merger_streams` (the existing pool — shared with Pass
+        // A3, which runs after this phase, so no contention).
+        for si in cuda_shards {
+            #[cfg(xtr_has_cuda_shim)]
+            let items = self.phase_2_one_cuda_shard(
+                si,
+                self.merger_streams.as_ref(),
+                per_query,
+                batch_queries,
+                subsets,
+                c,
+                batch_len,
+            )?;
+            #[cfg(not(xtr_has_cuda_shim))]
+            let items =
+                self.phase_2_one_cuda_shard(si, per_query, batch_queries, subsets, c, batch_len)?;
+            for (b, out) in items {
+                shard_outs[b][si] = Some(out);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Decompress and D2H one CUDA shard's slice of the batch. Returns
+    /// `(b, ShardOut)` pairs for queries that had cells on this shard.
+    /// `parallel_pool` (shim-only) controls the within-shard lane fan-
+    /// out: `Some(pool)` uses Path C streams; `None` runs serially.
+    fn phase_2_one_cuda_shard(
+        &self,
+        si: usize,
+        #[cfg(xtr_has_cuda_shim)] parallel_pool: Option<&StreamPool>,
+        per_query: &[Option<QueryState>],
+        batch_queries: &Tensor,
+        subsets: Option<&[Vec<i64>]>,
+        c: usize,
+        batch_len: usize,
+    ) -> Result<Vec<(usize, ShardOut)>> {
+        let nprobe = self.config.nprobe as usize;
+        let shard = &self.index.shards[si];
 
         // CUDA kernels are async: launches return immediately, kernels
         // execute in the background while the main thread moves on.
-        for si in 0..num_shards {
-            let shard = &self.index.shards[si];
-            if !shard.device.is_cuda() {
-                continue; // CPU shards are handled by the orchestrator's rayon scope
-            }
+        // `offsets` isn't transferred — it's rebuilt CPU-side from
+        // `sizes` (offsets[i+1] = offsets[i] + sizes[i]), the invariant
+        // the decompressor maintains.
+        let mut active_bs: Vec<usize> = Vec::new();
+        let mut caps_refs: Vec<Tensor> = Vec::new();
+        let mut sizes_refs: Vec<Tensor> = Vec::new();
+        let mut pids_refs: Vec<Tensor> = Vec::new();
+        let mut scores_refs: Vec<Tensor> = Vec::new();
+        let mut nc_per: Vec<usize> = Vec::new();
+        let mut nt_per: Vec<usize> = Vec::new();
 
-            // Launch all CUDA decompresses for this shard and accumulate
-            // their GPU tensors for a single batched D2H below. We don't
-            // park the results in `shard_outs[b][si]` because they're about
-            // to be replaced with Vec-form ShardOut values anyway.
-            //
-            // `offsets` isn't transferred — it's rebuilt CPU-side from
-            // `sizes` (offsets[i+1] = offsets[i] + sizes[i]), which is the
-            // invariant the decompressor maintains.
-            //
-            // Per-query decompresses are highly parallellizable (each reads
-            // the shard's shared codes/residuals, writes its own output
-            // tensors). Profile showed the serial loop on the default stream
-            // leaves the GPU ~75% idle — tiny back-to-back kernels bound by
-            // host launch overhead. We dispatch across `merger_streams`
-            // lanes, each rayon thread pinned to a pool stream, same pattern
-            // as Pass A3. Cross-stream RAW safety: lane-stream kernels are
-            // drained via `pool.synchronize_all()` before the `cat` below.
-            let mut active_bs: Vec<usize> = Vec::new();
-            let mut caps_refs: Vec<Tensor> = Vec::new();
-            let mut sizes_refs: Vec<Tensor> = Vec::new();
-            let mut pids_refs: Vec<Tensor> = Vec::new();
-            let mut scores_refs: Vec<Tensor> = Vec::new();
-            let mut nc_per: Vec<usize> = Vec::new();
-            let mut nt_per: Vec<usize> = Vec::new();
-
-            // Pre-filter queries to those with work on this shard. This
-            // mirrors the serial loop's `None` skips (per_query[b] is None
-            // for empty-subset queries; shard_cells[si] is empty for queries
-            // whose selected cells don't overlap this shard's centroid range).
-            let mut candidates: Vec<usize> = Vec::with_capacity(batch_len);
-            for b in 0..batch_len {
-                let qs = match &per_query[b] {
-                    Some(qs) => qs,
-                    None => continue,
-                };
-                if qs.shard_cells[si].is_empty() {
-                    continue;
-                }
-                candidates.push(b);
-            }
-
-            let parallel_available;
-            #[cfg(xtr_has_cuda_shim)]
-            {
-                let env_off = std::env::var_os("XTR_WARP_DECOMPRESS_STREAMS")
-                    .map(|v| v == "0" || v == "1")
-                    .unwrap_or(false);
-                parallel_available =
-                    !env_off && self.merger_streams.as_ref().map_or(false, |p| p.len() > 1);
-            }
-            #[cfg(not(xtr_has_cuda_shim))]
-            {
-                parallel_available = false;
-            }
-
-            // Single-candidate batches skip the stream fan-out: the
-            // `pool.synchronize_all()` + per-lane `SavedStream::save` +
-            // rayon dispatch overhead dwarfs any benefit when only one
-            // query has work on this shard (latency-harness, interactive).
-            if parallel_available && candidates.len() > 1 {
-                #[cfg(xtr_has_cuda_shim)]
-                {
-                    let pool = self.merger_streams.as_ref().unwrap();
-                    let device_ix = match shard.device {
-                        Device::Cuda(ix) => ix as i32,
-                        _ => unreachable!("shard.device.is_cuda() checked above"),
-                    };
-
-                    // Tensor is !Sync; wrap to cross rayon thread boundaries.
-                    let bq_ro = ReadOnlyTensor(batch_queries.shallow_clone());
-                    let bw_ro = ReadOnlyTensor(shared.bucket_weights.shallow_clone());
-                    let per_query_ref = &per_query;
-                    let decompressor = &self.decompressors[si];
-                    let shard_ref: &IndexShard = shard;
-
-                    type LaneOut = (Tensor, Tensor, Tensor, Tensor);
-                    let results: Vec<LaneOut> = lane_dispatch(
-                        pool,
-                        device_ix,
-                        &self.thread_pool,
-                        &candidates,
-                        |_ai, b, _lane_idx| -> Result<LaneOut> {
-                            let _force_capture = (&bq_ro, &bw_ro);
-                            let qs = per_query_ref[b]
-                                .as_ref()
-                                .expect("candidate b has per_query Some");
-                            let subset = resolve_subset(subsets, c + b);
-                            let d = decompress_query_shard(
-                                decompressor,
-                                shard_ref,
-                                &bw_ro.0,
-                                qs,
-                                si,
-                                &bq_ro.0,
-                                b,
-                                nprobe,
-                                subset,
-                            )?
-                            .expect("candidate pre-filtered to have cells");
-                            Ok((d.capacities, d.sizes, d.passage_ids, d.scores))
-                        },
-                    )?;
-
-                    // Drain all pool streams before the cat below, which will
-                    // run on the main thread's current stream (typically the
-                    // default stream). Without this, cat reads would race
-                    // against lane-stream writes.
-                    pool.synchronize_all();
-
-                    active_bs.reserve(results.len());
-                    caps_refs.reserve(results.len());
-                    sizes_refs.reserve(results.len());
-                    pids_refs.reserve(results.len());
-                    scores_refs.reserve(results.len());
-                    nc_per.reserve(results.len());
-                    nt_per.reserve(results.len());
-                    for (ai, (caps, sizes, pids, scores)) in results.into_iter().enumerate() {
-                        nc_per.push(caps.size()[0] as usize);
-                        nt_per.push(pids.size()[0] as usize);
-                        active_bs.push(candidates[ai]);
-                        caps_refs.push(caps);
-                        sizes_refs.push(sizes);
-                        pids_refs.push(pids);
-                        scores_refs.push(scores);
-                    }
-                }
-            } else {
-                // Serial fallback: no shim, pool disabled, or user opt-out.
-                // Behaviour identical to the pre-parallelization code.
-                for &b in &candidates {
-                    let qs = per_query[b]
-                        .as_ref()
-                        .expect("candidate b has per_query Some");
-                    let subset = resolve_subset(subsets, c + b);
-                    let d = decompress_query_shard(
-                        &self.decompressors[si],
-                        shard,
-                        &shared.bucket_weights,
-                        qs,
-                        si,
-                        &batch_queries,
-                        b,
-                        nprobe,
-                        subset,
-                    )?
-                    .expect("candidate pre-filtered to have cells");
-                    active_bs.push(b);
-                    nc_per.push(d.capacities.size()[0] as usize);
-                    nt_per.push(d.passage_ids.size()[0] as usize);
-                    caps_refs.push(d.capacities);
-                    sizes_refs.push(d.sizes);
-                    pids_refs.push(d.passage_ids);
-                    scores_refs.push(d.scores);
-                }
-            }
-
-            if active_bs.is_empty() {
+        // Pre-filter queries with work on this shard: skip empty-subset
+        // queries (per_query[b] = None) and queries whose selected cells
+        // don't overlap this shard's centroid range.
+        let mut candidates: Vec<usize> = Vec::with_capacity(batch_len);
+        for b in 0..batch_len {
+            let qs = match &per_query[b] {
+                Some(qs) => qs,
+                None => continue,
+            };
+            if qs.shard_cells[si].is_empty() {
                 continue;
             }
+            candidates.push(b);
+        }
 
-            // Batched D2H for this CUDA shard: one `cat` + one D2H per
-            // column, then split back to per-query ShardOut. Replaces
-            // 5 × batch_len per-query D2Hs in Phase 3 with 4 big transfers
-            // here. Ordering is stable (cat preserves input order), so
-            // Phase 3 reads identical data to before.
-            let caps_ref_view: Vec<&Tensor> = caps_refs.iter().collect();
-            let sizes_ref_view: Vec<&Tensor> = sizes_refs.iter().collect();
-            let pids_ref_view: Vec<&Tensor> = pids_refs.iter().collect();
-            let scores_ref_view: Vec<&Tensor> = scores_refs.iter().collect();
+        let parallel_available;
+        #[cfg(xtr_has_cuda_shim)]
+        {
+            let env_off = std::env::var_os("XTR_WARP_DECOMPRESS_STREAMS")
+                .map(|v| v == "0" || v == "1")
+                .unwrap_or(false);
+            parallel_available = !env_off && parallel_pool.map_or(false, |p| p.len() > 1);
+        }
+        #[cfg(not(xtr_has_cuda_shim))]
+        {
+            parallel_available = false;
+        }
 
-            let caps_cat = Tensor::cat(&caps_ref_view, 0);
-            let sizes_cat = Tensor::cat(&sizes_ref_view, 0).to_kind(Kind::Int);
-            let pids_cat = Tensor::cat(&pids_ref_view, 0).to_kind(Kind::Int64);
-            let scores_cat = Tensor::cat(&scores_ref_view, 0).to_kind(Kind::Float);
+        // Single-candidate batches skip the stream fan-out: the
+        // `pool.synchronize_all()` + per-lane `SavedStream::save` +
+        // rayon dispatch overhead dwarfs any benefit when only one
+        // query has work on this shard (latency-harness, interactive).
+        if parallel_available && candidates.len() > 1 {
+            #[cfg(xtr_has_cuda_shim)]
+            {
+                let pool = parallel_pool.unwrap();
+                let device_ix = match shard.device {
+                    Device::Cuda(ix) => ix as i32,
+                    _ => unreachable!("shard.device.is_cuda() checked above"),
+                };
 
-            let caps_vec: Vec<i64> = caps_cat.to_device(Device::Cpu).try_into()?;
-            let sizes_vec: Vec<i32> = sizes_cat.to_device(Device::Cpu).try_into()?;
-            let pids_vec: Vec<i64> = pids_cat.to_device(Device::Cpu).try_into()?;
-            let scores_vec: Vec<f32> = scores_cat.to_device(Device::Cpu).try_into()?;
+                // Tensor is !Sync; wrap to cross rayon thread boundaries.
+                let bq_ro = ReadOnlyTensor(batch_queries.shallow_clone());
+                let bw_ro = ReadOnlyTensor(shard.bucket_weights.shallow_clone());
+                let per_query_ref = &per_query;
+                let decompressor = &self.decompressors[si];
+                let shard_ref: &IndexShard = shard;
 
-            let mut cell_off = 0usize;
-            let mut cand_off = 0usize;
-            for (i, &b) in active_bs.iter().enumerate() {
-                let nc = nc_per[i];
-                let nt = nt_per[i];
+                type LaneOut = (Tensor, Tensor, Tensor, Tensor);
+                let results: Vec<LaneOut> = lane_dispatch(
+                    pool,
+                    device_ix,
+                    &self.thread_pool,
+                    &candidates,
+                    |_ai, b, _lane_idx| -> Result<LaneOut> {
+                        let _force_capture = (&bq_ro, &bw_ro);
+                        let qs = per_query_ref[b]
+                            .as_ref()
+                            .expect("candidate b has per_query Some");
+                        let subset = resolve_subset(subsets, c + b);
+                        let d = decompress_query_shard(
+                            decompressor,
+                            shard_ref,
+                            &bw_ro.0,
+                            qs,
+                            si,
+                            &bq_ro.0,
+                            b,
+                            nprobe,
+                            subset,
+                        )?
+                        .expect("candidate pre-filtered to have cells");
+                        Ok((d.capacities, d.sizes, d.passage_ids, d.scores))
+                    },
+                )?;
 
-                let capacities = caps_vec[cell_off..cell_off + nc].to_vec();
-                let sizes = sizes_vec[cell_off..cell_off + nc].to_vec();
-                let passage_ids = pids_vec[cand_off..cand_off + nt].to_vec();
-                let scores = scores_vec[cand_off..cand_off + nt].to_vec();
+                // Drain all pool streams before the cat below — the cat
+                // runs on this thread's current stream and would race
+                // against lane-stream writes otherwise.
+                pool.synchronize_all();
 
-                // Reconstruct per-query offsets from sizes (0, cumsum).
-                let mut offsets = vec![0i64; nc + 1];
-                for j in 0..nc {
-                    offsets[j + 1] = offsets[j] + sizes[j] as i64;
+                active_bs.reserve(results.len());
+                caps_refs.reserve(results.len());
+                sizes_refs.reserve(results.len());
+                pids_refs.reserve(results.len());
+                scores_refs.reserve(results.len());
+                nc_per.reserve(results.len());
+                nt_per.reserve(results.len());
+                for (ai, (caps, sizes, pids, scores)) in results.into_iter().enumerate() {
+                    nc_per.push(caps.size()[0] as usize);
+                    nt_per.push(pids.size()[0] as usize);
+                    active_bs.push(candidates[ai]);
+                    caps_refs.push(caps);
+                    sizes_refs.push(sizes);
+                    pids_refs.push(pids);
+                    scores_refs.push(scores);
                 }
+            }
+        } else {
+            // Serial fallback: no shim, pool disabled, env opt-out, or
+            // single-candidate batch.
+            for &b in &candidates {
+                let qs = per_query[b]
+                    .as_ref()
+                    .expect("candidate b has per_query Some");
+                let subset = resolve_subset(subsets, c + b);
+                let d = decompress_query_shard(
+                    &self.decompressors[si],
+                    shard,
+                    &shard.bucket_weights,
+                    qs,
+                    si,
+                    batch_queries,
+                    b,
+                    nprobe,
+                    subset,
+                )?
+                .expect("candidate pre-filtered to have cells");
+                active_bs.push(b);
+                nc_per.push(d.capacities.size()[0] as usize);
+                nt_per.push(d.passage_ids.size()[0] as usize);
+                caps_refs.push(d.capacities);
+                sizes_refs.push(d.sizes);
+                pids_refs.push(d.passage_ids);
+                scores_refs.push(d.scores);
+            }
+        }
 
-                shard_outs[b][si] = Some(ShardOut {
+        if active_bs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Batched D2H for this CUDA shard: one `cat` + one D2H per
+        // column, then split back to per-query ShardOut. Replaces
+        // 5 × batch_len per-query D2Hs in Phase 3 with 4 big transfers.
+        // Ordering is stable (cat preserves input order).
+        let caps_ref_view: Vec<&Tensor> = caps_refs.iter().collect();
+        let sizes_ref_view: Vec<&Tensor> = sizes_refs.iter().collect();
+        let pids_ref_view: Vec<&Tensor> = pids_refs.iter().collect();
+        let scores_ref_view: Vec<&Tensor> = scores_refs.iter().collect();
+
+        let caps_cat = Tensor::cat(&caps_ref_view, 0);
+        let sizes_cat = Tensor::cat(&sizes_ref_view, 0).to_kind(Kind::Int);
+        let pids_cat = Tensor::cat(&pids_ref_view, 0).to_kind(Kind::Int64);
+        let scores_cat = Tensor::cat(&scores_ref_view, 0).to_kind(Kind::Float);
+
+        let caps_vec: Vec<i64> = caps_cat.to_device(Device::Cpu).try_into()?;
+        let sizes_vec: Vec<i32> = sizes_cat.to_device(Device::Cpu).try_into()?;
+        let pids_vec: Vec<i64> = pids_cat.to_device(Device::Cpu).try_into()?;
+        let scores_vec: Vec<f32> = scores_cat.to_device(Device::Cpu).try_into()?;
+
+        let mut out: Vec<(usize, ShardOut)> = Vec::with_capacity(active_bs.len());
+        let mut cell_off = 0usize;
+        let mut cand_off = 0usize;
+        for (i, &b) in active_bs.iter().enumerate() {
+            let nc = nc_per[i];
+            let nt = nt_per[i];
+
+            let capacities = caps_vec[cell_off..cell_off + nc].to_vec();
+            let sizes = sizes_vec[cell_off..cell_off + nc].to_vec();
+            let passage_ids = pids_vec[cand_off..cand_off + nt].to_vec();
+            let scores = scores_vec[cand_off..cand_off + nt].to_vec();
+
+            // Reconstruct per-query offsets from sizes (0, cumsum).
+            let mut offsets = vec![0i64; nc + 1];
+            for j in 0..nc {
+                offsets[j + 1] = offsets[j] + sizes[j] as i64;
+            }
+
+            out.push((
+                b,
+                ShardOut {
                     capacities,
                     sizes,
                     offsets,
                     passage_ids,
                     scores,
-                });
+                },
+            ));
 
-                cell_off += nc;
-                cand_off += nt;
-            }
+            cell_off += nc;
+            cand_off += nt;
         }
 
-        Ok(())
+        Ok(out)
     }
 
     /// Runs Phase 0 then Phase 2 GPU sequentially. Used by the cross-batch
@@ -817,7 +918,6 @@ impl ShardedScorer {
                 // Capture Send-safe handles for the spawn closure.
                 let shards = &self.index.shards;
                 let decompressors = self.decompressors.clone();
-                let bw = ReadOnlyTensor(self.index.shared.bucket_weights.shallow_clone());
                 let per_query = &current.per_query;
                 let batch_queries = &current.batch_queries;
                 let batch_len = current.batch_len;
@@ -843,7 +943,7 @@ impl ShardedScorer {
                                         let d = match decompress_query_shard(
                                             decompressor,
                                             shard,
-                                            &bw,
+                                            &shard.bucket_weights,
                                             qs,
                                             si,
                                             batch_queries,
@@ -969,7 +1069,6 @@ impl ShardedScorer {
             // Send-safe captures for the CPU decompress spawn.
             let shards = &self.index.shards;
             let decompressors = self.decompressors.clone();
-            let bw = ReadOnlyTensor(self.index.shared.bucket_weights.shallow_clone());
             let per_query_ref = &per_query;
             let batch_queries_ref = &batch_queries;
             let batch_len_cp = batch_len;
@@ -995,7 +1094,7 @@ impl ShardedScorer {
                                     let d = match decompress_query_shard(
                                         decompressor,
                                         shard,
-                                        &bw,
+                                        &shard.bucket_weights,
                                         qs,
                                         si,
                                         batch_queries_ref,
@@ -1095,8 +1194,10 @@ impl ShardedScorer {
                 }
             }
             let pids: Vec<i64> = pids_t.to_device(Device::Cpu).try_into()?;
-            let scores: Vec<f32> =
-                scores_t.to_kind(Kind::Float).to_device(Device::Cpu).try_into()?;
+            let scores: Vec<f32> = scores_t
+                .to_kind(Kind::Float)
+                .to_device(Device::Cpu)
+                .try_into()?;
             batch_results[b] = Some(SearchResult {
                 passage_ids: pids,
                 scores,
@@ -1110,11 +1211,7 @@ impl ShardedScorer {
     ///   A3:  per-query merger launches, optionally fanned across streams.
     ///   B:   deferred-D2H drain of per-query top-k results.
     /// See the Lever F / sync-free / Path B notes in `HYBRID_SEARCH_PERF.md`.
-    fn run_phase_3(
-        &self,
-        current: PreparedBatch,
-        bar: &ProgressBar,
-    ) -> Result<Vec<SearchResult>> {
+    fn run_phase_3(&self, current: PreparedBatch, bar: &ProgressBar) -> Result<Vec<SearchResult>> {
         let merge_device = self.scoring_device;
         let nprobe = self.config.nprobe as usize;
         let num_shards = self.index.shards.len();
@@ -1278,11 +1375,9 @@ impl ShardedScorer {
                         |ai, b, lane_idx| -> Result<LaneOut> {
                             let _force_capture = (&sizes_ro, &pids_ro, &scores_ro);
                             let cell_start = cell_offsets_ref[ai] as i64;
-                            let cell_len =
-                                (cell_offsets_ref[ai + 1] - cell_offsets_ref[ai]) as i64;
+                            let cell_len = (cell_offsets_ref[ai + 1] - cell_offsets_ref[ai]) as i64;
                             let cand_start = cand_offsets_ref[ai] as i64;
-                            let cand_len =
-                                (cand_offsets_ref[ai + 1] - cand_offsets_ref[ai]) as i64;
+                            let cand_len = (cand_offsets_ref[ai + 1] - cand_offsets_ref[ai]) as i64;
 
                             let sz_t = sizes_ro.0.narrow(0, cell_start, cell_len);
                             let pid_t = pids_ro.0.narrow(0, cand_start, cand_len);
@@ -1298,9 +1393,7 @@ impl ShardedScorer {
                         },
                     )?;
 
-                    for (ai, (pids_gpu, scores_gpu, lane_idx)) in
-                        results.into_iter().enumerate()
-                    {
+                    for (ai, (pids_gpu, scores_gpu, lane_idx)) in results.into_iter().enumerate() {
                         gpu_topk[active[ai]] = Some((pids_gpu, scores_gpu, lane_idx));
                     }
                 }
@@ -1437,7 +1530,7 @@ impl ShardedScorer {
                             &cids,
                             &selected.scores,
                             shard,
-                            &index.shared.bucket_weights,
+                            &shard.bucket_weights,
                             &query_f32,
                             nprobe,
                             subset,
@@ -1479,10 +1572,7 @@ impl ShardedScorer {
             let mut results: Vec<SearchResult> = Vec::with_capacity(n_queries);
 
             #[cfg(xtr_has_cuda_shim)]
-            let use_streams = self
-                .merger_streams
-                .as_ref()
-                .map_or(false, |p| p.len() > 1)
+            let use_streams = self.merger_streams.as_ref().map_or(false, |p| p.len() > 1)
                 && matches!(self.scoring_device, Device::Cuda(_));
             #[cfg(not(xtr_has_cuda_shim))]
             let use_streams = false;
@@ -1541,16 +1631,16 @@ impl ShardedScorer {
                         // (same pattern as Phase 3's pre-A3 sync).
                         tch::Cuda::synchronize(device_ix as i64);
 
+                        let shard = &self.index.shards[0];
                         let bq_ro = ReadOnlyTensor(batch_queries_f32.shallow_clone());
                         let cs_ro = ReadOnlyTensor(centroid_scores.shallow_clone());
                         let bm_ro = ReadOnlyTensor(batch_mask.shallow_clone());
-                        let bw_ro = ReadOnlyTensor(shared.bucket_weights.shallow_clone());
+                        let bw_ro = ReadOnlyTensor(shard.bucket_weights.shallow_clone());
                         let sz_ro = ReadOnlyTensor(self.sizes_on_scoring_device.shallow_clone());
 
                         let decompressor = &self.decompressors[0];
                         let centroid_selector = &self.centroid_selector;
                         let merger = &self.merger;
-                        let shard = &self.index.shards[0];
                         let kdummy = shared.kdummy_centroid;
                         let scoring_device = self.scoring_device;
 
@@ -1597,9 +1687,7 @@ impl ShardedScorer {
                             },
                         )?;
 
-                        for (ai, (pids_t, scores_t, lane_idx)) in
-                            results.into_iter().enumerate()
-                        {
+                        for (ai, (pids_t, scores_t, lane_idx)) in results.into_iter().enumerate() {
                             gpu_topk[active[ai]] = Some((pids_t, scores_t, lane_idx));
                         }
                     }

@@ -240,6 +240,10 @@ pub struct IndexShard {
     pub residuals_compacted: Tensor,
     /// Local offsets (starts at 0): [shard_num_centroids + 1].
     pub offsets_compacted: Tensor,
+    /// Bucket weights replicated on this shard's device. Avoids an
+    /// implicit cross-device transfer per decompress call when the shard
+    /// is not on `scoring_device` (matters for multi-CUDA configs).
+    pub bucket_weights: Tensor,
     /// Mmap handles that must outlive the tensors they back.
     pub _mmap_handles: Arc<Vec<Mmap>>,
 }

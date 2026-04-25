@@ -326,6 +326,14 @@ impl IndexLoader {
                 o
             };
 
+            // Replicate bucket_weights on this shard's device so the
+            // decompressor doesn't pay a cross-device `to_device` per call.
+            let shard_bucket_weights = if *device == scoring_device {
+                bucket_weights.shallow_clone()
+            } else {
+                bucket_weights.to_device(*device)
+            };
+
             shards.push(IndexShard {
                 centroid_start: start,
                 centroid_end: end,
@@ -334,6 +342,7 @@ impl IndexLoader {
                 pids_compacted: pids,
                 residuals_compacted: residuals,
                 offsets_compacted: offsets,
+                bucket_weights: shard_bucket_weights,
                 _mmap_handles: Arc::new(mmap_handles),
             });
         }
