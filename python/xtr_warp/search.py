@@ -6,6 +6,8 @@ import logging
 import math
 import os
 import random
+from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -86,9 +88,18 @@ class DiskSource:
     """Source for embeddings stored in disk."""
 
     path: Path
-    _files_and_doclens: list[tuple[Path, list[int]]] | None = None
+    _files_and_doclens: list[tuple[Path, np.ndarray]] | None = None
     _doclens: list[int] | None = None
     _num_passages: int = 0
+    # Cumulative pid count up to (but not including) each file, so
+    # `bisect_right(_file_start_pids, pid) - 1` resolves a pid to the
+    # owning file in O(log num_files). Lets the parallel sampler skip
+    # files that own no sampled pids.
+    _file_start_pids: list[int] | None = None
+    # Per-file `cumsum(sidecar)` with a leading 0, so a doc's row range
+    # in its file is `token_offsets[i:i+2]`. Avoids re-walking sidecars
+    # in the inner loop.
+    _file_token_offsets: list[np.ndarray] | None = None
 
     def _load_metadata(self) -> None:
         if self._files_and_doclens is not None:
@@ -97,22 +108,141 @@ class DiskSource:
         files = _get_all_embedding_files(self.path)
         self._doclens = []
         self._files_and_doclens = []
+        self._file_start_pids = []
+        self._file_token_offsets = []
+        self._num_passages = 0
 
+        pid_offset = 0
         for file in files:
             doclens_file = _doclens_path_for(file)
-            sidecar = np.load(doclens_file)
-            self._num_passages += len(sidecar)
-            sidecar_list = sidecar.tolist()
-            self._doclens.extend(sidecar_list)
-            self._files_and_doclens.append((file, sidecar_list))
+            sidecar = np.load(doclens_file).astype(np.int64, copy=False)
+            self._num_passages += int(len(sidecar))
+            self._doclens.extend(sidecar.tolist())
+            self._files_and_doclens.append((file, sidecar))
+            self._file_start_pids.append(pid_offset)
+
+            token_offsets = np.empty(len(sidecar) + 1, dtype=np.int64)
+            token_offsets[0] = 0
+            if len(sidecar) > 0:
+                np.cumsum(sidecar, out=token_offsets[1:])
+            self._file_token_offsets.append(token_offsets)
+            pid_offset += int(len(sidecar))
 
     def get_num_passages(self) -> int:
         """Get the number of passages."""
         self._load_metadata()
         return self._num_passages
 
-    def sample_embeddings(self, pids: list[int]) -> tuple[torch.Tensor, int, int]:
-        """Sample the embeddings based on the pids."""
+    def sample_embeddings(
+        self, pids: list[int]
+    ) -> tuple[torch.Tensor, int, int]:
+        """Sample the embeddings based on the pids.
+
+        Default: targeted parallel implementation. Set
+        ``XTR_WARP_DISK_SAMPLE_MODE=serial`` to fall back to the legacy
+        scan-every-file loop (mainly useful for A/B regression checks).
+        """
+        mode = os.environ.get(
+            "XTR_WARP_DISK_SAMPLE_MODE", "parallel"
+        ).strip().lower()
+        if mode in {"serial", "legacy"}:
+            return self._sample_embeddings_serial(pids)
+        return self._sample_embeddings_parallel(pids)
+
+    def _sample_embeddings_parallel(
+        self, pids: list[int]
+    ) -> tuple[torch.Tensor, int, int]:
+        """Read only files that own a sampled pid; copy the per-doc
+        slices via mmap; parallelize across files on a thread pool.
+
+        NumPy disk reads / mmap page faults release the GIL, so threads
+        parallelize this I/O-bound work effectively.
+        """
+        self._load_metadata()
+        if not pids:
+            raise ValueError("No passage IDs provided for sampling")
+        assert self._files_and_doclens is not None
+        assert self._file_start_pids is not None
+        assert self._file_token_offsets is not None
+        assert self._doclens is not None
+
+        # Match the legacy implementation's emission order (ascending
+        # pid for unique pids), so the output tensor is byte-for-byte
+        # compatible with the serial path.
+        ordered_pids = sorted(set(pids))
+        total_tokens = sum(self._doclens[pid] for pid in ordered_pids)
+
+        requests_by_file: dict[int, list[tuple[int, int, int]]] = {}
+        write_offset = 0
+        for pid in ordered_pids:
+            file_idx = bisect_right(self._file_start_pids, pid) - 1
+            local_doc_idx = pid - self._file_start_pids[file_idx]
+            doc_len = int(self._doclens[pid])
+            requests_by_file.setdefault(file_idx, []).append(
+                (local_doc_idx, write_offset, doc_len)
+            )
+            write_offset += doc_len
+
+        active_file_indices = sorted(requests_by_file.keys())
+        if not active_file_indices:
+            raise ValueError("Could not sample embeddings from source")
+
+        # Probe the first hit file for dim/dtype (mmap a single row, copy
+        # to a fresh buffer to avoid the mmap-readonly torch warning).
+        first_file_path = self._files_and_doclens[active_file_indices[0]][0]
+        first_data = np.load(first_file_path, mmap_mode="r")
+        dim = int(first_data.shape[-1])
+        dtype = torch.from_numpy(np.array(first_data[:1], copy=True)).dtype
+        del first_data
+
+        tensors = torch.empty((total_tokens, dim), dtype=dtype)
+
+        max_workers_env = os.environ.get(
+            "XTR_WARP_DISK_SAMPLE_WORKERS", ""
+        ).strip()
+        if max_workers_env:
+            try:
+                max_workers = max(1, int(max_workers_env))
+            except ValueError:
+                max_workers = min(
+                    len(active_file_indices), os.cpu_count() or 1, 8
+                )
+        else:
+            max_workers = min(
+                len(active_file_indices), os.cpu_count() or 1, 8
+            )
+
+        def _copy_file_samples(file_idx: int) -> None:
+            file_path, _ = self._files_and_doclens[file_idx]
+            token_offsets = self._file_token_offsets[file_idx]
+            data = np.load(file_path, mmap_mode="r")
+            for local_doc_idx, out_off, doc_len in requests_by_file[file_idx]:
+                tok_off = int(token_offsets[local_doc_idx])
+                doc = torch.from_numpy(
+                    np.array(data[tok_off : tok_off + doc_len], copy=True)
+                )
+                tensors[out_off : out_off + doc_len].copy_(doc)
+
+        if max_workers <= 1 or len(active_file_indices) == 1:
+            for file_idx in active_file_indices:
+                _copy_file_samples(file_idx)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(_copy_file_samples, file_idx)
+                    for file_idx in active_file_indices
+                ]
+                for fut in as_completed(futures):
+                    fut.result()
+
+        return tensors, total_tokens, dim
+
+    def _sample_embeddings_serial(
+        self, pids: list[int]
+    ) -> tuple[torch.Tensor, int, int]:
+        """Legacy implementation: scans every embedding file. Kept as
+        an opt-in fallback via ``XTR_WARP_DISK_SAMPLE_MODE=serial``.
+        """
         self._load_metadata()
 
         sampled_pid_set = set(pids)
@@ -132,7 +262,7 @@ class DiskSource:
                 tensors = torch.empty((total_tokens, dim), dtype=data.dtype)
 
             offset = 0
-            for doc_len in sidecar:
+            for doc_len in sidecar.tolist():
                 if doc_offset in sampled_pid_set:
                     doc = data[offset : offset + doc_len]
                     tensors[write_offset : write_offset + doc_len].copy_(doc)
@@ -141,7 +271,7 @@ class DiskSource:
                     remaining -= 1
                     if remaining == 0:
                         break
-                offset += doc_len
+                offset += int(doc_len)
                 doc_offset += 1
 
             del data
