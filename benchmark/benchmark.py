@@ -1,8 +1,7 @@
 # /// script
 # dependencies = [
-#    "pylate>=1.3.3",
 #    "beir>=2.2.0",
-#    "fast_plaid",
+#    "fast_plaid==1.4.5.290",
 #    "ranx",
 #    "psutil",
 #    "pyyaml",
@@ -240,9 +239,8 @@ def _load_documents_embeddings(embeddings_dir: Path) -> list[torch.Tensor]:
 
 
 def measure_single_query_latency(
-    index,
     queries_embeddings,
-    config,
+    search_fn,
     *,
     num_samples: int = 200,
     warmup: int = 20,
@@ -255,6 +253,10 @@ def measure_single_query_latency(
     before starting and after finishing each measurement so the timer
     captures end-to-end latency (submission + kernels + D2H), not just
     async submission.
+
+    `search_fn(query_tensor)` is a framework-specific closure that performs
+    exactly one search — callers bind their own config (num_threads, nprobe,
+    n_ivf_probe, etc.) inside the closure.
 
     `warmup` iterations are run first and discarded; they're noisy from
     CUDA context/JIT init, caching-allocator warmup, and cold page faults.
@@ -281,17 +283,7 @@ def measure_single_query_latency(
         if cuda:
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        _ = index.search(
-            queries_embeddings=q,
-            top_k=config["top_k"],
-            num_threads=config.get("num_threads", 1),
-            nprobe=config.get("nprobe"),
-            bound=config.get("bound"),
-            t_prime=config.get("t_prime"),
-            max_candidates=config.get("max_candidates"),
-            centroid_score_threshold=config.get("centroid_score_threshold"),
-            batch_size=1,
-        )
+        _ = search_fn(q)
         if cuda:
             torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -419,8 +411,22 @@ def run_xtr_warp(
         f"🔬 Measuring single-query latency on {dataset_name} "
         f"(200 sequential searches, 20 warmup)..."
     )
+
+    def _xtr_warp_single_search(q):
+        return index.search(
+            queries_embeddings=q,
+            top_k=config["top_k"],
+            num_threads=config.get("num_threads", 1),
+            nprobe=config.get("nprobe"),
+            bound=config.get("bound"),
+            t_prime=config.get("t_prime"),
+            max_candidates=config.get("max_candidates"),
+            centroid_score_threshold=config.get("centroid_score_threshold"),
+            batch_size=1,
+        )
+
     latency_stats = measure_single_query_latency(
-        index, queries_embeddings, config, num_samples=200, warmup=20
+        queries_embeddings, _xtr_warp_single_search, num_samples=200, warmup=20
     )
     if latency_stats is not None:
         print(
@@ -691,6 +697,35 @@ def run_fast_plaid(
         f"\t✅ {dataset_name} search: {heavy_search_time:.2f} seconds ({queries_per_second:.2f} QPS)"
     )
 
+    # Single-query latency: 200 sequential searches, 20 warmup.
+    print(
+        f"🔬 Measuring single-query latency on {dataset_name} "
+        f"(200 sequential searches, 20 warmup)..."
+    )
+
+    def _fast_plaid_single_search(q):
+        return index.search(
+            queries_embeddings=q,
+            top_k=config["top_k"],
+            n_ivf_probe=config.get("n_ivf_probe", 8),
+            n_full_scores=config.get("n_full_scores", 4096),
+        )
+
+    latency_stats = measure_single_query_latency(
+        queries_embeddings, _fast_plaid_single_search, num_samples=200, warmup=20
+    )
+    if latency_stats is not None:
+        print(
+            f"\t✅ {dataset_name} latency (ms): "
+            f"p50={latency_stats['p50_ms']:.2f}  "
+            f"p95={latency_stats['p95_ms']:.2f}  "
+            f"p99={latency_stats['p99_ms']:.2f}  "
+            f"mean={latency_stats['mean_ms']:.2f}  "
+            f"min={latency_stats['min_ms']:.2f}  "
+            f"max={latency_stats['max_ms']:.2f}  "
+            f"(n={latency_stats['samples']})"
+        )
+
     results = []
     for (query_id, _), query_scores in zip(queries.items(), scores, strict=True):
         results.append(
@@ -722,6 +757,7 @@ def run_fast_plaid(
         "size": len(documents),
         "queries": len(queries),
         "scores": evaluation_scores,
+        "latency": latency_stats,
         "memory": {
             "indexing": {
                 "cpu_increase_mb": index_memory["cpu_increase_mb"],
