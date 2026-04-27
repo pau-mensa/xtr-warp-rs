@@ -8,16 +8,16 @@ on:
         required: true
         type: string
       torch_suffix:
-        description: "Torch suffix (270/280/290)"
+        description: "Torch suffix (270/280/290/2100/2110)"
         required: true
         type: choice
-        options: ["270", "280", "290"]
+        options: ["270", "280", "290", "2100", "2110"]
       torch_version:
-        description: 'Torch pinned version (e.g. "2.9.0")'
+        description: 'Torch pinned version (e.g. "2.11.0")'
         required: true
         type: string
       torch_req:
-        description: 'Torch requirement metadata (e.g. "torch>=2.9,<2.10")'
+        description: 'Torch requirement metadata (e.g. "torch>=2.11,<2.12")'
         required: true
         type: string
   workflow_call:
