@@ -4,6 +4,7 @@ pub mod centroid_selector;
 pub mod decompressor;
 pub mod loader;
 pub mod merger;
+mod candidate_assembly;
 pub mod sharded_scorer;
 
 // Re-export main types for convenience

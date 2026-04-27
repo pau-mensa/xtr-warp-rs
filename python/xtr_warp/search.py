@@ -719,6 +719,7 @@ class XTRWarp:
         centroid_score_threshold: float | None = None,
         batch_size: int | None = 8192,
         subset: list[list[int]] | list[int] | None = None,
+        cuda_streams: int | None = None,
         show_progress: bool = True,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
@@ -750,6 +751,11 @@ class XTRWarp:
             - ``list[int]``: a single subset applied to every query.
             - ``list[list[int]]``: per-query subsets whose length must equal
               the number of queries.
+        cuda_streams:
+            Size of the per-device CUDA stream pool used by both the Pass
+            A3 merger fan-out and the Phase-2 decompress fan-out. ``None``
+            uses the built-in default (8). Set to 0 or 1 to disable
+            fan-out and run on the default stream. Ignored on CPU.
 
         """
         if self._searcher is None or self.devices is None:
@@ -839,6 +845,7 @@ class XTRWarp:
             centroid_score_threshold=centroid_score_threshold,
             max_codes_per_centroid=None,
             max_candidates=max_candidates,
+            cuda_streams=cuda_streams,
         )
         torch_path = self._ensure_torch_initialized(device)
 

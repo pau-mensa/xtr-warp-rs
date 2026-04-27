@@ -91,18 +91,12 @@ pub struct SearchConfig {
     #[pyo3(get, set)]
     pub max_candidates: Option<usize>,
 
-    /// Size of the per-device CUDA stream pool used by the Pass A3
-    /// merger and multi-CUDA Phase-2 fan-out. `None` uses the built-in
-    /// default. Set to 0 or 1 to disable (fall back to default stream).
+    /// Size of the per-device CUDA stream pool used by both the Pass A3
+    /// merger fan-out and the Phase-2 decompress fan-out (single- and
+    /// multi-CUDA). `None` uses the built-in default. Set to 0 or 1 to
+    /// disable fan-out and run on the default stream.
     #[pyo3(get, set)]
-    pub merger_streams: Option<usize>,
-
-    /// When true (default), the per-shard sharded scorer fans
-    /// decompresses across multiple streams when more than one query
-    /// in the batch has work on a shard. Set to false to force the
-    /// single-stream path.
-    #[pyo3(get, set)]
-    pub decompress_parallel: bool,
+    pub cuda_streams: Option<usize>,
 }
 
 #[pymethods]
@@ -121,8 +115,7 @@ impl SearchConfig {
         centroid_score_threshold=None,
         max_codes_per_centroid=None,
         max_candidates=None,
-        merger_streams=None,
-        decompress_parallel=true,
+        cuda_streams=None,
     ))]
     fn new(
         k: usize,
@@ -135,8 +128,7 @@ impl SearchConfig {
         centroid_score_threshold: Option<f32>,
         max_codes_per_centroid: Option<u32>,
         max_candidates: Option<usize>,
-        merger_streams: Option<usize>,
-        decompress_parallel: bool,
+        cuda_streams: Option<usize>,
     ) -> Self {
         Self {
             k,
@@ -149,8 +141,7 @@ impl SearchConfig {
             centroid_score_threshold,
             max_codes_per_centroid,
             max_candidates,
-            merger_streams,
-            decompress_parallel,
+            cuda_streams,
         }
     }
 }
@@ -168,8 +159,7 @@ impl Default for SearchConfig {
             centroid_score_threshold: None,
             max_codes_per_centroid: None,
             max_candidates: None,
-            merger_streams: None,
-            decompress_parallel: true,
+            cuda_streams: None,
         }
     }
 }

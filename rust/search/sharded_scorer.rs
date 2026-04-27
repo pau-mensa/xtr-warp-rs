@@ -31,6 +31,7 @@ use crate::utils::maybe_progress;
 use crate::search::centroid_selector::CentroidSelector;
 use crate::search::decompressor::CentroidDecompressor;
 use crate::search::merger::{MergerConfig, ResultMerger};
+use crate::search::candidate_assembly::{assemble_query_flats, concat_query_flats, BatchFlats};
 use crate::utils::types::{
     DecompressedCentroidsOutput, IndexShard, Query, ReadOnlyTensor, SearchConfig, SearchResult,
     ShardedIndex,
@@ -159,12 +160,12 @@ fn decompress_query_shard(
 ///
 /// CUDA shards batch their D2H inside `prepare_batch` before populating this;
 /// CPU shards write directly into it.
-struct ShardOut {
-    capacities: Vec<i64>,
-    sizes: Vec<i32>,
-    offsets: Vec<i64>,
-    passage_ids: Vec<i64>,
-    scores: Vec<f32>,
+pub(super) struct ShardOut {
+    pub(super) capacities: Vec<i64>,
+    pub(super) sizes: Vec<i32>,
+    pub(super) offsets: Vec<i64>,
+    pub(super) passage_ids: Vec<i64>,
+    pub(super) scores: Vec<f32>,
 }
 
 /// Per-query decompress output for one CUDA shard, still on the GPU.
@@ -334,7 +335,7 @@ fn batched_d2h_lanes(lanes: Vec<ShardLane>) -> Result<Vec<(usize, ShardOut)>> {
 /// Marked `Sync` so the CPU-shard rayon scope can borrow `&[Option<QueryState>]`.
 /// `mse_estimate` is a `Tensor` (not `Sync`) but is never mutated after creation
 /// — same invariant as `ReadOnlyTensor`.
-struct QueryState {
+pub(super) struct QueryState {
     mse_estimate: Tensor,
     /// Selected centroid IDs, on CPU (one entry per cell).
     ids: Vec<i64>,
@@ -346,6 +347,15 @@ struct QueryState {
     shard_cells: Vec<Vec<usize>>,
     /// Number of selected cells for this query.
     num_cells: usize,
+}
+
+impl QueryState {
+    /// Read-only view used by `candidate_assembly`. Returning just the two
+    /// fields it needs keeps `mse_estimate` unreachable from outside this
+    /// module, which is what makes the manual `Sync` impl below sound.
+    pub(super) fn assembly_view(&self) -> (usize, &[Vec<usize>]) {
+        (self.num_cells, &self.shard_cells)
+    }
 }
 
 // SAFETY: see struct docs — `mse_estimate` read-only after creation.
@@ -385,18 +395,19 @@ pub struct ShardedScorer {
     batch_size: i64,
     /// sizes_compacted pre-moved to scoring_device (avoids per-query transfer).
     sizes_on_scoring_device: Tensor,
-    /// Pool of CUDA streams for Pass A3 round-robin submission. Empty
-    /// when the shim isn't available or `config.merger_streams` is 0.
-    /// Per-query merger kernels are submitted to `streams[i % N]` so
-    /// the mid-merger `unique_consecutive` syncs don't serialize the
-    /// whole batch on the default stream.
+    /// Pool of CUDA streams used by both the Pass A3 merger fan-out and
+    /// the single-CUDA Phase-2 decompress fan-out. Empty when the shim
+    /// isn't available or `config.cuda_streams` is 0. Per-query kernels
+    /// are submitted to `streams[i % N]` so the mid-merger
+    /// `unique_consecutive` syncs don't serialize the whole batch on
+    /// the default stream.
     #[cfg(xtr_has_cuda_shim)]
-    merger_streams: Option<StreamPool>,
+    cuda_streams: Option<StreamPool>,
     /// Per-shard stream pools, populated only when there are 2+ CUDA
     /// shards. Each CUDA shard's slot holds a pool on that shard's
     /// device so Phase 2 can fan its decompresses across multiple
     /// devices concurrently. CPU shards and single-CUDA configs hold
-    /// `None` (the latter keeps using `merger_streams` from the
+    /// `None` (the latter keeps using `cuda_streams` from the
     /// existing fast path). Indexed by shard position.
     #[cfg(xtr_has_cuda_shim)]
     shard_streams: Vec<Option<StreamPool>>,
@@ -462,11 +473,11 @@ impl ShardedScorer {
         let sizes_on_scoring_device = shared.sizes_compacted.to_device(scoring_device);
 
         #[cfg(xtr_has_cuda_shim)]
-        let merger_pool_size = config.merger_streams.unwrap_or(DEFAULT_MERGER_STREAMS);
+        let stream_pool_size = config.cuda_streams.unwrap_or(DEFAULT_MERGER_STREAMS);
         #[cfg(xtr_has_cuda_shim)]
-        let merger_streams = match scoring_device {
+        let cuda_streams = match scoring_device {
             Device::Cuda(ix) => {
-                let pool = StreamPool::for_device(ix as i32, merger_pool_size);
+                let pool = StreamPool::for_device(ix as i32, stream_pool_size);
                 if pool.is_empty() {
                     None
                 } else {
@@ -478,7 +489,7 @@ impl ShardedScorer {
 
         // Per-shard stream pools for multi-CUDA Phase 2 fan-out. Only
         // built when there are 2+ CUDA shards — single-CUDA configs
-        // continue to use `merger_streams` for Phase 2.
+        // continue to use `cuda_streams` for Phase 2.
         // Each pool is bound to its shard's device so kernels
         // launched on it land on the right GPU.
         #[cfg(xtr_has_cuda_shim)]
@@ -490,7 +501,7 @@ impl ShardedScorer {
                     .iter()
                     .map(|shard| match shard.device {
                         Device::Cuda(ix) => {
-                            let pool = StreamPool::for_device(ix as i32, merger_pool_size);
+                            let pool = StreamPool::for_device(ix as i32, stream_pool_size);
                             if pool.is_empty() {
                                 None
                             } else {
@@ -516,7 +527,7 @@ impl ShardedScorer {
             batch_size,
             sizes_on_scoring_device,
             #[cfg(xtr_has_cuda_shim)]
-            merger_streams,
+            cuda_streams,
             #[cfg(xtr_has_cuda_shim)]
             shard_streams,
         })
@@ -685,7 +696,7 @@ impl ShardedScorer {
     /// Phase 2 GPU: per-CUDA-shard decompression. Writes `shard_outs[b][si]`
     /// for each CUDA shard `si` and every query `b` that has cells in it.
     /// CPU shards are skipped (handled by the orchestrator's rayon spawn).
-    /// Runs on the calling thread; when the CUDA shim and merger_streams
+    /// Runs on the calling thread; when the CUDA shim and cuda_streams
     /// are available it fans per-query decompress launches out across the
     /// stream pool via `thread_pool.install` (Path C).
     fn phase_2_gpu_batch(
@@ -738,13 +749,13 @@ impl ShardedScorer {
         }
 
         // Single-CUDA / non-shim serial path. Each CUDA shard fans out
-        // across `merger_streams` (the existing pool — shared with Pass
+        // across `cuda_streams` (the existing pool — shared with Pass
         // A3, which runs after this phase, so no contention).
         for si in cuda_shards {
             #[cfg(xtr_has_cuda_shim)]
             let items = self.phase_2_one_cuda_shard(
                 si,
-                self.merger_streams.as_ref(),
+                self.cuda_streams.as_ref(),
                 per_query,
                 batch_queries,
                 subsets,
@@ -804,8 +815,7 @@ impl ShardedScorer {
         let parallel_available;
         #[cfg(xtr_has_cuda_shim)]
         {
-            parallel_available = self.config.decompress_parallel
-                && parallel_pool.map_or(false, |p| p.len() > 1);
+            parallel_available = parallel_pool.map_or(false, |p| p.len() > 1);
         }
         #[cfg(not(xtr_has_cuda_shim))]
         {
@@ -879,7 +889,7 @@ impl ShardedScorer {
                 }
             }
         } else {
-            // Serial fallback: no shim, pool disabled, env opt-out, or
+            // Serial fallback: no shim, pool disabled, or
             // single-candidate batch.
             for &b in &candidates {
                 let qs = per_query[b]
@@ -1189,7 +1199,7 @@ impl ShardedScorer {
             }
             let topk = gpu_topk[b].take().unwrap();
             #[cfg(xtr_has_cuda_shim)]
-            if let Some(pool) = self.merger_streams.as_ref() {
+            if let Some(pool) = self.cuda_streams.as_ref() {
                 if let Some(s) = pool.get(topk.lane_idx) {
                     s.synchronize();
                 }
@@ -1224,7 +1234,7 @@ impl ShardedScorer {
             batch_len,
             per_query,
             mut batch_results,
-            mut shard_outs,
+            shard_outs,
             ..
         } = current;
 
@@ -1232,75 +1242,26 @@ impl ShardedScorer {
 
         // Pass A1a: parallel per-query CPU assembly. `shard_outs` is always
         // CPU-resident by this point (CUDA D2H already happened upstream).
-        type QueryFlats = (Vec<i64>, Vec<i32>, Vec<i64>, Vec<f32>);
-        let query_flats: Vec<Option<QueryFlats>> = self.thread_pool.install(|| {
-            shard_outs
-                .par_iter_mut()
-                .enumerate()
-                .map(|(b, shard_outs_b)| -> Option<QueryFlats> {
-                    if batch_results[b].is_some() {
-                        return None;
-                    }
-                    let qs = per_query[b].as_ref().unwrap();
-                    let nc = qs.num_cells;
-
-                    let mut g_cap = vec![0i64; nc];
-                    let mut g_sizes = vec![0i32; nc];
-                    let mut g_pids: Vec<Vec<i64>> = vec![Vec::new(); nc];
-                    let mut g_scores: Vec<Vec<f32>> = vec![Vec::new(); nc];
-
-                    for si in 0..num_shards {
-                        let cells = &qs.shard_cells[si];
-                        if cells.is_empty() {
-                            continue;
-                        }
-                        let out = match shard_outs_b[si].take() {
-                            Some(out) => out,
-                            None => continue,
-                        };
-
-                        for (local, &gc) in cells.iter().enumerate() {
-                            g_cap[gc] = out.capacities[local];
-                            g_sizes[gc] = out.sizes[local];
-                            let s = out.offsets[local] as usize;
-                            let e = out.offsets[local + 1] as usize;
-                            g_pids[gc] = out.passage_ids[s..e].to_vec();
-                            g_scores[gc] = out.scores[s..e].to_vec();
-                        }
-                    }
-
-                    let mut flat_pids: Vec<i64> = Vec::new();
-                    let mut flat_scores: Vec<f32> = Vec::new();
-                    for i in 0..nc {
-                        flat_pids.extend(&g_pids[i]);
-                        flat_scores.extend(&g_scores[i]);
-                    }
-
-                    Some((g_cap, g_sizes, flat_pids, flat_scores))
-                })
-                .collect()
-        });
+        let early_resolved: Vec<bool> = batch_results.iter().map(Option::is_some).collect();
+        let query_flats = assemble_query_flats(
+            &self.thread_pool,
+            num_shards,
+            &early_resolved,
+            &per_query,
+            shard_outs,
+        );
 
         // Pass A1b: serial concat into master arrays (preserves batch order).
-        let mut active: Vec<usize> = Vec::with_capacity(batch_len);
-        let mut all_caps: Vec<i64> = Vec::new();
-        let mut all_sizes: Vec<i32> = Vec::new();
-        let mut all_pids: Vec<i64> = Vec::new();
-        let mut all_scores: Vec<f32> = Vec::new();
-        let mut cell_offsets: Vec<usize> = vec![0];
-        let mut cand_offsets: Vec<usize> = vec![0];
-
-        for (b, result) in query_flats.into_iter().enumerate() {
-            if let Some((g_cap, g_sizes, flat_pids, flat_scores)) = result {
-                all_caps.extend_from_slice(&g_cap);
-                all_sizes.extend_from_slice(&g_sizes);
-                all_pids.extend(flat_pids);
-                all_scores.extend(flat_scores);
-                cell_offsets.push(all_caps.len());
-                cand_offsets.push(all_pids.len());
-                active.push(b);
-            }
-        }
+        let batch_flats = concat_query_flats(query_flats, batch_len);
+        let BatchFlats {
+            active,
+            capacities: all_caps,
+            sizes: all_sizes,
+            passage_ids: all_pids,
+            scores: all_scores,
+            cell_offsets,
+            cand_offsets,
+        } = batch_flats;
 
         let mut gpu_topk: Vec<Option<DeferredTopK>> = if use_defer_d2h {
             (0..batch_len).map(|_| None).collect()
@@ -1309,7 +1270,7 @@ impl ShardedScorer {
         };
 
         #[cfg(xtr_has_cuda_shim)]
-        let num_streams = self.merger_streams.as_ref().map(|p| p.len()).unwrap_or(0);
+        let num_streams = self.cuda_streams.as_ref().map(|p| p.len()).unwrap_or(0);
         #[cfg(not(xtr_has_cuda_shim))]
         let num_streams: usize = 0;
 
@@ -1356,7 +1317,7 @@ impl ShardedScorer {
                         _ => unreachable!("parallel_a3 implies CUDA"),
                     };
                     let pool = self
-                        .merger_streams
+                        .cuda_streams
                         .as_ref()
                         .expect("parallel_a3 implies pool exists");
 
@@ -1581,7 +1542,7 @@ impl ShardedScorer {
             let mut results: Vec<SearchResult> = Vec::with_capacity(n_queries);
 
             #[cfg(xtr_has_cuda_shim)]
-            let use_streams = self.merger_streams.as_ref().map_or(false, |p| p.len() > 1)
+            let use_streams = self.cuda_streams.as_ref().map_or(false, |p| p.len() > 1)
                 && matches!(self.scoring_device, Device::Cuda(_));
             #[cfg(not(xtr_has_cuda_shim))]
             let use_streams = false;
@@ -1625,7 +1586,7 @@ impl ShardedScorer {
                 if use_streams && active.len() > 1 {
                     #[cfg(xtr_has_cuda_shim)]
                     {
-                        let pool = self.merger_streams.as_ref().unwrap();
+                        let pool = self.cuda_streams.as_ref().unwrap();
                         let device_ix = match self.scoring_device {
                             Device::Cuda(ix) => ix as i32,
                             _ => unreachable!("use_streams implies CUDA"),
