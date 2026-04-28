@@ -161,23 +161,6 @@ idx.compact()
 |  | ndcg@10 | 0.25 | 0.24 |
 |  | recall@10 | 0.16 | 0.16 |
 
-#### Latency
-
-Per-query latency on CUDA, in milliseconds:
-
-| Dataset (Size) | mean fast-plaid | mean xtr-warp-rs | p99 xtr-warp-rs |
-|----------------|-----------------|------------------|-----------------|
-| arguana (8,674) | 13.53 | 1.73 | 1.94 |
-| fiqa (57,638) | 16.91 | 2.07 | 2.55 |
-| nfcorpus (3,633) | 13.09 | 1.66 | 1.89 |
-| quora (522,931) | 7.85 | 2.07 | 2.52 |
-| scidocs (25,657) | 13.78 | 1.96 | 2.16 |
-| scifact (5,183) | 14.80 | 2.07 | 2.64 |
-| trec-covid (171,332) | 31.07 | 4.27 | 5.34 |
-| webis-touche2020 (382,545) | 27.78 | 3.30 | 4.37 |
-
-p99 stays under **6 ms** across all datasets and the tail is tight enough to plan around.
-
 ### CPU
 
 #### Search Speed
