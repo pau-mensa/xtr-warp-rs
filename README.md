@@ -176,8 +176,6 @@ idx.compact()
 | trec-covid (171,332) | 2.73 | 21.84 (+700.0%) | 186.08 (+6716.5%) |
 | webis-touche2020 (382,545) | 3.58 | 40.59 (+1033.8%) | 303.57 (+8378.8%) |
 
-Multi-thread p99 stays within ~7 ms of mean on most datasets (quora and trec-covid have wider tails due to longer queries).
-
 #### Search Memory
 
 | Dataset (Size) | Peak fast-plaid (GB) | Peak xtr-warp-rs (GB) |
@@ -208,13 +206,11 @@ The table below compares pure CUDA against a 10/90 GPU/CPU shard. Sharded mode t
 | arguana (8,674) | 6.28 | 5.68 (-10%) | 2706.59 | 1341.49 |
 | fiqa (57,638) | 3.72 | 2.73 (-27%) | 2423.17 | 1334.50 |
 | nfcorpus (3,633) | 0.85 | 0.46 (-46%) | 3208.68 | 1732.16 |
-| quora (522,931) | 18.54 | 16.38 (-12%) | 2182.62 | 1155.82 |
+| quora (522,931) | 18.54 | 16.38 (-12%) | 2404.28 | 1155.82 |
 | scidocs (25,657) | 7.13 | 6.06 (-15%) | 1830.73 | 1117.98 |
 | scifact (5,183) | 1.42 | 1.04 (-27%) | 3063.71 | 1666.75 |
 | trec-covid (171,332) | 6.74 | 1.38 (-80%) | 340.14 | 254.14 |
 | webis-touche2020 (382,545) | 5.78 | 0.86 (-85%) | 741.70 | 615.12 |
-
-Per-query latency stays single-digit: p99 is under **6.5 ms** across all 8 datasets, within ~1.5 ms of mean.
 
 ### Streamed Indexing
 
@@ -277,7 +273,7 @@ The `create()` method accepts embeddings from multiple sources:
 ```python
 Parameter                  Default     Description
 embeddings_source          required    Source of document embeddings (see above)
-device                     required    Device to use for index creation (e.g., "cpu", "cuda", "mps")
+device                     required    Device to use for index creation (e.g., "cpu", "cuda")
 kmeans_niters              4           K-means iterations for clustering
 max_points_per_centroid    256         Maximum points per centroid during K-means
 nbits                      4           Product quantization bits for compression
@@ -288,7 +284,7 @@ metadata                   None        List of dicts (one per document) for meta
 ```
 
 > [!IMPORTANT]
-> Highly recommended to build the index using `cuda` devices. For a large corpus using `cpu` or even `mps` can take forever.
+> Highly recommended to build the index using `cuda` devices. For a large corpus using `cpu` can take forever.
 
 > [!NOTE]
 > When using path-based inputs, embeddings files must be 2D tensors (not 3D padded tensors) with accompanying `.doclens.npy` sidecars. See the streaming subsection below for format details.
@@ -345,9 +341,6 @@ device                    "auto"         Where to load the index. Accepts a sing
 dtype                     torch.float32  Dtype to use for the centroids and bucket weights. Lowers the memory footprint but can cause alterations in retrieval metrics
 mmap                      True           Whether or not to load the large tensors ("codes" and "residuals") using memory mapping. Applied to CPU shards only when sharding is enabled
 ```
-
-> [!WARNING]
-> The operator `aten::unique_dim` is not implemented in torch for the `mps` device, so if you want to use it you will need to set up the env var `PYTORCH_ENABLE_MPS_FALLBACK=1`, which fallbacks to the CPU
 
 ### Index Mutability
 
