@@ -146,11 +146,21 @@ jobs:
           CIBW_PIP_ARGS: "--no-cache-dir --no-build-isolation"
           CIBW_BEFORE_BUILD: "pip install torch==${{ inputs.torch_version }} numpy maturin delvewheel"
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
-            LD_LIBRARY_PATH=$(python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):$LD_LIBRARY_PATH auditwheel repair -w {dest_dir} {wheel} --exclude libtorch.so --exclude libtorch_cpu.so --exclude libtorch_python.so
+            LD_LIBRARY_PATH=$(python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):$LD_LIBRARY_PATH
+            auditwheel repair -w {dest_dir} {wheel}
+            --exclude libtorch.so --exclude libtorch_cpu.so --exclude libtorch_python.so
+            --exclude libtorch_cuda.so --exclude libtorch_cuda_cu.so --exclude libtorch_cuda_cpp.so
+            --exclude libtorch_cuda_linalg.so --exclude libtorch_global_deps.so --exclude libtorch_nvshmem.so
+            --exclude libc10.so --exclude libc10_cuda.so --exclude libshm.so
+            --exclude libcudart.so.13 --exclude libcudart.so.12
+            --exclude libnvToolsExt.so.1 --exclude libnvJitLink.so.13 --exclude libnvJitLink.so.12
           CIBW_REPAIR_WHEEL_COMMAND_MACOS: >
-            DYLD_LIBRARY_PATH=$(python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))') delocate-wheel -w {dest_dir} -v {wheel} --exclude libtorch.dylib --exclude libtorch_cpu.dylib --exclude libtorch_python.dylib
+            DYLD_LIBRARY_PATH=$(python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')
+            delocate-wheel -w {dest_dir} -v {wheel}
+            --exclude libtorch.dylib --exclude libtorch_cpu.dylib --exclude libtorch_python.dylib
+            --exclude libc10.dylib --exclude libshm.dylib
           CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
-            FOR /F "usebackq tokens=*" %i IN (`python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"`) DO (set "PATH=%i;%PATH%" && delvewheel repair -w {dest_dir} {wheel} --no-dll torch.dll --no-dll torch_cpu.dll --no-dll torch_python.dll)
+            FOR /F "usebackq tokens=*" %i IN (`python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"`) DO (set "PATH=%i;%PATH%" && delvewheel repair -w {dest_dir} {wheel} --no-dll torch.dll --no-dll torch_cpu.dll --no-dll torch_python.dll --no-dll torch_cuda.dll --no-dll torch_global_deps.dll --no-dll c10.dll --no-dll c10_cuda.dll --no-dll shm.dll)
 
       - name: Upload wheels to artifact
         uses: actions/upload-artifact@v4

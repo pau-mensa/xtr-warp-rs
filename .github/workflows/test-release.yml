@@ -36,6 +36,19 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          uv pip install -v "xtr-warp-rs==${{ inputs.release_tag }}"
+          # --refresh bypasses uv's HTTP cache so we don't hit a stale simple
+          # index from before the new wheels were uploaded. Retry a few times
+          # in case PyPI's CDN edge hasn't propagated the new release yet.
+          for attempt in 1 2 3 4 5; do
+            if uv pip install -v --refresh "xtr-warp-rs==${{ inputs.release_tag }}"; then
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "install failed after 5 attempts" >&2
+              exit 1
+            fi
+            echo "install attempt $attempt failed; sleeping 30s before retry"
+            sleep 30
+          done
           uv pip install pytest pytest-cov
           pytest tests/test.py tests/test_index_management.py tests/test_filtering.py
