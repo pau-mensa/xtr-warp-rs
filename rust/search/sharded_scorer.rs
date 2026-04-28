@@ -196,6 +196,7 @@ impl ShardLane {
 struct DeferredTopK {
     pids: Tensor,
     scores: Tensor,
+    #[cfg_attr(not(xtr_has_cuda_shim), allow(dead_code))]
     lane_idx: usize,
 }
 
@@ -1538,6 +1539,7 @@ impl ShardedScorer {
             // the GPU until a single deferred-D2H pass at the end of each
             // batch — no CPU-assembly roundtrip, unlike the multi-shard
             // Phase 3 (which needs one to merge CPU-shard outputs in).
+            #[cfg(xtr_has_cuda_shim)]
             let nprobe = self.config.nprobe as usize;
             let mut results: Vec<SearchResult> = Vec::with_capacity(n_queries);
 
