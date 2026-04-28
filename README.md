@@ -25,14 +25,11 @@ xtr-warp-rs is a high-performance implementation of the **WARP** engine for mult
 
 Compared to the current SOTA (FastPlaid), xtr-warp-rs focuses on doing less work per query while staying close in quality: it prunes the centroid/posting-list space per token, uses an error-aware merge that keeps ranking stable with fewer examined candidates, and keeps the hot path (selection → decompression → merge) highly optimized and parallel friendly.
 
-**Speed**: Achieves **3-10x** speedup on CUDA and **8-190x** on CPU (depending on dataset and thread count) vs FastPlaid.
+**Speed**: Achieves **10-40x** speedup on CUDA and **4-130x** on CPU (depending on dataset and thread count) vs FastPlaid.
 
-**Memory**: During search WARP reduces memory footprint by **58%** on average vs FastPlaid, reaching **76%** on the larger indices. During index creation the VRAM usage is around **10%** less, with an optional streaming mode that reduces it further by **66%** at a **20-25%** speed cost.
+**Memory**: During search WARP reduces peak CPU memory by **60%** on average vs FastPlaid, reaching **82%** on individual datasets. The sharded execution mode treats RAM+VRAM as a unified pool and cuts peak GPU memory by another **38%** on average over pure CUDA. During index creation the VRAM usage is around **10%** less, with an optional streaming mode that reduces it further by **66%** at a **20-25%** speed cost.
 
 Check the [benchmark section](#benchmarks) for detailed comparisons.
-
-> [!NOTE]
-> The memory benchmarks were done in CPU for search and in GPU for index creation
 
 &nbsp;
 
@@ -48,9 +45,11 @@ xtr-warp-rs supports three torch versions:
 
 | xtr-warp-rs Version | PyTorch Version | Installation Command                |
 | ------------------- | --------------- | ----------------------------------- |
-| 1.1.5.290         | 2.9.0           | `uv pip install xtr-warp-rs==1.1.5.290` |
-| 1.1.5.280         | 2.8.0           | `uv pip install xtr-warp-rs==1.1.5.280` |
-| 1.1.5.270         | 2.7.0           | `uv pip install xtr-warp-rs==1.1.5.270` |
+| 2.0.0.2110        | 2.11.0          | `uv pip install xtr-warp-rs==2.0.0.2110` |
+| 2.0.0.2100        | 2.10.0          | `uv pip install xtr-warp-rs==2.0.0.2100` |
+| 2.0.0.290         | 2.9.0           | `uv pip install xtr-warp-rs==2.0.0.290` |
+| 2.0.0.280         | 2.8.0           | `uv pip install xtr-warp-rs==2.0.0.280` |
+| 2.0.0.270         | 2.7.0           | `uv pip install xtr-warp-rs==2.0.0.270` |
 
 ### Build from Source
 
@@ -118,48 +117,6 @@ results = idx.search(queries_embeddings=torch.randn(2, 50, embedding_dim), top_k
 idx.compact()
 ```
 
-### Streaming from Disk (Path-Based)
-
-For large datasets, you can stream embeddings directly from disk instead of loading everything into memory when creating the index. The memory savings can be controlled by the number of documents per file, with the max possible saving being 25k documents, because that's the chunk size used during index creation. What this effectively means is that splitting files by less than 25k documents will **not** result in more memory savings.
-
-```python
-from xtr_warp import XTRWarp
-
-xtr_warp = XTRWarp(index="index")
-
-# Stream embeddings from a directory containing .npy files
-xtr_warp.create(
-    embeddings_source="/path/to/embeddings",
-    device="cuda",
-)
-
-# Load the index
-xtr_warp.load(device="cpu", dtype=torch.float32)
-
-# Search for 2 queries, each with 50 tokens, each token is a 128-dim vector
-scores = xtr_warp.search(
-    queries_embeddings=torch.randn(2, 50, embedding_dim),
-    top_k=10,
-)
-
-print(scores)
-```
-
-**Required format for path-based inputs:**
-- Embeddings must be stored as `.npy` files (2D tensors with shape `[total_tokens, embedding_dim]`)
-- Each embeddings file must have a corresponding `.doclens.npy` sidecar file containing a 1D array of document lengths. This pattern is adopted to avoid forcing the padding of documents
-- The order of the streaming is controlled by the filenames, it is recommended that they end in `..._idx.npy` or `..._idx.doclens.npy`
-
-Example structure:
-```
-/path/to/embeddings/
-├── embeddings_0.npy          # Shape: [total_tokens, 128]
-├── embeddings_0.doclens.npy  # Shape: [num_docs], sum(doclens) = total_tokens
-├── embeddings_1.npy
-├── embeddings_1.doclens.npy
-...
-```
-
 &nbsp;
 
 ## Benchmarks
@@ -167,72 +124,95 @@ Example structure:
 - `qps` stands for **Queries Per Second** (higher is better)
 - `indexing` stands for the time it took the engine to build the index (lower is better)
 
-### CUDA Performance
+### CUDA
 
 | Dataset (Size) | Metric | fast-plaid | xtr-warp-rs |
 |----------------|--------|------------|-------------|
-| arguana (8,674) | qps | 110.26 | 1024.55 (+829.2%) |
-|  | indexing | 1.67s | 1.39s |
-|  | ndcg@10 | 0.47 | 0.49 |
-|  | recall@10 | 0.73 | 0.75 |
-| fiqa (57,638) | qps | 87.16 | 981.71 (+1026.3%) |
-|  | indexing | 4.90s | 5.57s |
-|  | ndcg@10 | 0.41 | 0.37 |
+| arguana (8,674) | qps | 78.27 | 2706.59 (+3358.4%) |
+|  | indexing | 3.01s | 0.94s |
+|  | ndcg@10 | 0.47 | 0.50 |
+|  | recall@10 | 0.73 | 0.76 |
+| fiqa (57,638) | qps | 60.81 | 2423.17 (+3884.8%) |
+|  | indexing | 6.02s | 3.92s |
+|  | ndcg@10 | 0.41 | 0.36 |
 |  | recall@10 | 0.48 | 0.42 |
-| nfcorpus (3,633) | qps | 123.87 | 1155.00 (+832.4%) |
-|  | indexing | 0.90s | 0.905s |
-|  | ndcg@10 | 0.37 | 0.36 |
+| nfcorpus (3,633) | qps | 81.20 | 3208.68 (+3851.0%) |
+|  | indexing | 2.28s | 0.61s |
+|  | ndcg@10 | 0.37 | 0.37 |
 |  | recall@10 | 0.18 | 0.17 |
-| quora (522,931) | qps | 217.47 | 927.92 (+326.7%) |
-|  | indexing | 10.51s | 9.56s |
+| quora (522,931) | qps | 131.38 | 2404.28 (+1730.0%) |
+|  | indexing | 6.57s | 9.78s |
 |  | ndcg@10 | 0.88 | 0.86 |
 |  | recall@10 | 0.95 | 0.94 |
-| scidocs (25,657) | qps | 97.49 | 880.92 (+803.6%) |
-|  | indexing | 3.93s | 4.15s |
+| scidocs (25,657) | qps | 76.79 | 1830.73 (+2284.4%) |
+|  | indexing | 5.29s | 3.01s |
 |  | ndcg@10 | 0.19 | 0.18 |
 |  | recall@10 | 0.19 | 0.19 |
-| scifact (5,183) | qps | 112.30 | 1133.98 (+909.8%) |
-|  | indexing | 1.42s | 1.35s |
+| scifact (5,183) | qps | 72.38 | 3063.71 (+4133.0%) |
+|  | indexing | 3.03s | 0.84s |
 |  | ndcg@10 | 0.74 | 0.73 |
 |  | recall@10 | 0.86 | 0.85 |
-| trec-covid (171,332) | qps | 43.16 | 339.79 (+687.3%) |
-|  | indexing | 17.44s | 22.73s |
+| trec-covid (171,332) | qps | 32.68 | 340.14 (+940.7%) |
+|  | indexing | 17.28s | 21.79s |
 |  | ndcg@10 | 0.84 | 0.80 |
 |  | recall@10 | 0.02 | 0.02 |
-| webis-touche2020 (382,545) | qps | 55.37 | 601.75 (+980.9%) |
-|  | indexing | 28.48s | 33.08s |
+| webis-touche2020 (382,545) | qps | 36.41 | 741.70 (+1937.1%) |
+|  | indexing | 29.25s | 38.71s |
 |  | ndcg@10 | 0.25 | 0.24 |
 |  | recall@10 | 0.16 | 0.16 |
 
-### CPU Performance
+### CPU
 
-#### Search Speed comparison
+#### Search Speed
 
-| Dataset (Size) | QPS fast-plaid | QPS xtr-warp (Single) | QPS xtr-warp-rs (Multi) |
-|----------------|----------------|-----------------------|-------------------------|
-| arguana (8,674) | 4.79 | 170.64 (+3462.4%) | 495.5 (+10244.5%) |
-| fiqa (57,638) | 4.78 | 129.65 (+2162.3%) | 301.78 (+6213.4%) |
-| nfcorpus (3,633) | 6.69 | 189.9 (+2738.5%) | 1288.85 (+19165.3%) |
-| quora (522,931) | 8.60 | 100.0 (+1062.7%) | 298.72 (+3373.4%) |
-| scidocs (25,657) | 4.52 | 102.78 (+2173.9%) | 262.46 (+5706.6%) |
-| scifact (5,183) | 6.14 | 229.48 (+3637.4%) | 584.6 (+9421.2%) |
-| trec-covid (171,332) | 1.82 | 17.33 (+852.1%) | 106.17 (+5733.5%) |
-| webis-touche2020 (382,545) | 3.14 | 41.63 (+1225.8%) | 144.08 (+4488.6%) |
+| Dataset (Size) | QPS fast-plaid | QPS xtr-warp-rs (Single) | QPS xtr-warp-rs (Multi) |
+|----------------|----------------|--------------------------|-------------------------|
+| arguana (8,674) | 7.84 | 159.13 (+1929.7%) | 726.00 (+9159.6%) |
+| fiqa (57,638) | 6.67 | 100.61 (+1408.4%) | 611.98 (+9075.9%) |
+| nfcorpus (3,633) | 15.34 | 134.13 (+774.4%) | 1977.71 (+12792.5%) |
+| quora (522,931) | 22.27 | 94.26 (+323.3%) | 613.87 (+2657.0%) |
+| scidocs (25,657) | 8.58 | 80.03 (+832.7%) | 469.10 (+5367.4%) |
+| scifact (5,183) | 11.27 | 233.75 (+1974.1%) | 973.79 (+8540.7%) |
+| trec-covid (171,332) | 2.73 | 21.84 (+700.0%) | 186.08 (+6716.5%) |
+| webis-touche2020 (382,545) | 3.58 | 40.59 (+1033.8%) | 303.57 (+8378.8%) |
 
-#### Search Memory comparison
+#### Search Memory
 
-| Dataset (Size) | Peak fast-plaid (GB) | Peak xtr-warp (GB) |
-|----------------|----------------|-----------------------|
-| arguana (8,674) | 2.21 | 1.19 (-46.15%) |
-| fiqa (57,638) | 4.79 | 1.55 (-67.64%) |
-| nfcorpus (3,633) | 1.35 | 1.055 (-21.85%) |
-| quora (522,931) | 9.11 | 2.02 (-77.82%) |
-| scidocs (25,657) | 3.28 | 1.45 (-55.79%) |
-| scifact (5,183) | 1.92 | 1.05 (-45.31%) |
-| trec-covid (171,332) | 10.8 | 2.45 (-77.31%) |
-| webis-touche2020 (382,545) | 12.7 | 3.22 (-74.64%) |
+| Dataset (Size) | Peak fast-plaid (GB) | Peak xtr-warp-rs (GB) |
+|----------------|----------------------|-----------------------|
+| arguana (8,674) | 8.43 | 2.79 (-66.91%) |
+| fiqa (57,638) | 9.08 | 3.54 (-61.07%) |
+| nfcorpus (3,633) | 10.05 | 1.83 (-81.78%) |
+| quora (522,931) | 7.76 | 6.52 (-15.99%) |
+| scidocs (25,657) | 9.70 | 3.70 (-61.85%) |
+| scifact (5,183) | 9.91 | 2.48 (-74.99%) |
+| trec-covid (171,332) | 14.57 | 6.95 (-52.27%) |
+| webis-touche2020 (382,545) | 25.34 | 8.78 (-65.36%) |
 
-#### Streamed creation
+### Sharded Index (RAM + VRAM as unified memory)
+
+When the index is too large for the available VRAM — or when you want to free up GPU memory for other workloads — xtr-warp-rs can shard it between RAM and GPU memory, treating both as a single unified pool. The split is configured at load time via the `device` argument to `load()`, which accepts three forms:
+
+- `str` — a single device (e.g. `"cuda"`, `"cpu"`, or `"auto"`). No sharding.
+- `list[str]` — a list of devices (e.g. `["cuda:0", "cpu"]`). Ratios are auto-computed to fill accelerator VRAM first and place the remainder on CPU.
+- `dict[str, float]` — explicit ratios per device (e.g. `{"cuda": 0.1, "cpu": 0.9}` keeps 10% of the work on GPU and 90% on CPU).
+
+You can also call `recommend_device_map(devices)` to get a suggested ratio dict based on available memory, or `estimate_index_memory()` to inspect per-component byte sizes before deciding on a split.
+
+The table below compares pure CUDA against a 10/90 GPU/CPU shard. Sharded mode trades roughly **40% of CUDA's QPS** for a substantial cut in peak GPU memory — and is still **8-23× faster than fast-plaid CUDA** on every dataset.
+
+| Dataset (Size) | Peak GPU CUDA (GB) | Peak GPU Sharded (GB) | QPS CUDA | QPS Sharded |
+|----------------|--------------------|-----------------------|----------|-------------|
+| arguana (8,674) | 6.28 | 5.68 (-10%) | 2706.59 | 1341.49 |
+| fiqa (57,638) | 3.72 | 2.73 (-27%) | 2423.17 | 1334.50 |
+| nfcorpus (3,633) | 0.85 | 0.46 (-46%) | 3208.68 | 1732.16 |
+| quora (522,931) | 18.54 | 16.38 (-12%) | 2404.28 | 1155.82 |
+| scidocs (25,657) | 7.13 | 6.06 (-15%) | 1830.73 | 1117.98 |
+| scifact (5,183) | 1.42 | 1.04 (-27%) | 3063.71 | 1666.75 |
+| trec-covid (171,332) | 6.74 | 1.38 (-80%) | 340.14 | 254.14 |
+| webis-touche2020 (382,545) | 5.78 | 0.86 (-85%) | 741.70 | 615.12 |
+
+### Streamed Indexing
 
 To showcase the benefits and tradeoffs of the stream mode during index creation I ran a benchmark using the `webis-touche2020` dataset (~380K documents). The objective was to split the dataset embeddings into multiple files, achieving a fixed number of documents per file, with a hard cap on 25k documents per file:
 - 128k documents per file, 2 splits
@@ -280,6 +260,7 @@ max_candidates              None        Cap on document candidates before final 
 batch_size                  8192        Batch size for centroid scoring (watch out for VRAM spike in large indices)
 num_threads                 1           Upper bound for CPU parallelism during search (not used on CUDA)
 subset                      None        List of passage IDs to restrict search to (from filter())
+cuda_streams                None        Per-device CUDA stream pool size for merger + decompress fan-out (default 8; 0 or 1 disables fan-out; ignored on CPU)
 ```
 
 ### Indexing
@@ -292,7 +273,7 @@ The `create()` method accepts embeddings from multiple sources:
 ```python
 Parameter                  Default     Description
 embeddings_source          required    Source of document embeddings (see above)
-device                     required    Device to use for index creation (e.g., "cpu", "cuda", "mps")
+device                     required    Device to use for index creation (e.g., "cpu", "cuda")
 kmeans_niters              4           K-means iterations for clustering
 max_points_per_centroid    256         Maximum points per centroid during K-means
 nbits                      4           Product quantization bits for compression
@@ -303,10 +284,52 @@ metadata                   None        List of dicts (one per document) for meta
 ```
 
 > [!IMPORTANT]
-> Highly recommended to build the index using `cuda` devices. For a large corpus using `cpu` or even `mps` can take forever.
+> Highly recommended to build the index using `cuda` devices. For a large corpus using `cpu` can take forever.
 
 > [!NOTE]
-> When using path-based inputs, embeddings files must be 2D tensors (not 3D padded tensors) with accompanying `.doclens.npy` sidecars. See [Quick Start](#%EF%B8%8F-quick-start) for format details.
+> When using path-based inputs, embeddings files must be 2D tensors (not 3D padded tensors) with accompanying `.doclens.npy` sidecars. See the streaming subsection below for format details.
+
+#### Streaming from Disk
+
+For large datasets, you can stream embeddings directly from disk instead of loading everything into memory when creating the index. The memory savings can be controlled by the number of documents per file, with the max possible saving being 25k documents, because that's the chunk size used during index creation. What this effectively means is that splitting files by less than 25k documents will **not** result in more memory savings.
+
+```python
+from xtr_warp import XTRWarp
+
+xtr_warp = XTRWarp(index="index")
+
+# Stream embeddings from a directory containing .npy files
+xtr_warp.create(
+    embeddings_source="/path/to/embeddings",
+    device="cuda",
+)
+
+# Load the index
+xtr_warp.load(device="cpu", dtype=torch.float32)
+
+# Search for 2 queries, each with 50 tokens, each token is a 128-dim vector
+scores = xtr_warp.search(
+    queries_embeddings=torch.randn(2, 50, embedding_dim),
+    top_k=10,
+)
+
+print(scores)
+```
+
+**Required format for path-based inputs:**
+- Embeddings must be stored as `.npy` files (2D tensors with shape `[total_tokens, embedding_dim]`)
+- Each embeddings file must have a corresponding `.doclens.npy` sidecar file containing a 1D array of document lengths. This pattern is adopted to avoid forcing the padding of documents
+- The order of the streaming is controlled by the filenames, it is recommended that they end in `..._idx.npy` or `..._idx.doclens.npy`
+
+Example structure:
+```
+/path/to/embeddings/
+├── embeddings_0.npy          # Shape: [total_tokens, 128]
+├── embeddings_0.doclens.npy  # Shape: [num_docs], sum(doclens) = total_tokens
+├── embeddings_1.npy
+├── embeddings_1.doclens.npy
+...
+```
 
 ### Loading
 
@@ -314,13 +337,10 @@ To help with memory management the API also exposes the `load` and `free` method
 
 ```python
 Parameter                 Default        Description
-device                    required       Device where to load the index (e.g., "cpu", "cuda", "mps")
+device                    "auto"         Where to load the index. Accepts a single device str ("cpu", "cuda", "cuda:0", "auto"), a list[str] (auto-computed shard ratios filling accelerator VRAM first), or a dict[str, float] mapping each device to an explicit ratio
 dtype                     torch.float32  Dtype to use for the centroids and bucket weights. Lowers the memory footprint but can cause alterations in retrieval metrics
-mmap                      True           Whether or not to load the large tensors ("codes" and "residuals") using memory mapping. Only available in "cpu"
+mmap                      True           Whether or not to load the large tensors ("codes" and "residuals") using memory mapping. Applied to CPU shards only when sharding is enabled
 ```
-
-> [!WARNING]
-> The operator `aten::unique_dim` is not implemented in torch for the `mps` device, so if you want to use it you will need to set up the env var `PYTORCH_ENABLE_MPS_FALLBACK=1`, which fallbacks to the CPU
 
 ### Index Mutability
 
@@ -456,8 +476,8 @@ And for WARP (arXiv entry):
 ## Contributing
 
 This is an active in development project. Contributions are welcome, particularly in:
-- Adding a reranking step at the end of the search pipeline can stabilize the retrieval metrics, especially for datasets like `fiqa`
+- Multi-gpu indexing
 
 ## Acknowledgments
 
-I would like to personally acknowledge the creators and maintainers of the [FastPlaid](https://github.com/lightonai/fast-plaid/tree/main) library, from which I took most of the boilerplate code used here.
+I would like to personally acknowledge the creators and maintainers of the [FastPlaid](https://github.com/lightonai/fast-plaid/tree/main) library, from which I took most of the boilerplate code used here. Also give thanks to [Rohan Jha](https://github.com/robro612) for the support with XTR models and some algorithmic improvements.

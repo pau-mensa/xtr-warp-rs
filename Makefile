@@ -12,7 +12,7 @@ TORCH_ENV = \
 	LIBTORCH_BYPASS_VERSION_CHECK=1 \
 	LIBTORCH=$$($(PYTHON) -c "import torch,os;print(os.path.dirname(torch.__file__))")
 
-.PHONY: help install-gpu install clean build test
+.PHONY: help install-gpu install clean build test test-all
 
 help:	## Show all Makefile targets.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[33m%-30s\033[0m %s\n", $$1, $$2}'
@@ -42,6 +42,10 @@ build:	## Build the project
 	@test -x $(PYTHON) || { echo "No venv found — run 'make install' first"; exit 1; }
 	$(TORCH_ENV) CXXFLAGS="-w" $(MATURIN) develop --release
 
-test:	## Run tests
+test:	## Run tests (excludes sharding tests)
 	@test -x $(PYTEST) || { echo "No venv found — run 'make install' first"; exit 1; }
 	$(TORCH_ENV) $(PYTEST) tests/test.py tests/test_index_management.py tests/test_filtering.py
+
+test-all:	## Run all tests including sharding
+	@test -x $(PYTEST) || { echo "No venv found — run 'make install' first"; exit 1; }
+	$(TORCH_ENV) $(PYTEST) tests/ -m ""

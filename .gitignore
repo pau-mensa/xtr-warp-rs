@@ -160,3 +160,8 @@ msmarco/
 
 *.pt
 *.npy
+
+# Local profiling scaffolding (NVTX markers + shim). Apply with
+# `git apply PROFILING.patch` when profiling; reverse with -R.
+PROFILING.patch
+

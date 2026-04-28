@@ -1,9 +1,7 @@
 use anyhow::Result;
 use tch::{no_grad, Device, Kind, Tensor};
 
-use crate::utils::types::{
-    parse_device, parse_dtype, SearchConfig, SelectedCentroids, TPrimePolicy,
-};
+use crate::utils::types::{parse_device, SearchConfig, SelectedCentroids, TPrimePolicy};
 
 /// WARP centroid selection for efficient top-k retrieval
 #[derive(Clone)]
@@ -12,7 +10,6 @@ pub struct CentroidSelector {
     t_prime_policy: TPrimePolicy,
     bound: usize,
     device: Device,
-    dtype: Kind,
     centroid_score_threshold: f32,
 }
 
@@ -21,7 +18,6 @@ impl CentroidSelector {
     pub fn new(config: &SearchConfig, num_embeddings: usize, num_centroids: usize) -> Self {
         let nprobe = config.nprobe;
         let device = parse_device(&config.device).expect("Invalid device string");
-        let dtype = parse_dtype(&config.dtype).expect("Invalid dtype string");
 
         let t_prime_policy = match config.t_prime {
             Some(value) => TPrimePolicy::Fixed(value),
@@ -41,7 +37,6 @@ impl CentroidSelector {
             t_prime_policy,
             bound,
             device,
-            dtype,
             centroid_score_threshold: config.centroid_score_threshold.unwrap_or(0.4),
         }
     }
@@ -78,8 +73,8 @@ impl CentroidSelector {
             let mut cells =
                 Tensor::zeros(&[num_query_tokens, nprobe_i64], (Kind::Int, self.device));
             let mut scores =
-                Tensor::zeros(&[num_query_tokens, nprobe_i64], (self.dtype, self.device));
-            let mut mse = Tensor::zeros(&[num_query_tokens], (self.dtype, self.device));
+                Tensor::zeros(&[num_query_tokens, nprobe_i64], (Kind::Float, self.device));
+            let mut mse = Tensor::zeros(&[num_query_tokens], (Kind::Float, self.device));
 
             // We only want to treat the non-zero tokens
             // Note that this skips tensors padded with 0, not with the pad token
@@ -94,7 +89,7 @@ impl CentroidSelector {
                 let threshold_tensor = Tensor::full(
                     &[1],
                     self.centroid_score_threshold as f64,
-                    (self.dtype, max_scores.device()),
+                    (Kind::Float, max_scores.device()),
                 );
                 let above_threshold_mask = max_scores.squeeze_dim(1).ge_tensor(&threshold_tensor);
 
@@ -129,10 +124,7 @@ impl CentroidSelector {
                         Kind::Int64,
                     );
                     let mse_indices = if clamp_limit >= 0 {
-                        mse_indices
-                            .to_kind(self.dtype)
-                            .clamp_max(clamp_limit as f64)
-                            .to_kind(Kind::Int64)
+                        mse_indices.clamp_max(clamp_limit)
                     } else {
                         mse_indices
                     };

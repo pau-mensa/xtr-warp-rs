@@ -234,18 +234,15 @@ impl ResultMerger {
         let mut pid_idx: Vec<usize> = (0..size).collect();
 
         let scores = &stride.scores;
-        pid_idx.select_nth_unstable_by(
-            effective - 1,
-            |&idx1, &idx2| {
-                let score1 = scores[idx1];
-                let score2 = scores[idx2];
-                // Sort descending by score, with tie-breaking on index
-                score2
-                    .partial_cmp(&score1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| idx1.cmp(&idx2))
-            },
-        );
+        pid_idx.select_nth_unstable_by(effective - 1, |&idx1, &idx2| {
+            let score1 = scores[idx1];
+            let score2 = scores[idx2];
+            // Sort descending by score, with tie-breaking on index
+            score2
+                .partial_cmp(&score1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| idx1.cmp(&idx2))
+        });
 
         // Sort the top-k elements
         pid_idx[..effective].sort_unstable_by(|&idx1, &idx2| {
@@ -273,16 +270,20 @@ impl ResultMerger {
     ) -> Result<(Vec<PassageId>, Vec<Score>)> {
         // use cuda if possible
         if self.config.device.is_cuda() {
-            if let Ok((pids, scores)) = self.merge_candidate_scores_cuda(
+            if let Ok((top_pids_t, top_scores_t)) = self.merge_candidate_scores_cuda(
                 candidate_sizes,
                 candidate_pids,
                 candidate_scores,
                 mse_estimates,
                 nprobe,
                 k,
-                self.config.max_candidates,
             ) {
-                return Ok((pids, scores));
+                let top_scores: Vec<f32> = top_scores_t
+                    .to_kind(Kind::Float)
+                    .to_device(Device::Cpu)
+                    .try_into()?;
+                let top_pids: Vec<i64> = top_pids_t.to_device(Device::Cpu).try_into()?;
+                return Ok((top_pids, top_scores));
             }
         }
 
@@ -307,11 +308,7 @@ impl ResultMerger {
                 let cell_pids = pids_vec[offset..end].to_vec();
                 let cell_scores = scores_vec[offset..end].to_vec();
 
-                views.push(AnnotatedStrideView::from_data(
-                    cell_pids,
-                    cell_scores,
-                    size,
-                ));
+                views.push(AnnotatedStrideView::from_data(cell_pids, cell_scores, size));
                 offset += size;
             }
 
@@ -370,7 +367,34 @@ impl ResultMerger {
         })
     }
 
-    fn merge_candidate_scores_cuda(
+    /// CUDA merger. Returns results as GPU tensors — callers that need a
+    /// `Vec<PassageId>, Vec<Score>` should D2H themselves (see
+    /// `merge_candidate_scores`'s CUDA branch). Keeping the output on-device
+    /// lets `sharded_scorer` launch many queries' merges back-to-back and
+    /// drain with a single D2H at the end.
+    ///
+    /// Sync-free implementation: zero host-device syncs inside. All output
+    /// shapes are `[N]` where `N = candidate_pids.size()[0]` is known
+    /// from input, so we never have to read `.size()` on a dynamic-shape
+    /// tensor. Over-allocated slots get sentinel values (-inf for scores,
+    /// -1 for pids) and are masked out before the final topk.
+    ///
+    /// Reduction semantics match a conventional `unique_consecutive +
+    /// index_reduce` pipeline:
+    ///   - same sort keys → same reduction order
+    ///   - `scatter_reduce_(amax)` is equivalent to `index_reduce(amax)`
+    ///     (max is commutative + associative, bit-identical across orderings)
+    ///   - per-pid sum uses `prefix[end+1] - prefix[start]` on the same
+    ///     elements in the same order; padding is clamped from -inf to 0
+    ///     before cumsum so prefixes through the padding region are 0 and
+    ///     don't introduce catastrophic cancellation for real groups.
+    ///
+    /// Designed to stack with the multi-stream scheduling in
+    /// `sharded_scorer::rank_multi_shard` (Pass A3): the extra small
+    /// kernels this path introduces relative to a traditional merger run
+    /// concurrently across the stream pool, which is what makes the
+    /// sync-free approach viable here.
+    pub(crate) fn merge_candidate_scores_cuda(
         &self,
         candidate_sizes: &Tensor,
         candidate_pids: &Tensor,
@@ -378,122 +402,149 @@ impl ResultMerger {
         mse_estimates: &Tensor,
         nprobe: usize,
         k: usize,
-        max_candidates: usize,
-    ) -> Result<(Vec<PassageId>, Vec<Score>)> {
-        // I added the optional parameters in some functions
-        // because the torch signatures differ a bit from the cpp ones
-        if candidate_pids.numel() == 0 {
-            let empty_pid: Vec<i64> = Vec::new();
-            let empty_scores: Vec<f32> = Vec::new();
-            return Ok((empty_pid, empty_scores));
+    ) -> Result<(Tensor, Tensor)> {
+        let max_candidates = self.config.max_candidates;
+        let device = candidate_pids.device();
+
+        let n = candidate_pids.size()[0];
+        if n == 0 {
+            let empty_pids = Tensor::zeros(&[0], (Kind::Int64, device));
+            let empty_scores = Tensor::zeros(&[0], (Kind::Float, device));
+            return Ok((empty_pids, empty_scores));
         }
 
-        let device = candidate_pids.device();
         let sizes = candidate_sizes.shallow_clone();
         let pids = candidate_pids.shallow_clone();
         let scores = candidate_scores.shallow_clone();
-        let mse_estimates = mse_estimates.shallow_clone();
+        let score_kind = scores.kind();
 
-        // Token index per cell, repeated per candidate
+        // Token index per cell, repeated per candidate. Pass `Some(n)` so
+        // `repeat_interleave_self_tensor` doesn't have to infer the output
+        // size (which would itself force a sync).
         let num_cells = sizes.size()[0];
-        // IMPORTANT: the original implementation uses a hardcoded constant (32)
-        // this destroys retrieval metrics for longer queries, so we infer the number of tokens
         let num_tokens = (num_cells + (nprobe as i64) - 1) / (nprobe as i64);
         let mut token_indices = Tensor::arange(num_cells, (Kind::Int64, device));
         token_indices = token_indices.divide_scalar_mode(nprobe as i64, "trunc");
         let candidate_tokens =
-            Tensor::repeat_interleave_self_tensor(&token_indices, &sizes, 0, None);
+            Tensor::repeat_interleave_self_tensor(&token_indices, &sizes, 0, Some(n));
 
-        // Flatten token+pid into a combined id to compactly deduplicate
-        let combined_ids = pids * num_tokens + candidate_tokens;
+        // Flatten (pid, token) into one int64 key.
+        let combined_ids = pids.shallow_clone() * num_tokens + &candidate_tokens;
         let sort_result = combined_ids.sort(0, /*descending=*/ false);
         let sorted_ids = sort_result.0;
         let sort_idx = sort_result.1;
         let sorted_scores = scores.index_select(0, &sort_idx);
+        let sorted_pids_by_combined = pids.index_select(0, &sort_idx);
+        let sorted_tokens_by_combined = candidate_tokens.index_select(0, &sort_idx);
 
-        // Unique ids and inverse for max reduction
-        let unique_result = sorted_ids.unique_consecutive(
-            /*return_inverse=*/ true, /*return_counts=*/ false, 0,
-        );
-        let unique_ids = unique_result.0;
-        let inverse = unique_result.1;
-        let max_init = Tensor::full(
-            unique_ids.size(),
-            f64::NEG_INFINITY,
-            (sorted_scores.kind(), sorted_scores.device()),
-        );
-        let max_per_id = Tensor::index_reduce(
-            &max_init,
+        // --- Phase 1: dedup (pid, token) → max score (sync-free) ---
+        //
+        // group_ids[i] = cumulative count of "changes" in sorted_ids up to i.
+        // Elements of sorted_ids that are equal get the same group_id.
+        let sorted_lhs = sorted_ids.slice(0, 1, n, 1);
+        let sorted_rhs = sorted_ids.slice(0, 0, n - 1, 1);
+        let changes = sorted_lhs.ne_tensor(&sorted_rhs).to_kind(Kind::Int64);
+        let changes_cumsum = changes.cumsum(0, Kind::Int64);
+        let zero_head = Tensor::zeros(&[1], (Kind::Int64, device));
+        let group_ids = Tensor::cat(&[zero_head.shallow_clone(), changes_cumsum], 0);
+
+        // Max per group into a pre-allocated [N] buffer filled with -inf.
+        let mut max_per_group =
+            Tensor::full(&[n], f64::NEG_INFINITY, (score_kind, device));
+        let _ = max_per_group.internal_scatter_reduce_(
             0,
-            &inverse,
+            &group_ids,
             &sorted_scores,
             "amax",
             /*include_self=*/ true,
         );
 
-        // Split combined id back into pid and token
-        let pid = unique_ids
-            .divide_scalar_mode(num_tokens, "trunc")
-            .to_kind(Kind::Int64);
-        let token = (unique_ids - pid.shallow_clone() * num_tokens).to_kind(Kind::Int64);
+        // Scatter pid/token per group. All elements in a group have the
+        // same pid+token (that's the group definition), so last-write-wins
+        // is correct.
+        let mut group_pid = Tensor::full(&[n], -1i64, (Kind::Int64, device));
+        let _ = group_pid.scatter_(0, &group_ids, &sorted_pids_by_combined);
+        let mut group_token = Tensor::full(&[n], 0i64, (Kind::Int64, device));
+        let _ = group_token.scatter_(0, &group_ids, &sorted_tokens_by_combined);
 
-        // Prepare MSE vector (pad/truncate to num_tokens)
+        // --- Phase 2: MSE correction ---
         let mut mse = mse_estimates.shallow_clone();
         if mse.size()[0] < num_tokens {
             let pad = Tensor::zeros(&[num_tokens - mse.size()[0]], (mse.kind(), mse.device()));
             mse = Tensor::cat(&[mse, pad], 0);
         }
         mse = mse.narrow(0, 0, num_tokens);
-
         let sum_mse = mse.sum(None);
-        let mse_for_tokens = mse.index_select(0, &token);
-        let delta = max_per_id - mse_for_tokens;
 
-        // Reduce by pid: since keys were sorted, pid is non-decreasing
-        let pid_result = &pid.unique_consecutive(
-            /*return_inverse=*/ true, /*return_counts=*/ true, 0,
-        );
-        let unique_pids = pid_result.0.shallow_clone();
-        let pid_counts = pid_result.2.to_kind(Kind::Int64);
+        // Clamp tokens to [0, num_tokens-1] to keep index_select safe for
+        // the zero-filled padding entries in group_token.
+        let safe_tokens = group_token.clamp(0, num_tokens - 1);
+        let mse_for_groups = mse.index_select(0, &safe_tokens);
+        let delta = &max_per_group - mse_for_groups;
+        // For padding entries, max_per_group = -inf, so delta = -inf.
 
-        // Deterministic per-PID sum using cumulative sums to avoid nondeterministic atomics.
-        // Exclusive prefix to get exact per-pid sums.
-        let delta_cumsum = delta.cumsum(0, delta.kind()).contiguous();
-        let prefix = Tensor::zeros(
-            &[delta_cumsum.size()[0] + 1],
-            (delta_cumsum.kind(), delta_cumsum.device()),
-        );
-        prefix
-            .narrow(0, 1, delta_cumsum.size()[0])
-            .copy_(&delta_cumsum);
+        // --- Phase 3: per-pid sum via sort(pid) + shift-compare + cumsum ---
+        //
+        // Ascending sort: -1 padding floats to the front, real pids follow
+        // in ascending order. pid_group 0 captures all -1 padding (later
+        // masked out).
+        let pid_sort = group_pid.argsort(0, /*descending=*/ false);
+        let sorted_gpid = group_pid.index_select(0, &pid_sort);
+        let sorted_delta = delta.index_select(0, &pid_sort);
 
-        let end_indices = pid_counts.cumsum(0, Kind::Int64) - 1;
-        let start_indices = end_indices.shallow_clone() - pid_counts + 1;
-        let sums_at_end = prefix.index_select(0, &(end_indices + 1));
-        let sums_before = prefix.index_select(0, &start_indices);
-        let deltas_per_pid = sums_at_end - sums_before;
-        let totals = deltas_per_pid + sum_mse;
+        // Replace -inf deltas with 0 before cumsum. Real pid groups' prefix
+        // diffs only involve the real portion of the array; padding
+        // contributes 0 and doesn't affect numerics for real groups.
+        let safe_delta = sorted_delta.clamp_min(0.0f64);
+        let delta_cumsum = safe_delta.cumsum(0, score_kind).contiguous();
+        let prefix_zero = Tensor::zeros(&[1], (score_kind, device));
+        let prefix = Tensor::cat(&[prefix_zero, delta_cumsum], 0);
 
-        if totals.numel() == 0 {
-            let empty_pid: Vec<i64> = Vec::new();
-            let empty_scores_out: Vec<f32> = Vec::new();
-            return Ok((empty_pid, empty_scores_out));
-        }
+        // Pid-group boundaries via shift-compare.
+        let pid_lhs = sorted_gpid.slice(0, 1, n, 1);
+        let pid_rhs = sorted_gpid.slice(0, 0, n - 1, 1);
+        let pid_changes = pid_lhs.ne_tensor(&pid_rhs).to_kind(Kind::Int64);
+        let pid_changes_cs = pid_changes.cumsum(0, Kind::Int64);
+        let pid_group_ids = Tensor::cat(&[zero_head.shallow_clone(), pid_changes_cs], 0);
 
-        let totals_size = totals.size();
-        let num_candidates = totals_size.get(0).unwrap();
-        let budget = k.max(max_candidates.min(*num_candidates as usize));
-        let take_k = (budget as i64).min(*num_candidates);
+        // Start/end index per pid group via scatter_reduce with min/max.
+        let positions = Tensor::arange(n, (Kind::Int64, device));
+        let mut pid_starts = Tensor::full(&[n], n, (Kind::Int64, device));
+        let _ = pid_starts.internal_scatter_reduce_(0, &pid_group_ids, &positions, "amin", true);
+        let mut pid_ends = Tensor::full(&[n], 0i64, (Kind::Int64, device));
+        let _ = pid_ends.internal_scatter_reduce_(0, &pid_group_ids, &positions, "amax", true);
+
+        let start_idx = pid_starts.clamp_max(n);
+        let end_idx_plus_one = (pid_ends + 1).clamp_max(n);
+        let sums_at_end = prefix.index_select(0, &end_idx_plus_one);
+        let sums_before = prefix.index_select(0, &start_idx);
+        let per_pid_delta = sums_at_end - sums_before;
+        let totals = per_pid_delta + sum_mse;
+
+        // unique_pids_buf[g] = pid label for pid-group g. Default -1 for
+        // over-allocated / padding slots. Used to mask invalid totals.
+        let mut unique_pids_buf = Tensor::full(&[n], -1i64, (Kind::Int64, device));
+        let _ = unique_pids_buf.scatter_(0, &pid_group_ids, &sorted_gpid);
+
+        // Mask: groups whose pid is -1 (both the padding group at position
+        // 0 AND over-allocated slots that never got scattered) have totals
+        // we must exclude from topk.
+        let invalid_mask = unique_pids_buf.eq(-1);
+        let totals = totals.masked_fill(&invalid_mask, f64::NEG_INFINITY);
+
+        // --- Phase 4: topk ---
+        // Budget and take_k computed from N (known), not from num_unique.
+        // topk over a [N] buffer with -inf-padded invalids returns the real
+        // top-k provided enough valid entries exist.
+        let budget = k.max(max_candidates.min(n as usize));
+        let take_k = (budget as i64).min(n);
 
         let topk = totals.topk(take_k, 0, /*largest=*/ true, /*sorted=*/ true);
-        let top_scores: Vec<f32> = topk.0.to_device(Device::Cpu).try_into()?;
+        let top_scores_gpu = topk.0;
         let top_indices = topk.1;
-        let top_pids: Vec<i64> = unique_pids
-            .index_select(0, &top_indices)
-            .to_device(Device::Cpu)
-            .try_into()?;
+        let top_pids_gpu = unique_pids_buf.index_select(0, &top_indices);
 
-        return Ok((top_pids, top_scores));
+        Ok((top_pids_gpu, top_scores_gpu))
     }
 }
 

@@ -9,7 +9,7 @@ build-backend = "maturin"
 
 [project]
 name = "xtr-warp-rs"
-version = "1.1.5"
+version = "2.0.0"
 description = "XTR-Warp"
 authors = [
   { name = "Pau Montserrat", email = "pau.mopuig@gmail.com" },
@@ -68,14 +68,13 @@ addopts = [
   "--verbose",
   "-ra",
   "--cov-config=.coveragerc",
-  "-m not web and not slow",
+  "-m not sharding",
+]
+markers = [
+  "sharding: marks tests that require an accelerator or the full sharding test suite",
 ]
 doctest_optionflags = ["NORMALIZE_WHITESPACE", "NUMBER"]
 norecursedirs = ["build", "docs", "node_modules"]
-markers = [
-  "web: tests that require using the Internet",
-  "slow: tests that take a long time to run",
-]
 
 [tool.ruff]
 line-length = 88

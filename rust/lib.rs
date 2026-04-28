@@ -9,7 +9,7 @@ use std::ffi::CString;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
-use tch::{Device, Kind};
+use tch::Device;
 
 #[cfg(windows)]
 use winapi::um::errhandlingapi::GetLastError;
@@ -24,8 +24,8 @@ pub mod utils;
 // Re-exports for convenience
 use crate::index::create::create_index;
 use crate::index::source::{DiskEmbeddingSource, EmbeddingSource, InMemoryEmbeddingSource};
-use search::{IndexLoader, Searcher};
-use utils::types::{IndexConfig, Query, ReadOnlyIndex, SearchConfig, SearchResult};
+use search::{IndexLoader, ShardedScorer};
+use utils::types::{IndexConfig, Query, SearchConfig, SearchResult, ShardedIndex};
 
 /// Dynamically loads the native Torch shared library (e.g., `libtorch.so` or `torch.dll`).
 ///
@@ -70,181 +70,34 @@ fn call_torch(torch_path: String) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Parses a string identifier into a `tch::Device`.
-///
-/// Supports simple device strings like "cpu", "cuda", and indexed CUDA devices
-/// such as "cuda:0".
 fn get_device(device: &str) -> Result<Device, PyErr> {
-    match device.to_lowercase().as_str() {
-        "cpu" => Ok(Device::Cpu),
-        "mps" => Ok(Device::Mps),
-        "cuda" => Ok(Device::Cuda(0)), // Default to the first CUDA device.
-        s if s.starts_with("cuda:") => {
-            let parts: Vec<&str> = s.split(':').collect();
-            if parts.len() == 2 {
-                parts[1].parse::<usize>().map(Device::Cuda).map_err(|_| {
-                    PyValueError::new_err(format!("Invalid CUDA device index: '{}'", parts[1]))
-                })
-            } else {
-                Err(PyValueError::new_err(
-                    "Invalid CUDA device format. Expected 'cuda:N'.",
-                ))
-            }
-        },
-        _ => Err(PyValueError::new_err(format!(
-            "Unsupported device string: '{}'",
-            device
-        ))),
-    }
+    utils::types::parse_device(device).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// Parses a string identifier into a `tch::Kind`.
-///
-/// Supports simple strings like "float32", "float16"
-fn get_dtype(dtype: &str) -> Result<Kind, PyErr> {
-    match dtype.to_lowercase().as_str() {
-        "float32" => Ok(Kind::Float),
-        "float16" => Ok(Kind::Half),
-        "float64" => Ok(Kind::Double),
-        "bfloat16" => Ok(Kind::BFloat16),
-        _ => Err(PyValueError::new_err(format!(
-            "Unsupported dtype string: '{}', should be 'float32', 'float16', 'float64', or 'bfloat16'",
-            dtype
-        ))),
-    }
-}
 
-/// Represents a loaded index
-#[pyclass(unsendable)]
-struct LoadedSearcher {
-    /// The loaded index used for search.
-    loaded_index: Option<Arc<ReadOnlyIndex>>,
-    index_path: String,
-    device: Device,
-    dtype: Kind,
-    use_mmap: bool,
-    /// Tombstoned passage IDs — filtered out of search results at merge time.
-    deleted_pids: HashSet<i64>,
-}
-
-#[pymethods]
-impl LoadedSearcher {
-    #[new]
-    #[pyo3(signature = (index_path, device, dtype, use_mmap=true))]
-    fn new(index_path: String, device: String, dtype: String, use_mmap: bool) -> PyResult<Self> {
-        let device = get_device(&device)?;
-        let dtype = get_dtype(&dtype)?;
-
-        Ok(Self {
-            loaded_index: None,
-            index_path,
-            device,
-            dtype,
-            use_mmap,
-            deleted_pids: HashSet::new(),
-        })
-    }
-
-    /// Load the index in memory
-    fn load(&mut self) -> PyResult<()> {
-        let index_loader =
-            IndexLoader::new(&self.index_path, self.device, self.dtype, self.use_mmap)
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to create loader: {}", e)))?;
-        let loaded_index = index_loader
-            .load()
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load index: {}", e)))?;
-
-        // Load tombstones if present
-        self.deleted_pids =
-            crate::index::delete::load_tombstones(Path::new(&self.index_path))
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("Failed to load tombstones: {}", e))
-                })?;
-
-        self.loaded_index = Some(Arc::new(ReadOnlyIndex(loaded_index)));
-
-        Ok(())
-    }
-
-    /// Main search entrypoint
-    #[pyo3(signature = (torch_path, queries_embeddings, search_config, subsets=None, show_progress=true))]
-    fn search(
-        &self,
-        torch_path: String,
-        queries_embeddings: PyTensor,
-        search_config: SearchConfig,
-        subsets: Option<Vec<Vec<i64>>>,
-        show_progress: bool,
-    ) -> PyResult<Vec<SearchResult>> {
-        call_torch(torch_path)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
-
-        // Always expect 3D tensor
-        let shape = queries_embeddings.size();
-        if shape.len() != 3 {
-            return Err(PyRuntimeError::new_err(format!(
-                "Expected 3D tensor, got {}D tensor with shape {:?}",
-                shape.len(),
-                shape
-            )));
-        }
-
-        let searcher = Searcher::new(
-            self.loaded_index.as_ref().unwrap(),
-            &search_config,
-        )
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create searcher: {}", e)))?;
-
-        let k = search_config.k;
-
-        // process batch
-        let mut results = searcher
-            .search(
-                Query {
-                    embeddings: queries_embeddings.deref().shallow_clone(),
-                },
-                subsets.as_deref(),
-                show_progress,
-            )
-            .map_err(|e| PyRuntimeError::new_err(format!("Search failed: {}", e)))?;
-
-        // Filter tombstoned PIDs and truncate to k.
-        // Results arrive sorted by score descending from the merger, so we
-        // can stop as soon as we collect k non-deleted entries.
-        for result in &mut results {
-            if !self.deleted_pids.is_empty() {
-                let mut filtered_pids = Vec::with_capacity(k);
-                let mut filtered_scores = Vec::with_capacity(k);
-                for (pid, score) in result.passage_ids.iter().zip(result.scores.iter()) {
-                    if !self.deleted_pids.contains(pid) {
-                        filtered_pids.push(*pid);
-                        filtered_scores.push(*score);
-                        if filtered_pids.len() == k {
-                            break;
-                        }
+/// Filter tombstoned PIDs and truncate to k.
+/// Results arrive sorted by score descending from the merger, so we
+/// stop as soon as we collect k non-deleted entries.
+fn filter_tombstones(results: &mut [SearchResult], deleted_pids: &HashSet<i64>, k: usize) {
+    for result in results {
+        if !deleted_pids.is_empty() {
+            let mut filtered_pids = Vec::with_capacity(k);
+            let mut filtered_scores = Vec::with_capacity(k);
+            for (pid, score) in result.passage_ids.iter().zip(result.scores.iter()) {
+                if !deleted_pids.contains(pid) {
+                    filtered_pids.push(*pid);
+                    filtered_scores.push(*score);
+                    if filtered_pids.len() == k {
+                        break;
                     }
                 }
-                result.passage_ids = filtered_pids;
-                result.scores = filtered_scores;
-            } else {
-                result.passage_ids.truncate(k);
-                result.scores.truncate(k);
             }
+            result.passage_ids = filtered_pids;
+            result.scores = filtered_scores;
+        } else {
+            result.passage_ids.truncate(k);
+            result.scores.truncate(k);
         }
-
-        Ok(results)
-    }
-
-    /// Update in-memory tombstones without full reload after delete().
-    fn update_tombstones(&mut self, passage_ids: Vec<i64>) -> PyResult<()> {
-        self.deleted_pids.extend(passage_ids);
-        Ok(())
-    }
-
-    /// Free the loaded index
-    fn free(&mut self) {
-        self.loaded_index = None;
-        self.deleted_pids.clear();
     }
 }
 
@@ -403,16 +256,9 @@ fn add(
 
 /// Append new centroids to the codebook (called after Python-side K-means).
 #[pyfunction]
-fn append_centroids_py(
-    _py: Python<'_>,
-    index: String,
-    new_centroids: PyTensor,
-) -> PyResult<()> {
-    crate::index::update::append_centroids(
-        Path::new(&index),
-        &new_centroids,
-    )
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to append centroids: {}", e)))
+fn append_centroids_py(_py: Python<'_>, index: String, new_centroids: PyTensor) -> PyResult<()> {
+    crate::index::update::append_centroids(Path::new(&index), &new_centroids)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to append centroids: {}", e)))
 }
 
 /// Update passages in-place: new embeddings, same IDs.
@@ -461,6 +307,128 @@ fn compact(
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to compact index: {}", e)))
 }
 
+#[pyclass(unsendable)]
+struct ShardedSearcher {
+    sharded_index: Option<Arc<ShardedIndex>>,
+    index_path: String,
+    device_ratios: Vec<(Device, f64)>,
+    scoring_device: Device,
+    use_mmap: bool,
+    deleted_pids: HashSet<i64>,
+}
+
+#[pymethods]
+impl ShardedSearcher {
+    #[new]
+    #[pyo3(signature = (index_path, device_ratios, use_mmap=true))]
+    fn new(
+        index_path: String,
+        device_ratios: Vec<(String, f64)>,
+        use_mmap: bool,
+    ) -> PyResult<Self> {
+        let parsed: Vec<(Device, f64)> = device_ratios
+            .iter()
+            .map(|(d, r)| get_device(d).map(|dev| (dev, *r)))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let scoring_device = parsed
+            .iter()
+            .find(|(d, _)| d.is_cuda())
+            .map(|(d, _)| *d)
+            .unwrap_or(parsed[0].0);
+
+        Ok(Self {
+            sharded_index: None,
+            index_path,
+            device_ratios: parsed,
+            scoring_device,
+            use_mmap,
+            deleted_pids: HashSet::new(),
+        })
+    }
+
+    fn load(&mut self) -> PyResult<()> {
+        let loader = IndexLoader::new(&self.index_path, self.use_mmap)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create loader: {}", e)))?;
+
+        let sharded_index = loader
+            .load_sharded(&self.device_ratios, self.scoring_device)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load index: {}", e)))?;
+
+        self.deleted_pids = crate::index::delete::load_tombstones(Path::new(&self.index_path))
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load tombstones: {}", e)))?;
+
+        self.sharded_index = Some(Arc::new(sharded_index));
+        Ok(())
+    }
+
+    #[pyo3(signature = (torch_path, queries_embeddings, search_config, subsets=None, show_progress=true))]
+    fn search(
+        &self,
+        torch_path: String,
+        queries_embeddings: PyTensor,
+        search_config: SearchConfig,
+        subsets: Option<Vec<Vec<i64>>>,
+        show_progress: bool,
+    ) -> PyResult<Vec<SearchResult>> {
+        call_torch(torch_path)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch: {}", e)))?;
+
+        let shape = queries_embeddings.size();
+        if shape.len() != 3 {
+            return Err(PyRuntimeError::new_err(format!(
+                "Expected 3D tensor, got {}D tensor with shape {:?}",
+                shape.len(),
+                shape
+            )));
+        }
+
+        let scorer = ShardedScorer::new(
+            self.sharded_index
+                .as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("Index not loaded. Call load() first."))?,
+            search_config.clone(),
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create scorer: {}", e)))?;
+
+        let k = search_config.k;
+
+        let mut results = scorer
+            .rank(
+                &Query {
+                    embeddings: queries_embeddings.deref().shallow_clone(),
+                },
+                subsets.as_deref(),
+                show_progress,
+            )
+            .map_err(|e| PyRuntimeError::new_err(format!("Search failed: {}", e)))?;
+
+        filter_tombstones(&mut results, &self.deleted_pids, k);
+        Ok(results)
+    }
+
+    fn update_tombstones(&mut self, passage_ids: Vec<i64>) -> PyResult<()> {
+        self.deleted_pids.extend(passage_ids);
+        Ok(())
+    }
+
+    fn free(&mut self) {
+        self.sharded_index = None;
+        self.deleted_pids.clear();
+    }
+}
+
+/// Estimate index memory usage by reading only metadata and NPY headers.
+/// Returns a dict of component name → size in bytes.
+#[pyfunction]
+fn estimate_index_memory(
+    _py: Python<'_>,
+    index_path: String,
+) -> PyResult<std::collections::HashMap<String, u64>> {
+    search::loader::estimate_index_memory(Path::new(&index_path))
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to estimate memory: {}", e)))
+}
+
 /// A high-performance document retrieval toolkit using a ColBERT-style late
 /// interaction model, implemented in Rust with Python bindings.
 ///
@@ -472,7 +440,7 @@ fn compact(
 fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SearchConfig>()?;
     m.add_class::<SearchResult>()?;
-    m.add_class::<LoadedSearcher>()?;
+    m.add_class::<ShardedSearcher>()?;
 
     m.add_function(wrap_pyfunction!(initialize_torch, m)?)?;
     m.add_function(wrap_pyfunction!(create, m)?)?;
@@ -481,5 +449,6 @@ fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(update, m)?)?;
     m.add_function(wrap_pyfunction!(compact, m)?)?;
     m.add_function(wrap_pyfunction!(append_centroids_py, m)?)?;
+    m.add_function(wrap_pyfunction!(estimate_index_memory, m)?)?;
     Ok(())
 }

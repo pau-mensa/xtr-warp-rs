@@ -92,7 +92,7 @@ def main() -> int:
         description="Prepare repo versions for release builds."
     )
     parser.add_argument(
-        "--version", required=True, help="PEP 440 version (e.g. 1.1.5.290)"
+        "--version", required=True, help="PEP 440 version (e.g. 2.2.0.290)"
     )
     parser.add_argument(
         "--cargo-version",

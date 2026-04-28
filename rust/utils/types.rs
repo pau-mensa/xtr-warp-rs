@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tch::{Device, Kind, Tensor};
+use tch::{Device, Tensor};
 
 /// Represents a passage/document ID in the index
 pub type PassageId = i64;
@@ -16,11 +16,6 @@ pub type PassageId = i64;
 /// Represents a centroid ID in the clustering
 pub type CentroidId = i64;
 
-/// Represents an embedding ID in the index
-pub type EmbeddingId = i64;
-
-/// Query ID type
-pub type QueryId = i64;
 
 /// Score type for ranking
 pub type Score = f32;
@@ -64,10 +59,6 @@ pub struct SearchConfig {
     #[pyo3(get, set)]
     pub device: String,
 
-    /// Dtype to use for the search
-    #[pyo3(get, set)]
-    pub dtype: String,
-
     /// Number of centroids to probe during search
     #[pyo3(get, set)]
     pub nprobe: u32,
@@ -99,6 +90,13 @@ pub struct SearchConfig {
     /// The number of candidates to consider before the sorting
     #[pyo3(get, set)]
     pub max_candidates: Option<usize>,
+
+    /// Size of the per-device CUDA stream pool used by both the Pass A3
+    /// merger fan-out and the Phase-2 decompress fan-out (single- and
+    /// multi-CUDA). `None` uses the built-in default. Set to 0 or 1 to
+    /// disable fan-out and run on the default stream.
+    #[pyo3(get, set)]
+    pub cuda_streams: Option<usize>,
 }
 
 #[pymethods]
@@ -109,7 +107,6 @@ impl SearchConfig {
     #[pyo3(signature = (
         k,
         device,
-        dtype=None,
         nprobe=None,
         t_prime=None,
         bound=None,
@@ -118,11 +115,11 @@ impl SearchConfig {
         centroid_score_threshold=None,
         max_codes_per_centroid=None,
         max_candidates=None,
+        cuda_streams=None,
     ))]
     fn new(
         k: usize,
         device: String,
-        dtype: Option<String>,
         nprobe: Option<u32>,
         t_prime: Option<usize>,
         bound: Option<usize>,
@@ -131,11 +128,11 @@ impl SearchConfig {
         centroid_score_threshold: Option<f32>,
         max_codes_per_centroid: Option<u32>,
         max_candidates: Option<usize>,
+        cuda_streams: Option<usize>,
     ) -> Self {
         Self {
             k,
             device: device,
-            dtype: dtype.unwrap_or("float32".to_string()),
             nprobe: nprobe.unwrap_or(4),
             t_prime,
             bound: bound.unwrap_or(128),
@@ -144,6 +141,7 @@ impl SearchConfig {
             centroid_score_threshold,
             max_codes_per_centroid,
             max_candidates,
+            cuda_streams,
         }
     }
 }
@@ -153,7 +151,6 @@ impl Default for SearchConfig {
         Self {
             k: 100,
             device: "cpu".to_string(),
-            dtype: "float32".to_string(),
             nprobe: 4,
             t_prime: None,
             bound: 128,
@@ -162,6 +159,7 @@ impl Default for SearchConfig {
             centroid_score_threshold: None,
             max_codes_per_centroid: None,
             max_candidates: None,
+            cuda_streams: None,
         }
     }
 }
@@ -221,88 +219,83 @@ impl IndexMetadata {
         let file = std::fs::File::create(&tmp_path)
             .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", tmp_path.display(), e))?;
         serde_json::to_writer_pretty(std::io::BufWriter::new(file), self)?;
-        std::fs::rename(&tmp_path, &path)
-            .map_err(|e| anyhow::anyhow!("Failed to rename {} -> {}: {}", tmp_path.display(), path.display(), e))?;
+        std::fs::rename(&tmp_path, &path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to rename {} -> {}: {}",
+                tmp_path.display(),
+                path.display(),
+                e
+            )
+        })?;
         Ok(())
     }
 }
 
-/// Components of a loaded index
-pub struct LoadedIndex {
-    /// Centroids tensor [num_centroids, dim]
-    pub centroids: Tensor,
-
-    /// Bucket weights for scoring
-    pub bucket_weights: Tensor,
-
-    /// Compacted sizes per centroid
+/// A single shard of the index: owns a contiguous centroid range and the
+/// corresponding slices of pids_compacted and residuals_compacted.
+///
+/// # Safety
+/// Marked `Sync` because shard tensors are never mutated after load.
+pub struct IndexShard {
+    /// Inclusive start of the global centroid range owned by this shard.
+    pub centroid_start: usize,
+    /// Exclusive end of the global centroid range owned by this shard.
+    pub centroid_end: usize,
+    /// Device this shard's tensors live on.
+    pub device: Device,
+    /// Sizes per centroid for this shard's range: [shard_num_centroids].
     pub sizes_compacted: Tensor,
-
-    /// Per-embedding passage IDs in compacted (centroid-sorted) layout
+    /// Passage IDs for embeddings in this shard: [shard_num_embeddings].
     pub pids_compacted: Tensor,
-
-    /// Compacted residuals (compressed)
+    /// Compressed residuals for embeddings in this shard.
     pub residuals_compacted: Tensor,
-
-    /// Offsets for each centroid in the compacted arrays
+    /// Local offsets (starts at 0): [shard_num_centroids + 1].
     pub offsets_compacted: Tensor,
-
-    /// Index of the dummy centroid (smallest)
-    pub kdummy_centroid: CentroidId,
-
-    /// Metadata about the index
-    pub metadata: IndexMetadata,
-
+    /// Bucket weights replicated on this shard's device. Avoids an
+    /// implicit cross-device transfer per decompress call when the shard
+    /// is not on `scoring_device` (matters for multi-CUDA configs).
+    pub bucket_weights: Tensor,
     /// Mmap handles that must outlive the tensors they back.
-    /// Arc-wrapped for shared ownership across shallow clones.
     pub _mmap_handles: Arc<Vec<Mmap>>,
 }
 
-impl Clone for LoadedIndex {
-    fn clone(&self) -> Self {
-        Self {
-            centroids: self.centroids.shallow_clone(),
-            bucket_weights: self.bucket_weights.shallow_clone(),
-            sizes_compacted: self.sizes_compacted.shallow_clone(),
-            pids_compacted: self.pids_compacted.shallow_clone(),
-            residuals_compacted: self.residuals_compacted.shallow_clone(),
-            offsets_compacted: self.offsets_compacted.shallow_clone(),
-            kdummy_centroid: self.kdummy_centroid,
-            metadata: self.metadata.clone(),
-            _mmap_handles: Arc::clone(&self._mmap_handles),
-        }
-    }
+// SAFETY: IndexShard tensors are never mutated after load. All search
+// access is read-only (narrow, index_select).
+unsafe impl Sync for IndexShard {}
+
+/// Shared state across all shards: small tensors replicated on the scoring
+/// accelerator device.
+pub struct SharedIndexState {
+    /// Centroids tensor on scoring_device: [num_centroids, dim].
+    pub centroids: Tensor,
+    /// Bucket weights on scoring_device.
+    pub bucket_weights: Tensor,
+    /// Full sizes_compacted on CPU (small, needed by CentroidSelector).
+    pub sizes_compacted: Tensor,
+    /// Dummy centroid index (smallest centroid, for masked tokens).
+    pub kdummy_centroid: CentroidId,
+    /// Index metadata.
+    pub metadata: IndexMetadata,
+    /// The device used for centroid scoring (first accelerator).
+    pub scoring_device: Device,
 }
 
-/// Read-only wrapper that marks the loaded index as safe to share across threads.
-/// The tensors are never mutated after load, so we can treat them as Sync.
-pub struct ReadOnlyIndex(pub LoadedIndex);
-
-impl std::ops::Deref for ReadOnlyIndex {
-    type Target = LoadedIndex;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+/// A fully sharded index: shared state + per-device shards.
+///
+/// # Safety
+/// Marked `Sync` because shard tensors are never mutated after load — same
+/// invariant as `IndexShard`.
+pub struct ShardedIndex {
+    pub shared: SharedIndexState,
+    pub shards: Vec<IndexShard>,
 }
 
-unsafe impl Sync for ReadOnlyIndex {}
-
-impl Clone for ReadOnlyIndex {
-    fn clone(&self) -> Self {
-        ReadOnlyIndex(self.0.clone())
-    }
-}
+// SAFETY: see struct docs — read-only after load.
+unsafe impl Sync for ShardedIndex {}
 
 /// Query representation for search
 pub struct Query {
     pub embeddings: Tensor, // Always [batch, num_tokens, dim]
-}
-
-/// Batch of queries for efficient processing
-pub struct QueryBatch {
-    pub queries: Vec<Query>,
-    pub max_tokens: usize,
 }
 
 /// Read-only tensor wrapper to opt into Sync when we guarantee no mutation.
@@ -332,27 +325,12 @@ pub struct SelectedCentroids {
     pub mse_estimate: Tensor,
 }
 
-/// Decompressed centroid data
-pub struct DecompressedCentroid {
-    pub centroid_id: CentroidId,
-    pub passage_ids: Vec<PassageId>,
-    pub scores: Vec<Score>,
-}
-
 pub struct DecompressedCentroidsOutput {
     pub capacities: Tensor, // Total capacity of each centroid (ends - begins)
     pub sizes: Tensor,      // Actual sizes after deduplication
     pub passage_ids: Tensor,
     pub scores: Tensor,
     pub offsets: Tensor,
-}
-
-/// Candidate for final ranking
-#[derive(Debug, Clone)]
-pub struct RankingCandidate {
-    pub passage_id: PassageId,
-    pub score: Score,
-    pub centroid_id: CentroidId,
 }
 
 /// T-prime policy for adaptive early termination
@@ -449,15 +427,17 @@ impl PassageBitset {
     }
 }
 
-/// Parses a string identifier into a `tch::Kind`.
-///
-/// Supports simple strings like "float32", "float16"
-pub fn parse_dtype(dtype: &str) -> anyhow::Result<Kind> {
-    match dtype.to_lowercase().as_str() {
-        "float32" => Ok(Kind::Float),
-        "float16" => Ok(Kind::Half),
-        "float64" => Ok(Kind::Double),
-        "bfloat16" => Ok(Kind::BFloat16),
-        _ => Err(anyhow::anyhow!("Unsupported dtype string: '{}', should be 'float32', 'float16', 'float64', or 'bfloat16'", dtype)),
+impl IndexShard {
+    /// Translate global centroid IDs into this shard's local ID space.
+    /// For a shard starting at 0 this is a no-op; otherwise subtracts
+    /// `centroid_start`.
+    pub fn localize_centroid_ids(&self, global_ids: &Tensor) -> Tensor {
+        if self.centroid_start == 0 {
+            global_ids.shallow_clone()
+        } else {
+            global_ids - (self.centroid_start as i64)
+        }
     }
 }
+
+

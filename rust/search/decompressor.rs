@@ -3,14 +3,12 @@ use rayon::{prelude::*, ThreadPool};
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
-use crate::utils::types::{DecompressedCentroidsOutput, PassageBitset, ReadOnlyIndex};
+use crate::utils::types::{DecompressedCentroidsOutput, IndexShard, PassageBitset};
 
 /// Centroid decompressor for efficient residual decompression
 #[derive(Clone)]
 pub struct CentroidDecompressor {
     nbits: u8,
-    device: Device,
-    dtype: Kind,
     dim: usize,
     reversed_bit_map: [u8; 256],
     thread_pool: Arc<ThreadPool>,
@@ -18,13 +16,7 @@ pub struct CentroidDecompressor {
 
 impl CentroidDecompressor {
     /// Create a new centroid decompressor
-    pub fn new(
-        nbits: u8,
-        dim: usize,
-        device: Device,
-        dtype: Kind,
-        thread_pool: Arc<ThreadPool>,
-    ) -> Result<Self> {
+    pub fn new(nbits: u8, dim: usize, thread_pool: Arc<ThreadPool>) -> Result<Self> {
         if nbits != 2 && nbits != 4 {
             return Err(anyhow!("nbits must be 2 or 4, got {}", nbits));
         }
@@ -33,8 +25,6 @@ impl CentroidDecompressor {
 
         Ok(Self {
             nbits,
-            device,
-            dtype,
             dim,
             reversed_bit_map,
             thread_pool,
@@ -66,49 +56,60 @@ impl CentroidDecompressor {
         reversed
     }
 
-    pub fn decompress_centroids(
+    /// Decompress centroids for a single shard. Global centroid IDs are
+    /// translated to shard-local IDs before indexing into the shard's tensors.
+    ///
+    /// `per_cell_tokens` maps each local cell position to its query token
+    /// index. When `None`, the decompressor computes `cell_idx / nprobe`
+    /// (correct for single-shard case where local cell == global cell).
+    pub fn decompress_centroids_for_shard(
         &self,
         centroid_ids: &Tensor,
         centroid_scores: &Tensor,
-        index: &Arc<ReadOnlyIndex>,
-        query_embeddings: &Tensor, // [num_tokens, dim]
+        shard: &IndexShard,
+        bucket_weights: &Tensor,
+        query_embeddings: &Tensor,
         nprobe: usize,
         subset: Option<&[i64]>,
+        per_cell_tokens: Option<&Tensor>,
     ) -> Result<DecompressedCentroidsOutput> {
         let centroid_ids = centroid_ids.to_kind(Kind::Int64);
         let num_cells = centroid_ids.size()[0] as usize;
+        let device = shard.device;
 
-        let num_total_centroids = index.offsets_compacted.size()[0] - 1;
-        let max_centroid_id = centroid_ids.max().int64_value(&[]);
-
-        if max_centroid_id >= num_total_centroids {
-            return Err(anyhow!(
-                "Centroid ID {} is out of bounds (max valid ID is {})",
-                max_centroid_id,
-                num_total_centroids - 1
-            ));
-        }
-
-        // Gather begin/end offsets and capacities for every requested centroid
-        let begins = index.offsets_compacted.index_select(0, &centroid_ids);
-        let ends = index.offsets_compacted.index_select(0, &(centroid_ids + 1));
-        let capacities = &ends - &begins;
-
-        // Early exit when there is nothing to process
+        // Empty result for zero cells
         if num_cells == 0 {
-            let empty = Tensor::zeros(&[0], (Kind::Int, self.device));
+            let empty = Tensor::zeros(&[0], (Kind::Int, device));
             return Ok(DecompressedCentroidsOutput {
-                capacities,
-                sizes: empty.to_kind(Kind::Int),
-                passage_ids: Tensor::zeros(&[0], (Kind::Int64, self.device)),
-                scores: Tensor::zeros(&[0], (self.dtype, self.device)),
-                offsets: Tensor::zeros(&[1], (Kind::Int64, self.device)),
+                capacities: Tensor::zeros(&[0], (Kind::Int64, device)),
+                sizes: empty,
+                passage_ids: Tensor::zeros(&[0], (Kind::Int64, device)),
+                scores: Tensor::zeros(&[0], (Kind::Float, device)),
+                offsets: Tensor::zeros(&[1], (Kind::Int64, device)),
             });
         }
 
+        // Translate global centroid IDs to shard-local IDs
+        let local_ids = shard.localize_centroid_ids(&centroid_ids);
+
+        // Bounds check
+        let num_source_centroids = shard.offsets_compacted.size()[0] - 1;
+        let max_centroid_id = local_ids.max().int64_value(&[]);
+        if max_centroid_id >= num_source_centroids {
+            return Err(anyhow!(
+                "Centroid ID {} is out of bounds (max valid ID is {})",
+                max_centroid_id,
+                num_source_centroids - 1
+            ));
+        }
+
+        // Gather begin/end offsets and capacities
+        let begins = shard.offsets_compacted.index_select(0, &local_ids);
+        let ends = shard.offsets_compacted.index_select(0, &(&local_ids + 1));
+        let capacities = &ends - &begins;
+
         anyhow::ensure!(nprobe > 0, "nprobe must be greater than zero");
 
-        let query_embeddings = query_embeddings.to_kind(self.dtype);
         anyhow::ensure!(
             query_embeddings.size()[1] == self.dim as i64,
             "Query embedding dim ({}) does not match index dim ({})",
@@ -116,32 +117,39 @@ impl CentroidDecompressor {
             self.dim
         );
 
-        let num_tokens = query_embeddings.size()[0] as usize;
-        anyhow::ensure!(
-            num_tokens > 0,
-            "Expected at least one query token for decompression"
-        );
+        // Resolve bucket_weights to correct device once
+        let bucket_weights = if bucket_weights.device() == device {
+            bucket_weights.shallow_clone()
+        } else {
+            bucket_weights.to_device(device)
+        };
 
-        if self.device.is_cuda() {
-            return self.decompress_centroids_cuda_ops(
+        if device.is_cuda() {
+            return self.decompress_cuda(
                 &begins,
                 &capacities,
                 centroid_scores,
-                index,
-                &query_embeddings,
+                shard,
+                &bucket_weights,
+                query_embeddings,
                 nprobe,
                 subset,
+                per_cell_tokens,
             );
         }
 
         let subset_bitset = subset.map(PassageBitset::new);
 
-        let bucket_weights = index.bucket_weights.to_kind(self.dtype);
+        // CPU: always compute bucket scores in Float32.
+        // x86 CPUs lack native FP16 ALU so Half tensor ops are emulated
+        // and very slow. The inner scoring loop works with f32 anyway.
+        let query_f32 = query_embeddings.to_kind(Kind::Float);
+        let bw_f32 = bucket_weights.to_kind(Kind::Float);
         let vt_bucket_scores =
-            (query_embeddings.unsqueeze(2) * &bucket_weights.unsqueeze(0)).contiguous();
+            (query_f32.unsqueeze(2) * bw_f32.unsqueeze(0)).contiguous();
 
         let bucket_scores_flat: Vec<f32> = vt_bucket_scores.flatten(0, -1).try_into()?;
-        let centroid_scores_vec: Vec<f32> = centroid_scores.flatten(0, -1).try_into()?;
+        let centroid_scores_vec: Vec<f32> = centroid_scores.to_kind(Kind::Float).flatten(0, -1).try_into()?;
 
         anyhow::ensure!(
             centroid_scores_vec.len() == num_cells,
@@ -150,13 +158,14 @@ impl CentroidDecompressor {
             num_cells
         );
 
-        let total_capacity = capacities.sum(Kind::Int64).int64_value(&[]).max(0) as usize;
+        let capacities_vec: Vec<i64> = capacities.shallow_clone().try_into()?;
+        let begins_vec: Vec<i64> = begins.try_into()?;
 
-        let mut candidate_sizes = vec![0i32; num_cells];
-        let mut candidate_pids = Vec::with_capacity(total_capacity);
-        let mut candidate_scores = Vec::with_capacity(total_capacity);
-        let mut offsets = Vec::with_capacity(num_cells + 1);
-        offsets.push(0i64);
+        let num_tokens = query_embeddings.size()[0] as usize;
+        anyhow::ensure!(
+            num_tokens > 0,
+            "Expected at least one query token for decompression"
+        );
 
         let num_buckets = 1usize << (self.nbits as usize);
         let bucket_dim_shift = self.nbits as usize;
@@ -164,27 +173,40 @@ impl CentroidDecompressor {
         let packed_vals_per_byte = 8usize / self.nbits as usize;
         let residual_bytes_per_embedding = self.dim / packed_vals_per_byte;
 
-        let capacities_vec: Vec<i64> = capacities.shallow_clone().try_into()?;
-        let begins_vec: Vec<i64> = begins.try_into()?;
+        let total_capacity = capacities_vec.iter().sum::<i64>().max(0) as usize;
+
+        // Convert per-cell token indices (None → derive from cell_idx / nprobe)
+        let per_cell_tokens_vec: Option<Vec<i64>> = per_cell_tokens
+            .map(|t| t.to_device(Device::Cpu).try_into())
+            .transpose()?;
+
+        let mut candidate_sizes = vec![0i32; num_cells];
+        let mut candidate_pids = Vec::with_capacity(total_capacity);
+        let mut candidate_scores = Vec::with_capacity(total_capacity);
+        let mut offsets = Vec::with_capacity(num_cells + 1);
+        offsets.push(0i64);
 
         let use_parallel = self.thread_pool.current_num_threads() > 1 && num_cells > 1;
 
         if use_parallel {
             let subset_bitset_ref = subset_bitset.as_ref();
+            let tokens_ref = per_cell_tokens_vec.as_ref();
             let cell_results: Vec<_> = self.thread_pool.install(|| {
                 (0..num_cells)
                     .into_par_iter()
                     .map(|cell_idx| {
-                        self.process_cell(
+                        let token_idx = tokens_ref
+                            .map_or(cell_idx / nprobe, |v| v[cell_idx] as usize)
+                            .min(num_tokens - 1);
+                        self.process_cell_impl(
+                            token_idx,
                             cell_idx,
                             &capacities_vec,
                             &begins_vec,
                             &centroid_scores_vec,
-                            nprobe,
-                            num_tokens,
                             bucket_score_stride,
                             &bucket_scores_flat,
-                            index,
+                            shard,
                             residual_bytes_per_embedding,
                             bucket_dim_shift,
                             subset_bitset_ref,
@@ -193,7 +215,6 @@ impl CentroidDecompressor {
                     .collect()
             });
 
-            // rebuild the results
             offsets.clear();
             offsets.push(0i64);
             candidate_pids.clear();
@@ -208,18 +229,21 @@ impl CentroidDecompressor {
                 offsets.push(next_offset);
             }
         } else {
-            // Sequential processing
             for cell_idx in 0..num_cells {
-                let (local_pids, local_scores, size) = self.process_cell(
+                let token_idx = per_cell_tokens_vec
+                    .as_ref()
+                    .map_or(cell_idx / nprobe, |v| v[cell_idx] as usize)
+                    .min(num_tokens - 1);
+
+                let (local_pids, local_scores, size) = self.process_cell_impl(
+                    token_idx,
                     cell_idx,
                     &capacities_vec,
                     &begins_vec,
                     &centroid_scores_vec,
-                    nprobe,
-                    num_tokens,
                     bucket_score_stride,
                     &bucket_scores_flat,
-                    index,
+                    shard,
                     residual_bytes_per_embedding,
                     bucket_dim_shift,
                     subset_bitset.as_ref(),
@@ -234,16 +258,15 @@ impl CentroidDecompressor {
         }
 
         let sizes_tensor = Tensor::from_slice(&candidate_sizes)
-            .to_device(self.device)
+            .to_device(device)
             .to_kind(Kind::Int);
         let pids_tensor = Tensor::from_slice(&candidate_pids)
-            .to_device(self.device)
+            .to_device(device)
             .to_kind(Kind::Int64);
         let scores_tensor = Tensor::from_slice(&candidate_scores)
-            .to_device(self.device)
-            .to_kind(self.dtype);
+            .to_device(device);
         let offsets_tensor = Tensor::from_slice(&offsets)
-            .to_device(self.device)
+            .to_device(device)
             .to_kind(Kind::Int64);
 
         Ok(DecompressedCentroidsOutput {
@@ -255,20 +278,23 @@ impl CentroidDecompressor {
         })
     }
 
-    fn decompress_centroids_cuda_ops(
+    /// CUDA decompression path.
+    fn decompress_cuda(
         &self,
         begins: &Tensor,
         capacities: &Tensor,
         centroid_scores: &Tensor,
-        index: &Arc<ReadOnlyIndex>,
-        query_embeddings: &Tensor, // [num_tokens, dim]
+        shard: &IndexShard,
+        bucket_weights: &Tensor,
+        query_embeddings: &Tensor,
         nprobe: usize,
         subset: Option<&[i64]>,
+        per_cell_tokens: Option<&Tensor>,
     ) -> Result<DecompressedCentroidsOutput> {
-        let device = query_embeddings.device();
+        let device = shard.device;
         anyhow::ensure!(
             device.is_cuda(),
-            "CUDA decompression requested but query is on {:?}",
+            "CUDA decompression requested but source is on {:?}",
             device
         );
         anyhow::ensure!(nprobe > 0, "nprobe must be greater than zero");
@@ -277,10 +303,10 @@ impl CentroidDecompressor {
         let num_cells = capacities_i64.size()[0];
         let total_capacity = capacities_i64.sum(Kind::Int64).int64_value(&[]).max(0);
 
-        let sizes = capacities_i64.to_kind(Kind::Int);
+        let mut sizes = capacities_i64.to_kind(Kind::Int);
 
         let end_offsets = capacities_i64.cumsum(0, Kind::Int64);
-        let offsets = Tensor::zeros(&[num_cells + 1], (Kind::Int64, device));
+        let mut offsets = Tensor::zeros(&[num_cells + 1], (Kind::Int64, device));
         offsets
             .narrow(0, 1, num_cells)
             .copy_(&end_offsets.contiguous());
@@ -313,7 +339,7 @@ impl CentroidDecompressor {
         let intra = &ranges - &candidate_cell_starts;
         let embedding_indices = &candidate_begins + &intra;
 
-        let mut passage_ids = index
+        let mut passage_ids = shard
             .pids_compacted
             .index_select(0, &embedding_indices)
             .to_kind(Kind::Int64);
@@ -321,8 +347,9 @@ impl CentroidDecompressor {
         // Apply subset filter before expensive residual retrieval
         let (embedding_indices, candidate_cells, total_capacity) = if let Some(subset_ids) = subset
         {
-            let subset_tensor =
-                Tensor::from_slice(subset_ids).to_device(device).to_kind(Kind::Int64);
+            let subset_tensor = Tensor::from_slice(subset_ids)
+                .to_device(device)
+                .to_kind(Kind::Int64);
             let max_pid = passage_ids.max().int64_value(&[]);
             let max_subset = subset_tensor.max().int64_value(&[]);
             let lookup_size = max_pid.max(max_subset) + 1;
@@ -345,12 +372,24 @@ impl CentroidDecompressor {
             let embedding_indices = embedding_indices.index_select(0, &valid_indices);
             let candidate_cells = candidate_cells.index_select(0, &valid_indices);
             let total_capacity = valid_indices.size()[0];
+
+            // Rebuild sizes and offsets to reflect the filtered data so that
+            // downstream consumers index into the flat arrays correctly.
+            let mut filtered_counts = Tensor::zeros(&[num_cells], (Kind::Int64, device));
+            let ones = Tensor::ones(&[total_capacity], (Kind::Int64, device));
+            let _ = filtered_counts.scatter_add_(0, &candidate_cells, &ones);
+            sizes = filtered_counts.to_kind(Kind::Int);
+            offsets = Tensor::zeros(&[num_cells + 1], (Kind::Int64, device));
+            offsets
+                .narrow(0, 1, num_cells)
+                .copy_(&filtered_counts.cumsum(0, Kind::Int64).contiguous());
+
             (embedding_indices, candidate_cells, total_capacity)
         } else {
             (embedding_indices, candidate_cells, total_capacity)
         };
 
-        let residuals = index
+        let residuals = shard
             .residuals_compacted
             .index_select(0, &embedding_indices)
             .to_kind(Kind::Uint8);
@@ -412,14 +451,20 @@ impl CentroidDecompressor {
             Tensor::stack(&[hi, lo], -1).view([total_capacity, dim])
         };
 
-        let token_indices = candidate_cells.divide_scalar_mode(nprobe as i64, "trunc");
+        // Map each candidate to its query token index.
+        // When per_cell_tokens is provided, it maps cell positions directly to
+        // query tokens. When None, derive from cell_idx / nprobe.
+        let token_indices = match per_cell_tokens {
+            Some(ti) => ti.to_device(device).index_select(0, &candidate_cells),
+            None => candidate_cells.divide_scalar_mode(nprobe as i64, "trunc"),
+        };
 
-        let bucket_weights = index.bucket_weights.to_kind(Kind::Float);
+        let bucket_weights_f = bucket_weights.to_kind(Kind::Float);
         let query = query_embeddings.to_kind(Kind::Float);
 
         let query_per_candidate = query.index_select(0, &token_indices);
         let codes_flat = codes.to_kind(Kind::Int).view([-1]);
-        let weights_flat = bucket_weights.index_select(0, &codes_flat);
+        let weights_flat = bucket_weights_f.index_select(0, &codes_flat);
         let weights = weights_flat.view([total_capacity, dim]);
 
         let residual_scores = Tensor::einsum(
@@ -441,36 +486,38 @@ impl CentroidDecompressor {
         })
     }
 
-    // Helper function to process a single cell using narrow (zero-copy view) on compacted data
-    fn process_cell(
+    /// Process a single cell on CPU.
+    ///
+    /// `token_idx` is the precomputed query token index for this cell.
+    /// `data_cell_idx` is the index into capacities/begins/scores arrays.
+    fn process_cell_impl(
         &self,
-        cell_idx: usize,
+        token_idx: usize,
+        data_cell_idx: usize,
         capacities_vec: &[i64],
         begins_vec: &[i64],
         centroid_scores_vec: &[f32],
-        nprobe: usize,
-        num_tokens: usize,
         bucket_score_stride: usize,
         bucket_scores_flat: &[f32],
-        index: &Arc<ReadOnlyIndex>,
+        shard: &IndexShard,
         residual_bytes_per_embedding: usize,
         bucket_dim_shift: usize,
         subset_bitset: Option<&PassageBitset>,
     ) -> (Vec<i64>, Vec<f32>, i32) {
-        let capacity = capacities_vec[cell_idx] as usize;
+        let capacity = capacities_vec[data_cell_idx] as usize;
         if capacity == 0 {
             return (vec![], vec![], 0i32);
         }
 
-        let begin = begins_vec[cell_idx];
+        let begin = begins_vec[data_cell_idx];
 
-        // Use narrow for zero-copy views into compacted data, then convert to local Vecs
-        let local_pids_raw: Vec<i64> = index
+        // Use narrow for zero-copy views into compacted data
+        let local_pids_raw: Vec<i64> = shard
             .pids_compacted
             .narrow(0, begin, capacity as i64)
             .try_into()
             .unwrap_or_default();
-        let local_residuals_raw: Vec<u8> = index
+        let local_residuals_raw: Vec<u8> = shard
             .residuals_compacted
             .narrow(0, begin, capacity as i64)
             .to_kind(Kind::Uint8)
@@ -479,8 +526,7 @@ impl CentroidDecompressor {
             .try_into()
             .unwrap_or_default();
 
-        let centroid_score = centroid_scores_vec[cell_idx];
-        let token_idx = (cell_idx / nprobe).min(num_tokens - 1);
+        let centroid_score = centroid_scores_vec[data_cell_idx];
         let bucket_scores_offset = token_idx * bucket_score_stride;
         let token_bucket_scores =
             &bucket_scores_flat[bucket_scores_offset..bucket_scores_offset + bucket_score_stride];
