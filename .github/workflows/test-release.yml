@@ -33,7 +33,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Run tests
+        shell: bash
         run: |
-          uv pip install xtr-warp-rs==${{ inputs.release_tag }}
+          set -euxo pipefail
+          uv pip install -v "xtr-warp-rs==${{ inputs.release_tag }}"
           uv pip install pytest pytest-cov
           pytest tests/test.py tests/test_index_management.py tests/test_filtering.py

@@ -16,4 +16,5 @@ jobs:
       torch_suffix: "2100"
       torch_version: "2.10.0"
       torch_req: "torch>=2.10,<2.11"
+      tch_version: "0.23.0"
     secrets: inherit

@@ -87,6 +87,59 @@ def set_pyproject_torch_req(
         pyproject_toml.write_text(text, encoding="utf-8")
 
 
+def set_cargo_tch_versions(
+    cargo_toml: Path, tch_version: str, *, dry_run: bool
+) -> None:
+    """Pin the ``tch``, ``torch-sys``, and ``pyo3-tch`` crate versions.
+
+    These three crates are released in lockstep and must match the libtorch
+    ABI of the target PyTorch version. Handles three Cargo.toml syntaxes:
+    inline tables (``tch = { version = "x" }``), bare strings
+    (``pyo3-tch = "x"``), and dedicated sections
+    (``[dependencies.torch-sys]`` followed by ``version = "x"``).
+    """
+    text = cargo_toml.read_text(encoding="utf-8")
+    crates = ("tch", "torch-sys", "pyo3-tch")
+    total_replaced = 0
+    for crate in crates:
+        crate_re = re.escape(crate)
+        before = text
+        # Inline table form:  crate = { ... version = "x" ... }
+        text = re.sub(
+            rf'^(\s*{crate_re}\s*=\s*\{{[^}}\n]*?version\s*=\s*)"[^"]*"',
+            rf'\g<1>"{tch_version}"',
+            text,
+            flags=re.MULTILINE,
+        )
+        # Bare string form:  crate = "x"
+        text = re.sub(
+            rf'^(\s*{crate_re}\s*=\s*)"[^"]*"\s*$',
+            rf'\g<1>"{tch_version}"',
+            text,
+            flags=re.MULTILINE,
+        )
+        # Dedicated section form:  [dependencies.crate]\n... version = "x"
+        text = re.sub(
+            rf'(^\[(?:dependencies|build-dependencies|dev-dependencies)\.{crate_re}\][^\[]*?\n\s*version\s*=\s*)"[^"]*"',
+            rf'\g<1>"{tch_version}"',
+            text,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        if text != before:
+            total_replaced += 1
+        else:
+            raise SystemExit(
+                f"{cargo_toml}: did not find a '{crate}' dependency entry to replace"
+            )
+    if total_replaced != len(crates):
+        raise SystemExit(
+            f"{cargo_toml}: expected to replace {len(crates)} crate versions, "
+            f"replaced {total_replaced}"
+        )
+    if not dry_run:
+        cargo_toml.write_text(text, encoding="utf-8")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Prepare repo versions for release builds."
@@ -103,6 +156,13 @@ def main() -> int:
         "--torch-req",
         default=None,
         help='Replace torch requirement string (e.g. "torch>=2.9,<2.10")',
+    )
+    parser.add_argument(
+        "--tch-version",
+        default=None,
+        help='Pin tch / torch-sys / pyo3-tch crate versions in Cargo.toml '
+        '(e.g. "0.24.0" for torch 2.11). Required when targeting torch '
+        ">=2.10 because of libtorch ABI changes.",
     )
     parser.add_argument(
         "--dry-run",
@@ -128,6 +188,8 @@ def main() -> int:
     set_pyproject_version(pyproject_toml, args.version, dry_run=args.dry_run)
     if args.torch_req:
         set_pyproject_torch_req(pyproject_toml, args.torch_req, dry_run=args.dry_run)
+    if args.tch_version:
+        set_cargo_tch_versions(cargo_toml, args.tch_version, dry_run=args.dry_run)
 
     return 0
 

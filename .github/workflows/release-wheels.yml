@@ -20,6 +20,11 @@ on:
         description: 'Torch requirement metadata (e.g. "torch>=2.11,<2.12")'
         required: true
         type: string
+      tch_version:
+        description: 'tch/torch-sys/pyo3-tch crate version (e.g. "0.24.0" for torch 2.11; required for torch >=2.10 due to libtorch ABI changes)'
+        required: false
+        type: string
+        default: ""
   workflow_call:
     inputs:
       base_version:
@@ -34,6 +39,10 @@ on:
       torch_req:
         required: true
         type: string
+      tch_version:
+        required: false
+        type: string
+        default: ""
     secrets:
       PYPI_API_TOKEN:
         required: true
@@ -78,7 +87,15 @@ jobs:
       - name: Prepare version metadata
         shell: bash
         run: |
-          python scripts/release_prep.py --version "${{ inputs.base_version }}.${{ inputs.torch_suffix }}" --cargo-version "${{ inputs.base_version }}" --torch-req "${{ inputs.torch_req }}"
+          ARGS=(
+            --version "${{ inputs.base_version }}.${{ inputs.torch_suffix }}"
+            --cargo-version "${{ inputs.base_version }}"
+            --torch-req "${{ inputs.torch_req }}"
+          )
+          if [ -n "${{ inputs.tch_version }}" ]; then
+            ARGS+=(--tch-version "${{ inputs.tch_version }}")
+          fi
+          python scripts/release_prep.py "${ARGS[@]}"
 
       - name: Prepare Python Version for CIBW_BUILD
         id: prepare_python_version
