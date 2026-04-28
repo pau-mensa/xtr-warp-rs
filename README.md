@@ -210,7 +210,13 @@ Multi-thread p99 stays within ~7 ms of mean on most datasets (quora and trec-cov
 
 ### Sharded Index (RAM + VRAM as unified memory)
 
-When the index is too large for the available VRAM — or when you want to free up GPU memory for other workloads — xtr-warp-rs can shard it between RAM and GPU memory, treating both as a single unified pool. The split is controlled per-call via the `device` argument (e.g. `device={"cuda": 0.1, "cpu": 0.9}` keeps 10% of the work on GPU and 90% on CPU).
+When the index is too large for the available VRAM — or when you want to free up GPU memory for other workloads — xtr-warp-rs can shard it between RAM and GPU memory, treating both as a single unified pool. The split is configured at load time via the `device` argument to `load()`, which accepts three forms:
+
+- `str` — a single device (e.g. `"cuda"`, `"cpu"`, or `"auto"`). No sharding.
+- `list[str]` — a list of devices (e.g. `["cuda:0", "cpu"]`). Ratios are auto-computed to fill accelerator VRAM first and place the remainder on CPU.
+- `dict[str, float]` — explicit ratios per device (e.g. `{"cuda": 0.1, "cpu": 0.9}` keeps 10% of the work on GPU and 90% on CPU).
+
+You can also call `recommend_device_map(devices)` to get a suggested ratio dict based on available memory, or `estimate_index_memory()` to inspect per-component byte sizes before deciding on a split.
 
 The table below compares pure CUDA against a 10/90 GPU/CPU shard. Sharded mode trades roughly **40% of CUDA's QPS** for a substantial cut in peak GPU memory — and is still **8-23× faster than fast-plaid CUDA** on every dataset.
 
@@ -352,9 +358,9 @@ To help with memory management the API also exposes the `load` and `free` method
 
 ```python
 Parameter                 Default        Description
-device                    required       Device where to load the index (e.g., "cpu", "cuda", "mps")
+device                    "auto"         Where to load the index. Accepts a single device str ("cpu", "cuda", "cuda:0", "auto"), a list[str] (auto-computed shard ratios filling accelerator VRAM first), or a dict[str, float] mapping each device to an explicit ratio
 dtype                     torch.float32  Dtype to use for the centroids and bucket weights. Lowers the memory footprint but can cause alterations in retrieval metrics
-mmap                      True           Whether or not to load the large tensors ("codes" and "residuals") using memory mapping. Only available in "cpu"
+mmap                      True           Whether or not to load the large tensors ("codes" and "residuals") using memory mapping. Applied to CPU shards only when sharding is enabled
 ```
 
 > [!WARNING]
