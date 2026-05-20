@@ -5,7 +5,7 @@
   </p>
 </div>
 <p align="center">
-  <img src="https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg" alt="Python Versions">
+  <img src="https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg" alt="Python Versions">
   <img src="https://github.com/pau-mensa/xtr-warp-rs/actions/workflows/ci.yml/badge.svg" alt="CI Status">
   <img src="https://img.shields.io/badge/Platform-Ubuntu%7C%20macOS%20%7C%20Windows-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License">
