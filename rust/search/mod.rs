@@ -2,6 +2,7 @@
 
 pub mod centroid_selector;
 pub mod decompressor;
+pub(crate) mod int8_simd;
 pub mod loader;
 pub mod merger;
 mod candidate_assembly;

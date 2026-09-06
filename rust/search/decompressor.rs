@@ -31,7 +31,7 @@ impl CentroidDecompressor {
         })
     }
 
-    fn build_reversed_bit_map(nbits: u8) -> [u8; 256] {
+    pub fn build_reversed_bit_map(nbits: u8) -> [u8; 256] {
         let mut reversed = [0u8; 256];
         let nbits_mask = (1 << nbits) - 1;
         for byte_val in 0..256u32 {
@@ -54,6 +54,65 @@ impl CentroidDecompressor {
             reversed[byte_val as usize] = (reversed_bits & 0xFF) as u8;
         }
         reversed
+    }
+
+    /// Build quantized int8 lookup table with per-token symmetric scaling.
+    ///
+    /// The bit reversal is baked into the table so the scoring loop can
+    /// index directly with raw nibble/code values, skipping reversed_bit_map.
+    /// See: https://chaochunhsu.github.io/blog/slow-half-of-plaid/
+    pub fn build_int8_lut(
+        bucket_scores_flat: &[f32],
+        num_tokens: usize,
+        dim: usize,
+        num_buckets: usize,
+        nbits: u8,
+    ) -> (Vec<i8>, Vec<f32>) {
+        let stride = dim * num_buckets;
+
+        let code_rev: Vec<u8> = (0..num_buckets)
+            .map(|code| {
+                let mut r = 0u8;
+                for bit in 0..nbits {
+                    if (code as u8) & (1 << bit) != 0 {
+                        r |= 1 << (nbits - 1 - bit);
+                    }
+                }
+                r
+            })
+            .collect();
+
+        let mut weights = vec![0i8; num_tokens * stride];
+        let mut scales = vec![0.0f32; num_tokens];
+
+        for token in 0..num_tokens {
+            let offset = token * stride;
+            let token_scores = &bucket_scores_flat[offset..offset + stride];
+
+            let abs_max = token_scores
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max);
+            let scale = if abs_max > 1e-10 {
+                abs_max / 127.0
+            } else {
+                1.0
+            };
+            let inv_scale = 1.0 / scale;
+            scales[token] = scale;
+
+            for d in 0..dim {
+                for raw_code in 0..num_buckets {
+                    let reversed_code = code_rev[raw_code] as usize;
+                    let f32_val = token_scores[d * num_buckets + reversed_code];
+                    let quantized =
+                        (f32_val * inv_scale).round().clamp(-127.0, 127.0) as i8;
+                    weights[offset + d * num_buckets + raw_code] = quantized;
+                }
+            }
+        }
+
+        (weights, scales)
     }
 
     /// Decompress centroids for a single shard. Global centroid IDs are
@@ -173,6 +232,36 @@ impl CentroidDecompressor {
         let packed_vals_per_byte = 8usize / self.nbits as usize;
         let residual_bytes_per_embedding = self.dim / packed_vals_per_byte;
 
+        // Validate the on-disk residual row width against the metadata dim
+        // before scoring anything. `decompress_cuda` already does this; the
+        // CPU path did not, so an index whose residuals.npy disagrees with
+        // metadata.json (built at a different dim, or truncated) reached the
+        // scoring loop and produced wrong scores rather than an error.
+        // Checking here, once per call, keeps the per-cell scorers free of
+        // shape concerns.
+        let packed_dim = shard.residuals_compacted.size()[1];
+        anyhow::ensure!(
+            packed_dim as usize * packed_vals_per_byte == self.dim,
+            "Residual shape mismatch: packed_dim={} implies dim={}, but index dim={}",
+            packed_dim,
+            packed_dim as usize * packed_vals_per_byte,
+            self.dim
+        );
+
+        let use_int8 = std::env::var("XTR_WARP_INT8").map_or(true, |v| v != "0");
+        let (int8_lut, int8_scales) = if use_int8 {
+            let (w, s) = Self::build_int8_lut(
+                &bucket_scores_flat,
+                num_tokens,
+                self.dim,
+                num_buckets,
+                self.nbits,
+            );
+            (Some(w), Some(s))
+        } else {
+            (None, None)
+        };
+
         let total_capacity = capacities_vec.iter().sum::<i64>().max(0) as usize;
 
         // Convert per-cell token indices (None → derive from cell_idx / nprobe)
@@ -191,6 +280,8 @@ impl CentroidDecompressor {
         if use_parallel {
             let subset_bitset_ref = subset_bitset.as_ref();
             let tokens_ref = per_cell_tokens_vec.as_ref();
+            let int8_lut_ref = int8_lut.as_deref();
+            let int8_scales_ref = int8_scales.as_deref();
             let cell_results: Vec<_> = self.thread_pool.install(|| {
                 (0..num_cells)
                     .into_par_iter()
@@ -210,6 +301,8 @@ impl CentroidDecompressor {
                             residual_bytes_per_embedding,
                             bucket_dim_shift,
                             subset_bitset_ref,
+                            int8_lut_ref,
+                            int8_scales_ref,
                         )
                     })
                     .collect()
@@ -247,6 +340,8 @@ impl CentroidDecompressor {
                     residual_bytes_per_embedding,
                     bucket_dim_shift,
                     subset_bitset.as_ref(),
+                    int8_lut.as_deref(),
+                    int8_scales.as_deref(),
                 );
 
                 candidate_sizes[cell_idx] = size;
@@ -503,6 +598,8 @@ impl CentroidDecompressor {
         residual_bytes_per_embedding: usize,
         bucket_dim_shift: usize,
         subset_bitset: Option<&PassageBitset>,
+        int8_lut: Option<&[i8]>,
+        int8_scales: Option<&[f32]>,
     ) -> (Vec<i64>, Vec<f32>, i32) {
         let capacity = capacities_vec[data_cell_idx] as usize;
         if capacity == 0 {
@@ -531,6 +628,26 @@ impl CentroidDecompressor {
         let token_bucket_scores =
             &bucket_scores_flat[bucket_scores_offset..bucket_scores_offset + bucket_score_stride];
 
+        // Pre-compute all residual scores when SIMD batch scoring applies
+        // (int8 enabled, 4-bit codes). The batch kernel scores 16 documents
+        // per tbl/pshufb instruction instead of one scalar lookup each.
+        let batch_i32: Option<Vec<i32>> =
+            if let (Some(lut), Some(_)) = (int8_lut, int8_scales) {
+                if self.nbits == 4 {
+                    let off = token_idx * bucket_score_stride;
+                    Some(crate::search::int8_simd::score_batch_4bit(
+                        &local_residuals_raw,
+                        capacity,
+                        residual_bytes_per_embedding,
+                        &lut[off..off + bucket_score_stride],
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         // Score all embeddings in this cell
         let mut scored: Vec<(i64, f32)> = Vec::with_capacity(capacity);
         for i in 0..capacity {
@@ -540,24 +657,45 @@ impl CentroidDecompressor {
                     continue;
                 }
             }
-            let residual_start = i * residual_bytes_per_embedding;
-            let residual_end = residual_start + residual_bytes_per_embedding;
-            let residual_bytes = &local_residuals_raw[residual_start..residual_end];
 
-            let residual_score = if self.nbits == 2 {
-                Self::decompress_residual_2bit(
-                    residual_bytes,
-                    &self.reversed_bit_map,
-                    token_bucket_scores,
-                    bucket_dim_shift,
-                )
+            let residual_score = if let Some(ref batch) = batch_i32 {
+                batch[i] as f32 * int8_scales.unwrap()[token_idx]
             } else {
-                Self::decompress_residual_4bit(
-                    residual_bytes,
-                    &self.reversed_bit_map,
-                    token_bucket_scores,
-                    bucket_dim_shift,
-                )
+                let residual_start = i * residual_bytes_per_embedding;
+                let residual_end = residual_start + residual_bytes_per_embedding;
+                let residual_bytes =
+                    &local_residuals_raw[residual_start..residual_end];
+
+                if let (Some(lut), Some(scales)) = (int8_lut, int8_scales) {
+                    let off = token_idx * bucket_score_stride;
+                    let token_lut = &lut[off..off + bucket_score_stride];
+                    // Route on nbits explicitly. Today this branch is only
+                    // reachable with nbits == 2 (4-bit is handled by the batch
+                    // above), but calling the 2-bit scorer on 4-bit data reads
+                    // the wrong LUT entries *without* going out of bounds, so
+                    // it would silently return garbage rather than panic if
+                    // the batch path ever gains a guard.
+                    let raw_sum = if self.nbits == 4 {
+                        Self::score_residual_4bit_int8(residual_bytes, token_lut)
+                    } else {
+                        Self::score_residual_2bit_int8(residual_bytes, token_lut)
+                    };
+                    raw_sum as f32 * scales[token_idx]
+                } else if self.nbits == 2 {
+                    Self::decompress_residual_2bit(
+                        residual_bytes,
+                        &self.reversed_bit_map,
+                        token_bucket_scores,
+                        bucket_dim_shift,
+                    )
+                } else {
+                    Self::decompress_residual_4bit(
+                        residual_bytes,
+                        &self.reversed_bit_map,
+                        token_bucket_scores,
+                        bucket_dim_shift,
+                    )
+                }
             };
 
             scored.push((pid, centroid_score + residual_score));
@@ -588,7 +726,7 @@ impl CentroidDecompressor {
         (dedup_pids, dedup_scores, size)
     }
 
-    fn decompress_residual_2bit(
+    pub fn decompress_residual_2bit(
         residual: &[u8],
         reversed_bit_map: &[u8; 256],
         bucket_scores: &[f32],
@@ -620,7 +758,7 @@ impl CentroidDecompressor {
         score
     }
 
-    fn decompress_residual_4bit(
+    pub fn decompress_residual_4bit(
         residual: &[u8],
         reversed_bit_map: &[u8; 256],
         bucket_scores: &[f32],
@@ -641,5 +779,114 @@ impl CentroidDecompressor {
             score += bucket_scores[idx0] + bucket_scores[idx1];
         }
         score
+    }
+
+    /// Int8 scoring for 4-bit residuals. Bit reversal is pre-baked into the
+    /// LUT, so the hot loop is two table lookups and two i32 adds per byte.
+    #[inline]
+    pub fn score_residual_4bit_int8(residual: &[u8], lut: &[i8]) -> i32 {
+        let mut sum: i32 = 0;
+        for (i, &packed) in residual.iter().enumerate() {
+            let d0 = i << 1;
+            let d1 = d0 + 1;
+            let hi = (packed >> 4) as usize;
+            let lo = (packed & 0x0F) as usize;
+            sum += lut[(d0 << 4) | hi] as i32;
+            sum += lut[(d1 << 4) | lo] as i32;
+        }
+        sum
+    }
+
+    /// Int8 scoring for 2-bit residuals.
+    #[inline]
+    pub fn score_residual_2bit_int8(residual: &[u8], lut: &[i8]) -> i32 {
+        let mut sum: i32 = 0;
+        for (i, &packed) in residual.iter().enumerate() {
+            let d0 = i << 2;
+            let c0 = (packed >> 6) as usize;
+            let c1 = ((packed >> 4) & 0x03) as usize;
+            let c2 = ((packed >> 2) & 0x03) as usize;
+            let c3 = (packed & 0x03) as usize;
+            sum += lut[(d0 << 2) | c0] as i32;
+            sum += lut[((d0 + 1) << 2) | c1] as i32;
+            sum += lut[((d0 + 2) << 2) | c2] as i32;
+            sum += lut[((d0 + 3) << 2) | c3] as i32;
+        }
+        sum
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn int8_4bit_matches_f32() {
+        let dim = 128;
+        let num_buckets = 16usize;
+        let num_tokens = 1;
+        let stride = dim * num_buckets;
+
+        let bucket_scores: Vec<f32> = (0..num_tokens * stride)
+            .map(|i| (i as f32 * 0.7123).sin() * 0.5)
+            .collect();
+
+        let reversed_bit_map = CentroidDecompressor::build_reversed_bit_map(4);
+        let (i8_lut, scales) =
+            CentroidDecompressor::build_int8_lut(&bucket_scores, num_tokens, dim, num_buckets, 4);
+
+        let residual: Vec<u8> = (0..dim / 2).map(|i| (i * 37 + 13) as u8).collect();
+
+        let f32_score = CentroidDecompressor::decompress_residual_4bit(
+            &residual,
+            &reversed_bit_map,
+            &bucket_scores,
+            4,
+        );
+
+        let i8_sum = CentroidDecompressor::score_residual_4bit_int8(&residual, &i8_lut);
+        let i8_score = i8_sum as f32 * scales[0];
+
+        let abs_err = (f32_score - i8_score).abs();
+        let rel_err = abs_err / f32_score.abs().max(1e-6);
+        assert!(
+            rel_err < 0.02,
+            "f32={f32_score:.6} i8={i8_score:.6} rel_err={rel_err:.4}"
+        );
+    }
+
+    #[test]
+    fn int8_2bit_matches_f32() {
+        let dim = 128;
+        let num_buckets = 4usize;
+        let num_tokens = 1;
+        let stride = dim * num_buckets;
+
+        let bucket_scores: Vec<f32> = (0..num_tokens * stride)
+            .map(|i| (i as f32 * 0.3917).cos() * 0.4)
+            .collect();
+
+        let reversed_bit_map = CentroidDecompressor::build_reversed_bit_map(2);
+        let (i8_lut, scales) =
+            CentroidDecompressor::build_int8_lut(&bucket_scores, num_tokens, dim, num_buckets, 2);
+
+        let residual: Vec<u8> = (0..dim / 4).map(|i| (i * 53 + 7) as u8).collect();
+
+        let f32_score = CentroidDecompressor::decompress_residual_2bit(
+            &residual,
+            &reversed_bit_map,
+            &bucket_scores,
+            2,
+        );
+
+        let i8_sum = CentroidDecompressor::score_residual_2bit_int8(&residual, &i8_lut);
+        let i8_score = i8_sum as f32 * scales[0];
+
+        let abs_err = (f32_score - i8_score).abs();
+        let rel_err = abs_err / f32_score.abs().max(1e-6);
+        assert!(
+            rel_err < 0.02,
+            "f32={f32_score:.6} i8={i8_score:.6} rel_err={rel_err:.4}"
+        );
     }
 }

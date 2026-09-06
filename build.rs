@@ -9,9 +9,10 @@ fn main() {
 
     let os = env::var("CARGO_CFG_TARGET_OS").expect("Unable to get TARGET_OS");
 
-    // Existing libtorch linkage (unchanged from previous build.rs).
+    // Linux needs these GNU linker arguments for downstream binaries. MSVC
+    // receives its link libraries from torch-sys and does not understand them.
     match os.as_str() {
-        "linux" | "windows" => {
+        "linux" => {
             if let Some(lib_path) = env::var_os("DEP_TCH_LIBTORCH_LIB") {
                 println!(
                     "cargo:rustc-link-arg=-Wl,-rpath={}",

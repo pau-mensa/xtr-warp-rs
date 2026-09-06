@@ -35,8 +35,102 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install deps and run tests
+      - name: Install dependencies
         run: |
           uv pip install "torch==2.9.0" pytest pytest-cov maturin numpy setuptools
           uv pip install --no-build-isolation -e .
+
+      # The Rust test harness is a standalone executable rather than a Python
+      # extension, so it has no Python host to supply libtorch_python's
+      # flat-namespace Python C API symbols, and no rpath to PyTorch's dylibs.
+      #
+      # Both gaps are closed with loader variables, but DYLD_INSERT_LIBRARIES
+      # must NOT wrap `cargo test`: it would then also be injected into Cargo's
+      # build scripts and linker invocations, which run as arm64e system
+      # binaries and abort with "missing compatible architecture (have
+      # 'x86_64,arm64', need 'arm64e')". So compile first with a clean
+      # environment, then run only the produced arm64 test executables with the
+      # loader variables set.
+      - name: Run Rust tests (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -eo pipefail
+
+          TORCH_LIB_DIR="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"
+
+          # Locate the Python runtime library to preload. A framework build
+          # (the python.org install on GitHub's runner images) reports
+          # LDLIBRARY as a framework-relative path whose base is
+          # PYTHONFRAMEWORKPREFIX, not LIBDIR. A uv-managed interpreter is an
+          # ordinary shared build with a plain libpython under LIBDIR.
+          PY_LDLIBRARY="$(python -c 'import sysconfig; print(sysconfig.get_config_var("LDLIBRARY") or "")')"
+          PY_LIBDIR="$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"
+          PY_FWPREFIX="$(python -c 'import sysconfig; print(sysconfig.get_config_var("PYTHONFRAMEWORKPREFIX") or "")')"
+          PY_ABIFLAGS="$(python -c 'import sysconfig; print(sysconfig.get_config_var("ABIFLAGS") or "")')"
+          PY_BASE="$(python -c 'import sys; print(sys.base_prefix)')"
+          PY_VER="$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+
+          PYTHON_DYLIB=""
+          PYTHON_CANDIDATES=(
+            "${PY_FWPREFIX:+${PY_FWPREFIX}/${PY_LDLIBRARY}}"
+            "${PY_LIBDIR:+${PY_LIBDIR}/${PY_LDLIBRARY}}"
+            "${PY_BASE}/Python"
+            "${PY_LIBDIR:+${PY_LIBDIR}/libpython${PY_VER}${PY_ABIFLAGS}.dylib}"
+            "${PY_BASE}/lib/libpython${PY_VER}${PY_ABIFLAGS}.dylib"
+          )
+          for candidate in "${PYTHON_CANDIDATES[@]}"; do
+            if [[ -n "$candidate" && -f "$candidate" ]]; then
+              PYTHON_DYLIB="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$PYTHON_DYLIB" ]]; then
+            echo "::error::No Python runtime library found. Tried:"
+            printf '  %s\n' "${PYTHON_CANDIDATES[@]}"
+            echo "base_prefix=${PY_BASE} LIBDIR=${PY_LIBDIR} LDLIBRARY=${PY_LDLIBRARY} PYTHONFRAMEWORKPREFIX=${PY_FWPREFIX}"
+            exit 1
+          fi
+
+          echo "torch lib dir: $TORCH_LIB_DIR"
+          echo "python dylib:  $PYTHON_DYLIB"
+
+          # Compile without running. json-render-diagnostics keeps compiler
+          # errors readable on stderr while the artifact JSON goes to stdout.
+          cargo test --release --no-run --message-format=json-render-diagnostics \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true)
+                     | .executable | select(. != null)' \
+            > "${RUNNER_TEMP}/rust-test-binaries.txt"
+
+          if [[ ! -s "${RUNNER_TEMP}/rust-test-binaries.txt" ]]; then
+            echo "::error::cargo test --no-run produced no test executables"
+            exit 1
+          fi
+
+          status=0
+          while IFS= read -r test_bin; do
+            [[ -n "$test_bin" ]] || continue
+            echo "Running $test_bin"
+            DYLD_LIBRARY_PATH="${TORCH_LIB_DIR}${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}" \
+            DYLD_INSERT_LIBRARIES="$PYTHON_DYLIB" \
+              "$test_bin" || status=$?
+          done < "${RUNNER_TEMP}/rust-test-binaries.txt"
+          exit $status
+
+      - name: Run Rust tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $torchLibDir = python -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"
+          $pythonDir = python -c "import sys; print(sys.base_prefix)"
+          $env:PATH = "$torchLibDir;$pythonDir;$env:PATH"
+          cargo test --release
+
+      - name: Run Rust tests (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test --release
+
+      - name: Run Python tests
+        run: |
           pytest tests/test.py tests/test_index_management.py tests/test_filtering.py

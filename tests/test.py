@@ -45,6 +45,42 @@ def test():
     shutil.rmtree(index_name, ignore_errors=True)
 
 
+def test_int8_is_default_and_can_be_disabled(monkeypatch, tmp_path):
+    """Unset uses int8 scoring, while XTR_WARP_INT8=0 selects f32 scoring."""
+    torch.manual_seed(42)
+    documents_embeddings = [torch.randn(32, 128) for _ in range(32)]
+    queries_embeddings = torch.randn(3, 16, 128)
+
+    index = XTRWarp(index=str(tmp_path / "int8_default_index"))
+    index.create(
+        embeddings_source=documents_embeddings,
+        kmeans_niters=4,
+        max_points_per_centroid=256,
+        nbits=4,
+        seed=42,
+        device="cpu",
+    )
+    index.load("cpu")
+
+    search_kwargs = {
+        "queries_embeddings": queries_embeddings,
+        "top_k": 5,
+        "num_threads": 1,
+    }
+
+    monkeypatch.delenv("XTR_WARP_INT8", raising=False)
+    default_results = index.search(**search_kwargs)
+
+    monkeypatch.setenv("XTR_WARP_INT8", "1")
+    explicit_int8_results = index.search(**search_kwargs)
+
+    monkeypatch.setenv("XTR_WARP_INT8", "0")
+    f32_results = index.search(**search_kwargs)
+
+    assert default_results == explicit_int8_results
+    assert default_results != f32_results
+
+
 def test_embeddings_from_path():
     """Ensure that embeddings can be loaded from a path."""
     index_name = ".indices/test_index_path"
