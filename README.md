@@ -25,7 +25,7 @@ xtr-warp-rs is a high-performance implementation of the **WARP** engine for mult
 
 Compared to the current SOTA (FastPlaid), xtr-warp-rs focuses on doing less work per query while staying close in quality: it prunes the centroid/posting-list space per token, uses an error-aware merge that keeps ranking stable with fewer examined candidates, and keeps the hot path (selection → decompression → merge) highly optimized and parallel friendly.
 
-**Speed**: Achieves **10-40x** speedup on CUDA and **7-130x** on CPU (depending on dataset and thread count) vs FastPlaid.
+**Speed**: Achieves **10-40x** speedup on CUDA and **7-147x** on CPU (depending on dataset and thread count) vs FastPlaid.
 
 **Memory**: During search WARP reduces peak CPU memory by **60%** on average vs FastPlaid, reaching **82%** on individual datasets. The sharded execution mode treats RAM+VRAM as a unified pool and cuts peak GPU memory by another **38%** on average over pure CUDA. During index creation the VRAM usage is around **10%** less, with an optional streaming mode that reduces it further by **66%** at a **20-25%** speed cost.
 
@@ -281,6 +281,7 @@ n_samples_kmeans           None        Samples for K-means clustering
 seed                       42          Random seed for reproducibility
 use_triton_kmeans          None        Whether to use Triton-based K-means
 metadata                   None        List of dicts (one per document) for metadata filtering
+resume                     False       Resume an interrupted disk-backed build from completed chunk checkpoints
 ```
 
 > [!IMPORTANT]
@@ -330,6 +331,38 @@ Example structure:
 ├── embeddings_1.doclens.npy
 ...
 ```
+
+#### Resuming an Interrupted Build
+
+Index creation from a disk-backed embedding source is resumable. During creation,
+WARP saves its build state and marks each completed compression chunk atomically. If
+the process is interrupted, call `create()` again with the same source and build
+parameters, adding `resume=True`:
+
+```python
+from xtr_warp import XTRWarp
+
+index = XTRWarp(index="index")
+create_options = {
+    "embeddings_source": "/path/to/embeddings",
+    "device": "cuda",
+    "indexing_chunk_size": 256,
+    "compression_batch_size": 32_768,
+}
+
+# Initial build
+index.create(**create_options)
+
+# If the initial build is interrupted, restart the process and resume it
+index = XTRWarp(index="index")
+index.create(**create_options, resume=True)
+```
+
+The resumed build reuses saved centroids, residual-codec state, and the contiguous
+prefix of completed chunks; an incomplete chunk is encoded again. Resuming requires
+the original disk source and identical build parameters. WARP rejects changed inputs
+or settings rather than combining incompatible checkpoints. It also rejects
+`resume=True` for in-memory embeddings and for an already completed index.
 
 ### Loading
 
