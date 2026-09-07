@@ -9,9 +9,11 @@ Internals are split across:
 - :mod:`xtr_warp.device_planner` — VRAM-aware shard ratios
 - :mod:`xtr_warp.index_maintenance` — centroid expansion and threshold recalibration
 """
+
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -187,6 +189,14 @@ class XTRWarp:
         metadata: list[dict] | None = None,
         show_progress: bool = True,
         sample_workers: int | None = None,
+        num_partitions: int | None = None,
+        kmeans_sample_max_bytes: int | None = 2 * 1024**3,
+        kmeans_data_chunk_size: int = 32_768,
+        kmeans_centroid_chunk_size: int = 8_192,
+        indexing_chunk_size: int = 256,
+        compression_batch_size: int = 32_768,
+        codec_sample_max_tokens: int = 1_000_000,
+        resume: bool = False,
     ) -> "XTRWarp":
         """Create and saves the XTRWarp index.
 
@@ -212,6 +222,24 @@ class XTRWarp:
         use_triton_kmeans:
             Whether to use the Triton-based K-means implementation. If None, it will be
             set to True if the device is not "cpu".
+        num_partitions:
+            Explicit centroid/codebook count. If omitted, the corpus-size heuristic
+            is used. This value must not exceed the sampled token count.
+        kmeans_sample_max_bytes:
+            Maximum bytes occupied by the float32 K-means sample. Defaults to 2 GiB;
+            set to None to disable the guard.
+        kmeans_data_chunk_size:
+            Maximum training points in a K-means distance tile.
+        kmeans_centroid_chunk_size:
+            Maximum centroids in a K-means distance tile.
+        indexing_chunk_size:
+            Maximum documents retained in memory while encoding one index chunk.
+        compression_batch_size:
+            Maximum token embeddings compressed at once on the selected device.
+        codec_sample_max_tokens:
+            Maximum token embeddings retained while training residual quantization.
+        resume:
+            Preserve and reuse a contiguous prefix of completed compression chunks.
 
         """
         self.device = device
@@ -235,41 +263,120 @@ class XTRWarp:
         else:
             embeddings_path = Path(embeddings_source)
 
-        self._prepare_index_directory(index_path=self.index)
-
-        centroids, dim = compute_kmeans(
-            embeddings_source=embeddings_path or documents_embeddings,
-            kmeans_niters=kmeans_niters,
-            device=device,
-            max_points_per_centroid=max_points_per_centroid,
-            n_samples_kmeans=n_samples_kmeans,
-            seed=seed,
-            use_triton_kmeans=use_triton_kmeans,
-            sample_workers=sample_workers,
+        if resume and embeddings_path is None:
+            error = "resume=True requires a durable disk embedding source"
+            raise ValueError(error)
+        source_description = (
+            self._disk_source_signature(embeddings_path)
+            if embeddings_path
+            else {"kind": "in-memory", "documents": len(documents_embeddings or [])}
         )
+        build_configuration = {
+            "source": source_description,
+            "device": device,
+            "nbits": nbits,
+            "seed": seed,
+            "kmeans_niters": kmeans_niters,
+            "max_points_per_centroid": max_points_per_centroid,
+            "n_samples_kmeans": n_samples_kmeans,
+            "use_triton_kmeans": use_triton_kmeans,
+            "num_partitions": num_partitions,
+            "kmeans_sample_max_bytes": kmeans_sample_max_bytes,
+            "kmeans_data_chunk_size": kmeans_data_chunk_size,
+            "kmeans_centroid_chunk_size": kmeans_centroid_chunk_size,
+            "indexing_chunk_size": indexing_chunk_size,
+            "compression_batch_size": compression_batch_size,
+            "codec_sample_max_tokens": codec_sample_max_tokens,
+        }
+        self._validate_resume_configuration(build_configuration, resume=resume)
+        self._prepare_index_directory(index_path=self.index, resume=resume)
+        self._write_build_state("clustering", configuration=build_configuration)
 
-        xtr_warp_rs.create(
-            index=self.index,
-            torch_path=torch_path,
-            device=device,
-            nbits=nbits,
-            centroids=centroids,
-            embeddings=documents_embeddings or str(embeddings_path),
-            embedding_dim=dim,
-            seed=seed,
-            show_progress=show_progress,
-        )
+        try:
+            centroids_path = Path(self.index) / "centroids.npy"
+            if resume and centroids_path.is_file():
+                centroids = torch.from_numpy(np.load(centroids_path)).to(
+                    device=device, dtype=torch.float32
+                )
+                dim = int(centroids.shape[1])
+                if num_partitions is not None and len(centroids) != num_partitions:
+                    error = (
+                        f"Resume checkpoint has {len(centroids):,} centroids, "
+                        f"not the requested {num_partitions:,}"
+                    )
+                    raise ValueError(error)
+                logger.warning(
+                    "Resuming with %s saved centroids from %s",
+                    f"{len(centroids):,}",
+                    centroids_path,
+                )
+            else:
+                centroids, dim = compute_kmeans(
+                    embeddings_source=embeddings_path or documents_embeddings,
+                    kmeans_niters=kmeans_niters,
+                    device=device,
+                    max_points_per_centroid=max_points_per_centroid,
+                    n_samples_kmeans=n_samples_kmeans,
+                    seed=seed,
+                    use_triton_kmeans=use_triton_kmeans,
+                    sample_workers=sample_workers,
+                    num_partitions_override=num_partitions,
+                    kmeans_sample_max_bytes=kmeans_sample_max_bytes,
+                    kmeans_data_chunk_size=kmeans_data_chunk_size,
+                    kmeans_centroid_chunk_size=kmeans_centroid_chunk_size,
+                )
 
-        if metadata is not None:
-            store = MetadataStore(self.index)
-            store.create(metadata, start_pid=0)
-            store.close()
+            self._write_build_state("encoding", configuration=build_configuration)
+            xtr_warp_rs.create(
+                index=self.index,
+                torch_path=torch_path,
+                device=device,
+                nbits=nbits,
+                centroids=centroids,
+                embeddings=documents_embeddings or str(embeddings_path),
+                embedding_dim=dim,
+                seed=seed,
+                indexing_chunk_size=indexing_chunk_size,
+                compression_batch_size=compression_batch_size,
+                codec_sample_max_tokens=codec_sample_max_tokens,
+                resume=resume,
+                show_progress=show_progress,
+            )
+
+            self._write_build_state("metadata", configuration=build_configuration)
+            if metadata is not None:
+                store = MetadataStore(self.index)
+                store.create(metadata, start_pid=0)
+                store.close()
+        except BaseException as error:
+            self._write_build_state(
+                "failed", configuration=build_configuration, error=repr(error)
+            )
+            raise
+
+        self._write_build_state("complete", configuration=build_configuration)
 
         return self
 
     @staticmethod
-    def _prepare_index_directory(index_path: str) -> None:
+    def _prepare_index_directory(index_path: str, *, resume: bool = False) -> None:
         """Prepare the index directory by cleaning or creating it."""
+        if resume and os.path.isdir(index_path):
+            # Keep the chunk checkpoints, but drop anything that is rebuilt
+            # by finalization or that only a finished index can own.
+            for pattern in (
+                "*.compacted.npy",
+                "deleted_pids.npy",
+                "metadata.json",
+                ".compact-part-*.tmp",
+                "*.duckdb*",
+            ):
+                for stale in glob.glob(os.path.join(index_path, pattern)):
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
+            return
         if os.path.exists(index_path) and os.path.isdir(index_path):
             for pattern in ("*.json", "*.npy", "*.pt", "*.duckdb*"):
                 for stale in glob.glob(os.path.join(index_path, pattern)):
@@ -279,6 +386,88 @@ class XTRWarp:
                         pass
         elif not os.path.exists(index_path):
             os.makedirs(index_path)
+
+    def _write_build_state(
+        self,
+        stage: str,
+        *,
+        configuration: dict,
+        error: str | None = None,
+    ) -> None:
+        """Atomically persist the latest durable index-build stage."""
+        state_path = Path(self.index) / "build_state.json"
+        temporary_path = state_path.with_suffix(".json.tmp")
+        state = {"stage": stage, "configuration": configuration}
+        if error is not None:
+            state["error"] = error
+        temporary_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        temporary_path.replace(state_path)
+
+    @staticmethod
+    def _disk_source_signature(path: Path) -> dict:
+        """Fingerprint cache metadata without rereading every embedding byte."""
+        resolved = path.resolve()
+        if resolved.is_file():
+            files = [resolved]
+            sidecar = resolved.with_suffix(".doclens.npy")
+            if sidecar.is_file():
+                files.append(sidecar)
+            manifest_candidates = (
+                resolved.parent / "manifest.json",
+                resolved.parent.parent / "manifest.json",
+            )
+        else:
+            files = sorted(resolved.glob("*.npy"))
+            manifest_candidates = (resolved.parent / "manifest.json",)
+        digest = hashlib.sha256()
+        total_bytes = 0
+        for file_path in files:
+            stat = file_path.stat()
+            total_bytes += stat.st_size
+            digest.update(file_path.name.encode())
+            digest.update(f":{stat.st_size}:{stat.st_mtime_ns}\n".encode())
+        for manifest_path in manifest_candidates:
+            if manifest_path.is_file():
+                digest.update(manifest_path.read_bytes())
+                break
+        return {
+            "kind": "disk",
+            "path": str(resolved),
+            "file_count": len(files),
+            "total_bytes": total_bytes,
+            "metadata_sha256": digest.hexdigest(),
+        }
+
+    def _validate_resume_configuration(
+        self, configuration: dict, *, resume: bool
+    ) -> None:
+        if not resume:
+            return
+        state_path = Path(self.index) / "build_state.json"
+        if not state_path.is_file():
+            has_chunks = any(Path(self.index).glob("*.metadata.json"))
+            if has_chunks:
+                error = (
+                    "Cannot safely resume chunks created without build_state.json; "
+                    "restart with resume=False"
+                )
+                raise ValueError(error)
+            return
+        previous = json.loads(state_path.read_text(encoding="utf-8"))
+        if previous.get("stage") == "complete":
+            error = (
+                "This index finished building; resume=True would rebuild it on "
+                "top of a finished index. Restart with resume=False."
+            )
+            raise ValueError(error)
+        if previous.get("configuration") != configuration:
+            error = (
+                "Resume configuration differs from the checkpoint. Restart with "
+                "resume=False or use the original build parameters."
+            )
+            raise ValueError(error)
 
     def delete(
         self,

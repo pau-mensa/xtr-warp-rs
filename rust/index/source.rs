@@ -11,6 +11,11 @@ pub trait EmbeddingSource {
         &mut self,
         chunk_size: usize,
     ) -> Result<Box<dyn Iterator<Item = Result<DocChunk>> + '_>>;
+    fn chunk_iter_from(
+        &mut self,
+        chunk_size: usize,
+        start_doc: usize,
+    ) -> Result<Box<dyn Iterator<Item = Result<DocChunk>> + '_>>;
     fn get_doc(&self, _idx: usize) -> Option<&Tensor> {
         None
     }
@@ -62,6 +67,35 @@ impl EmbeddingSource for InMemoryEmbeddingSource {
         Ok(Box::new(iter))
     }
 
+    fn chunk_iter_from(
+        &mut self,
+        chunk_size: usize,
+        start_doc: usize,
+    ) -> Result<Box<dyn Iterator<Item = Result<DocChunk>> + '_>> {
+        anyhow::ensure!(
+            start_doc <= self.embeddings.len(),
+            "start_doc is out of range"
+        );
+        let embeddings = &self.embeddings;
+        let total = embeddings.len();
+        let iter = (start_doc..total).step_by(chunk_size).map(move |offset| {
+            let end = (offset + chunk_size).min(total);
+            let chunk_embeddings: Vec<Tensor> = embeddings[offset..end]
+                .iter()
+                .map(|tensor| tensor.shallow_clone())
+                .collect();
+            let doclens = chunk_embeddings
+                .iter()
+                .map(|embedding| embedding.size()[0])
+                .collect();
+            Ok(DocChunk {
+                embeddings: chunk_embeddings,
+                doclens,
+            })
+        });
+        Ok(Box::new(iter))
+    }
+
     fn get_doc(&self, idx: usize) -> Option<&Tensor> {
         self.embeddings.get(idx)
     }
@@ -75,6 +109,7 @@ impl From<Vec<Tensor>> for InMemoryEmbeddingSource {
 
 pub struct DiskEmbeddingSource {
     files: Vec<PathBuf>,
+    file_num_docs: Vec<usize>,
     num_docs: usize,
 }
 
@@ -83,10 +118,17 @@ impl DiskEmbeddingSource {
         let path = path.as_ref();
         let files = list_embedding_files(path)?;
         let mut num_docs = 0usize;
+        let mut file_num_docs = Vec::with_capacity(files.len());
         for file in &files {
-            num_docs += count_docs_for_file(file)?;
+            let count = count_docs_for_file(file)?;
+            file_num_docs.push(count);
+            num_docs += count;
         }
-        Ok(Self { files, num_docs })
+        Ok(Self {
+            files,
+            file_num_docs,
+            num_docs,
+        })
     }
 }
 
@@ -100,7 +142,29 @@ impl EmbeddingSource for DiskEmbeddingSource {
         chunk_size: usize,
     ) -> Result<Box<dyn Iterator<Item = Result<DocChunk>> + '_>> {
         let files = self.files.clone();
-        Ok(Box::new(DiskChunkIter::new(files, chunk_size)))
+        Ok(Box::new(DiskChunkIter::new(files, chunk_size, 0, 0)))
+    }
+
+    fn chunk_iter_from(
+        &mut self,
+        chunk_size: usize,
+        start_doc: usize,
+    ) -> Result<Box<dyn Iterator<Item = Result<DocChunk>> + '_>> {
+        anyhow::ensure!(start_doc <= self.num_docs, "start_doc is out of range");
+        let mut preceding_docs = 0usize;
+        let mut file_idx = 0usize;
+        while file_idx < self.files.len()
+            && preceding_docs + self.file_num_docs[file_idx] <= start_doc
+        {
+            preceding_docs += self.file_num_docs[file_idx];
+            file_idx += 1;
+        }
+        Ok(Box::new(DiskChunkIter::new(
+            self.files.clone(),
+            chunk_size,
+            file_idx,
+            start_doc - preceding_docs,
+        )))
     }
 }
 
@@ -111,17 +175,24 @@ struct DiskChunkIter {
     current_docs: VecDeque<Tensor>,
     current_doclens: VecDeque<i64>,
     failed: bool,
+    skip_docs_in_next_file: usize,
 }
 
 impl DiskChunkIter {
-    fn new(files: Vec<PathBuf>, chunk_size: usize) -> Self {
+    fn new(
+        files: Vec<PathBuf>,
+        chunk_size: usize,
+        file_idx: usize,
+        skip_docs_in_next_file: usize,
+    ) -> Self {
         Self {
             files,
-            file_idx: 0,
+            file_idx,
             chunk_size,
             current_docs: VecDeque::new(),
             current_doclens: VecDeque::new(),
             failed: false,
+            skip_docs_in_next_file,
         }
     }
 }
@@ -148,6 +219,11 @@ impl Iterator for DiskChunkIter {
                     Ok((docs, doclens)) => {
                         self.current_docs = VecDeque::from(docs);
                         self.current_doclens = VecDeque::from(doclens);
+                        for _ in 0..self.skip_docs_in_next_file {
+                            self.current_docs.pop_front();
+                            self.current_doclens.pop_front();
+                        }
+                        self.skip_docs_in_next_file = 0;
                     },
                     Err(err) => {
                         self.failed = true;

@@ -1,6 +1,8 @@
 use anyhow::Result;
 use std::collections::HashSet;
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use tch::{Device, Kind, Tensor};
 
 use crate::utils::maybe_progress;
@@ -41,7 +43,7 @@ pub fn compact_index(
     num_centroids: usize,
     embedding_dim: usize,
     nbits: usize,
-    device: Device,
+    _device: Device,
     deleted_pids: &HashSet<i64>,
     show_progress: bool,
 ) -> Result<CompactStats> {
@@ -99,98 +101,184 @@ pub fn compact_index(
     let sizes_tensor = Tensor::from_slice(&centroid_counts);
     sizes_tensor.write_npy(index_path.join("sizes.compacted.npy"))?;
 
-    // ── Pass 2: place non-deleted embeddings into compacted arrays ──
+    // ── Pass 2: partition records on disk by their final global ordinal ──
     let residual_dim = (embedding_dim * nbits) / 8;
-    let compacted_residuals = Tensor::zeros(
-        &[total_filtered, residual_dim as i64],
-        (Kind::Uint8, device),
-    );
-    let compacted_pids = Tensor::zeros(&[total_filtered], (Kind::Int64, device));
-
-    let mut write_offsets = offsets_vec[..num_centroids].to_vec();
+    let record_size = 8 + 8 + residual_dim; // final ordinal u64 + pid i64 + residual
+    let target_partition_bytes = 256 * 1024 * 1024usize;
+    let records_per_partition = (target_partition_bytes / record_size).max(1);
+    let num_partitions = (total_filtered as usize).div_ceil(records_per_partition);
+    let temp_paths: Vec<PathBuf> = (0..num_partitions)
+        .map(|idx| index_path.join(format!(".compact-part-{idx}.tmp")))
+        .collect();
+    for path in &temp_paths {
+        let _ = std::fs::remove_file(path);
+    }
+    let mut temp_writers: Vec<BufWriter<File>> = temp_paths
+        .iter()
+        .map(|path| {
+            OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)
+                .map(BufWriter::new)
+        })
+        .collect::<std::io::Result<_>>()?;
 
     let bar2 = maybe_progress(show_progress, num_chunks as u64, "Compacting (pass 2)");
+    let mut seen_per_centroid = vec![0usize; num_centroids];
 
     for chunk_idx in 0..num_chunks {
         let codes = Tensor::read_npy(index_path.join(format!("{}.codes.npy", chunk_idx)))?
-            .to_device(device);
-        let residuals = Tensor::read_npy(index_path.join(format!("{}.residuals.npy", chunk_idx)))?
-            .to_device(device);
-        let doclens = Tensor::read_npy(index_path.join(format!("doclens.{}.npy", chunk_idx)))?
-            .to_device(device)
+            .to_device(Device::Cpu)
             .to_kind(Kind::Int64);
-        let pids_base =
+        let residuals = Tensor::read_npy(index_path.join(format!("{}.residuals.npy", chunk_idx)))?
+            .to_device(Device::Cpu)
+            .to_kind(Kind::Uint8)
+            .contiguous();
+        let doclens: Vec<i64> =
+            Tensor::read_npy(index_path.join(format!("doclens.{}.npy", chunk_idx)))?
+                .to_device(Device::Cpu)
+                .to_kind(Kind::Int64)
+                .try_into()?;
+        let pids_base: Vec<i64> =
             Tensor::read_npy(index_path.join(format!("{}.passage_ids.npy", chunk_idx)))?
-                .to_device(device)
-                .to_kind(Kind::Int64);
+                .to_device(Device::Cpu)
+                .to_kind(Kind::Int64)
+                .try_into()?;
+        let codes_vec: Vec<i64> = codes.try_into()?;
+        let residual_bytes: Vec<u8> = residuals.flatten(0, -1).try_into()?;
+        let mut buffers: Vec<Vec<u8>> = (0..num_partitions).map(|_| Vec::new()).collect();
 
-        let chunk_total = codes.size()[0];
-        let pids =
-            Tensor::repeat_interleave_self_tensor(&pids_base, &doclens, 0, Some(chunk_total));
-
-        // Build keep indices (non-deleted)
-        let pids_vec: Vec<i64> = pids.to_device(Device::Cpu).try_into()?;
-        let keep_indices: Vec<i64> = (0..chunk_total)
-            .filter(|&i| !deleted_pids.contains(&pids_vec[i as usize]))
-            .collect();
-
-        if keep_indices.is_empty() {
-            continue;
-        }
-
-        let keep_tensor = Tensor::from_slice(&keep_indices).to_device(device);
-        let filtered_codes = codes.index_select(0, &keep_tensor);
-        let filtered_residuals = residuals.index_select(0, &keep_tensor);
-        let filtered_pids = pids.index_select(0, &keep_tensor);
-
-        // Sort by centroid for counting-sort placement
-        let sort_result = filtered_codes.sort(0, false);
-        let sorted_codes = sort_result.0;
-        let sorted_idx = sort_result.1;
-        let sorted_residuals = filtered_residuals.index_select(0, &sorted_idx);
-        let sorted_pids = filtered_pids.index_select(0, &sorted_idx);
-
-        let chunk_counts = sorted_codes.bincount::<Tensor>(None, num_centroids as i64);
-        let chunk_counts_vec: Vec<i64> = chunk_counts.to_device(Device::Cpu).try_into()?;
-
-        let mut local_offset: i64 = 0;
-        for (centroid_id, &count) in chunk_counts_vec.iter().enumerate() {
-            if count == 0 {
+        let mut embedding_offset = 0usize;
+        for (doc_idx, &doc_len) in doclens.iter().enumerate() {
+            let pid = pids_base[doc_idx];
+            if deleted_pids.contains(&pid) {
+                embedding_offset += doc_len as usize;
                 continue;
             }
-            let write_pos = write_offsets[centroid_id];
-            compacted_residuals
-                .narrow(0, write_pos, count)
-                .copy_(&sorted_residuals.narrow(0, local_offset, count));
-            compacted_pids
-                .narrow(0, write_pos, count)
-                .copy_(&sorted_pids.narrow(0, local_offset, count));
-            write_offsets[centroid_id] += count;
-            local_offset += count;
+            for _ in 0..doc_len {
+                let centroid = codes_vec[embedding_offset] as usize;
+                let final_ordinal = offsets_vec[centroid] as usize + seen_per_centroid[centroid];
+                seen_per_centroid[centroid] += 1;
+                let partition = final_ordinal / records_per_partition;
+                let buffer = &mut buffers[partition];
+                buffer.extend_from_slice(&(final_ordinal as u64).to_le_bytes());
+                buffer.extend_from_slice(&pid.to_le_bytes());
+                let residual_start = embedding_offset * residual_dim;
+                buffer.extend_from_slice(
+                    &residual_bytes[residual_start..residual_start + residual_dim],
+                );
+                embedding_offset += 1;
+            }
+        }
+        anyhow::ensure!(
+            embedding_offset == codes_vec.len(),
+            "doclens do not cover all embeddings in chunk {}",
+            chunk_idx
+        );
+        for (writer, buffer) in temp_writers.iter_mut().zip(buffers) {
+            writer.write_all(&buffer)?;
         }
 
         bar2.inc(1);
     }
 
     bar2.finish_and_clear();
+    anyhow::ensure!(
+        seen_per_centroid
+            .iter()
+            .zip(&centroid_counts)
+            .all(|(&seen, &expected)| seen == expected as usize),
+        "compaction count mismatch"
+    );
+    for writer in &mut temp_writers {
+        writer.flush()?;
+    }
+    drop(temp_writers);
 
-    // Write compacted data
-    compacted_residuals
-        .to_device(Device::Cpu)
-        .write_npy(index_path.join("residuals.compacted.npy"))?;
-    compacted_pids
-        .to_device(Device::Cpu)
-        .write_npy(index_path.join("codes.compacted.npy"))?;
+    // Sort one bounded partition at a time, then append it to the final NPY
+    // files. No corpus-sized tensor is allocated on either CPU or GPU.
+    let mut pids_writer = BufWriter::new(File::create(index_path.join("codes.compacted.npy"))?);
+    write_npy_header(&mut pids_writer, "<i8", &[total_filtered as usize])?;
+    let mut residuals_writer =
+        BufWriter::new(File::create(index_path.join("residuals.compacted.npy"))?);
+    write_npy_header(
+        &mut residuals_writer,
+        "|u1",
+        &[total_filtered as usize, residual_dim],
+    )?;
 
-    let offsets_tensor = Tensor::from_slice(&offsets_vec).to_device(device);
-    offsets_tensor
-        .to_device(Device::Cpu)
-        .write_npy(index_path.join("offsets.compacted.npy"))?;
+    let mut written_records = 0usize;
+    for path in &temp_paths {
+        let mut records = Vec::new();
+        File::open(path)?.read_to_end(&mut records)?;
+        anyhow::ensure!(
+            records.len() % record_size == 0,
+            "invalid temporary compaction record file {}",
+            path.display()
+        );
+        let num_records = records.len() / record_size;
+        let mut order: Vec<usize> = (0..num_records).collect();
+        order.sort_unstable_by_key(|&idx| {
+            let start = idx * record_size;
+            u64::from_le_bytes(records[start..start + 8].try_into().unwrap())
+        });
+
+        let mut partition_pids = Vec::with_capacity(num_records * 8);
+        let mut partition_residuals = Vec::with_capacity(num_records * residual_dim);
+        for idx in order {
+            let start = idx * record_size;
+            let ordinal =
+                u64::from_le_bytes(records[start..start + 8].try_into().unwrap()) as usize;
+            anyhow::ensure!(ordinal == written_records, "compaction ordinal gap");
+            written_records += 1;
+            partition_pids.extend_from_slice(&records[start + 8..start + 16]);
+            partition_residuals.extend_from_slice(&records[start + 16..start + record_size]);
+        }
+        pids_writer.write_all(&partition_pids)?;
+        residuals_writer.write_all(&partition_residuals)?;
+        std::fs::remove_file(path)?;
+    }
+    pids_writer.flush()?;
+    residuals_writer.flush()?;
+    anyhow::ensure!(
+        written_records == total_filtered as usize,
+        "compaction count mismatch"
+    );
+
+    Tensor::from_slice(&offsets_vec).write_npy(index_path.join("offsets.compacted.npy"))?;
 
     Ok(CompactStats {
         total_embeddings: total_filtered,
         num_active_passages: active_pids_set.len(),
     })
+}
+
+fn write_npy_header(writer: &mut impl Write, descr: &str, shape: &[usize]) -> Result<()> {
+    let shape_body = shape
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let trailing_comma = if shape.len() == 1 { "," } else { "" };
+    let dictionary = format!(
+        "{{'descr': '{descr}', 'fortran_order': False, 'shape': ({shape_body}{trailing_comma}), }}"
+    );
+    let preamble_len = 10usize;
+    let base_header_len = dictionary.len() + 1;
+    let padding = (64 - (preamble_len + base_header_len) % 64) % 64;
+    let header = format!("{dictionary}{}\n", " ".repeat(padding));
+    let header_len: u16 = header
+        .len()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("NPY header is too large"))?;
+
+    writer.write_all(b"\x93NUMPY")?;
+    writer.write_all(&[1, 0])?;
+    writer.write_all(&header_len.to_le_bytes())?;
+    writer.write_all(header.as_bytes())?;
+    Ok(())
 }
 
 /// Build per-centroid data from a range of chunks.

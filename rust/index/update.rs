@@ -66,6 +66,9 @@ pub fn add_to_index(
         meta.dim as u32,
         Some(&new_passage_ids),
         start_chunk_idx,
+        CHUNK_SIZE,
+        crate::index::encode::EMB_BATCH_SIZE,
+        false,
         show_progress,
     )?;
 
@@ -163,6 +166,9 @@ pub fn update_in_index(
         meta.dim as u32,
         Some(passage_ids),
         meta.num_chunks,
+        CHUNK_SIZE,
+        crate::index::encode::EMB_BATCH_SIZE,
+        false,
         show_progress,
     )?;
 

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde_json::json;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
@@ -21,23 +21,30 @@ pub fn read_chunk_data(index_path: &Path, chunk_idx: usize) -> Result<ChunkData>
         .to_device(tch::Device::Cpu);
     let residuals = Tensor::read_npy(index_path.join(format!("{}.residuals.npy", chunk_idx)))?
         .to_device(tch::Device::Cpu);
-    let doclens: Vec<i64> = Tensor::read_npy(index_path.join(format!("doclens.{}.npy", chunk_idx)))?
-        .to_device(tch::Device::Cpu)
-        .to_kind(Kind::Int64)
-        .try_into()?;
-    let pids: Vec<i64> = Tensor::read_npy(index_path.join(format!("{}.passage_ids.npy", chunk_idx)))?
-        .to_device(tch::Device::Cpu)
-        .to_kind(Kind::Int64)
-        .try_into()?;
-    Ok(ChunkData { codes, residuals, doclens, pids })
+    let doclens: Vec<i64> =
+        Tensor::read_npy(index_path.join(format!("doclens.{}.npy", chunk_idx)))?
+            .to_device(tch::Device::Cpu)
+            .to_kind(Kind::Int64)
+            .try_into()?;
+    let pids: Vec<i64> =
+        Tensor::read_npy(index_path.join(format!("{}.passage_ids.npy", chunk_idx)))?
+            .to_device(tch::Device::Cpu)
+            .to_kind(Kind::Int64)
+            .try_into()?;
+    Ok(ChunkData {
+        codes,
+        residuals,
+        doclens,
+        pids,
+    })
 }
 
 use crate::index::source::EmbeddingSource;
 use crate::utils::residual_codec::ResidualCodec;
 use crate::utils::types::IndexPlan;
 
-pub const CHUNK_SIZE: usize = 25_000;
-pub const EMB_BATCH_SIZE: i64 = 1 << 18;
+pub const CHUNK_SIZE: usize = 256;
+pub const EMB_BATCH_SIZE: i64 = 1 << 15;
 pub const CODE_BATCH_SIZE: i64 = 1 << 20;
 
 const BIT_WEIGHTS: [i64; 8] = [128, 64, 32, 16, 8, 4, 2, 1];
@@ -65,9 +72,27 @@ pub fn encode_chunks(
     embedding_dim: u32,
     passage_ids: Option<&[i64]>,
     start_chunk_idx: usize,
+    chunk_size: usize,
+    compression_batch_size: i64,
+    resume: bool,
     show_progress: bool,
 ) -> Result<EncodeResult> {
-    encode_chunks_inner(plan, source, centroids, codec, index_path, device, embedding_dim, passage_ids, start_chunk_idx, false, show_progress)
+    encode_chunks_inner(
+        plan,
+        source,
+        centroids,
+        codec,
+        index_path,
+        device,
+        embedding_dim,
+        passage_ids,
+        start_chunk_idx,
+        chunk_size,
+        compression_batch_size,
+        resume,
+        false,
+        show_progress,
+    )
 }
 
 /// Like `encode_chunks` but also returns per-embedding residual norms.
@@ -81,9 +106,27 @@ pub fn encode_chunks_with_norms(
     embedding_dim: u32,
     passage_ids: Option<&[i64]>,
     start_chunk_idx: usize,
+    chunk_size: usize,
+    compression_batch_size: i64,
+    resume: bool,
     show_progress: bool,
 ) -> Result<EncodeResult> {
-    encode_chunks_inner(plan, source, centroids, codec, index_path, device, embedding_dim, passage_ids, start_chunk_idx, true, show_progress)
+    encode_chunks_inner(
+        plan,
+        source,
+        centroids,
+        codec,
+        index_path,
+        device,
+        embedding_dim,
+        passage_ids,
+        start_chunk_idx,
+        chunk_size,
+        compression_batch_size,
+        resume,
+        true,
+        show_progress,
+    )
 }
 
 fn encode_chunks_inner(
@@ -96,6 +139,9 @@ fn encode_chunks_inner(
     embedding_dim: u32,
     passage_ids: Option<&[i64]>,
     start_chunk_idx: usize,
+    chunk_size: usize,
+    compression_batch_size: i64,
+    resume: bool,
     collect_norms: bool,
     show_progress: bool,
 ) -> Result<EncodeResult> {
@@ -112,29 +158,50 @@ fn encode_chunks_inner(
     let mut chunk_stats = Vec::with_capacity(plan.num_chunks);
     let mut current_emb_offset: usize = 0;
     let mut total_embeddings: i64 = 0;
-    let mut global_counts = Tensor::zeros(&[num_centroids as i64], (Kind::Int64, device));
+    anyhow::ensure!(chunk_size > 0, "indexing_chunk_size must be positive");
+    anyhow::ensure!(
+        compression_batch_size > 0,
+        "compression_batch_size must be positive"
+    );
+    let mut global_counts = Tensor::zeros(&[num_centroids as i64], (Kind::Int64, Device::Cpu));
     let mut passage_offset: usize = 0;
     let mut all_norms: Vec<f32> = Vec::new();
 
-    let bar = maybe_progress(show_progress, plan.num_chunks as u64, "Encoding chunks");
+    let completed_chunks = if resume {
+        restore_completed_prefix(
+            index_path,
+            start_chunk_idx,
+            plan.num_chunks,
+            &mut chunk_stats,
+            &mut passage_offset,
+            &mut current_emb_offset,
+            &mut total_embeddings,
+        )?
+    } else {
+        0
+    };
 
-    let chunk_iter = source.chunk_iter(CHUNK_SIZE)?;
+    let bar = maybe_progress(show_progress, plan.num_chunks as u64, "Encoding chunks");
+    bar.set_position(completed_chunks as u64);
+
+    let chunk_iter = source.chunk_iter_from(chunk_size, passage_offset)?;
     for (local_chk_idx, chunk) in chunk_iter.enumerate() {
-        let chk_idx = start_chunk_idx + local_chk_idx;
+        let chk_idx = start_chunk_idx + completed_chunks + local_chk_idx;
         let chunk = chunk?;
         let chk_doclens = chunk.doclens;
         let chk_embs_vec = chunk.embeddings;
-        let chk_embs_tensor = Tensor::cat(&chk_embs_vec, 0)
-            .to_kind(Kind::Half)
-            .to_device(device);
+        // Keep the complete source chunk on CPU. Only one bounded token batch
+        // and one distance/residual working set live on the accelerator.
+        let chk_embs_tensor = Tensor::cat(&chk_embs_vec, 0).to_kind(Kind::Half);
         total_embeddings += chk_embs_tensor.size()[0];
 
         let mut chk_codes_list: Vec<Tensor> = Vec::new();
         let mut chk_res_list: Vec<Tensor> = Vec::new();
 
-        for emb_batch in chk_embs_tensor.split(EMB_BATCH_SIZE, 0) {
+        for emb_batch_cpu in chk_embs_tensor.split(compression_batch_size, 0) {
+            let emb_batch = emb_batch_cpu.to_device(device);
             let code_batch = compress_into_codes(&emb_batch, &codec.centroids);
-            chk_codes_list.push(code_batch.shallow_clone());
+            chk_codes_list.push(code_batch.to_device(Device::Cpu));
 
             let mut recon_centroids_batches: Vec<Tensor> = Vec::new();
             for sub_code_batch in code_batch.split(CODE_BATCH_SIZE, 0) {
@@ -171,7 +238,7 @@ fn encode_chunks_inner(
                 res_batch.size()[0],
                 (embedding_dim as i64) / 8 * (plan.nbits as i64),
             ];
-            chk_res_list.push(res_packed.reshape(&shape));
+            chk_res_list.push(res_packed.reshape(&shape).to_device(Device::Cpu));
         }
 
         let chk_codes = Tensor::cat(&chk_codes_list, 0);
@@ -209,10 +276,18 @@ fn encode_chunks_inner(
             "num_embeddings": chunk_num_embeddings,
             "embedding_offset": current_emb_offset,
         });
+        // The metadata file marks the chunk as a complete checkpoint, so it is
+        // written last and atomically (temp + rename): a crash mid-write must
+        // not leave a truncated file that looks like a finished chunk.
         let chk_meta_fpath = index_path.join(format!("{}.metadata.json", chk_idx));
-        let meta_f_w = File::create(chk_meta_fpath)?;
-        let buf_writer_meta = BufWriter::new(meta_f_w);
-        serde_json::to_writer(buf_writer_meta, &chk_meta)?;
+        let chk_meta_tmp_fpath = index_path.join(format!("{}.metadata.json.tmp", chk_idx));
+        {
+            let mut buf_writer_meta = BufWriter::new(File::create(&chk_meta_tmp_fpath)?);
+            serde_json::to_writer(&mut buf_writer_meta, &chk_meta)?;
+            buf_writer_meta.flush()?;
+            buf_writer_meta.get_ref().sync_all()?;
+        }
+        std::fs::rename(&chk_meta_tmp_fpath, &chk_meta_fpath)?;
 
         chunk_stats.push(ChunkStats {
             embedding_offset: current_emb_offset,
@@ -222,6 +297,17 @@ fn encode_chunks_inner(
         passage_offset += chk_doclens.len();
 
         bar.inc(1);
+        if show_progress
+            && ((completed_chunks + local_chk_idx + 1) % 10 == 0
+                || completed_chunks + local_chk_idx + 1 == plan.num_chunks)
+        {
+            eprintln!(
+                "Encoded chunk {}/{} ({} token embeddings total)",
+                completed_chunks + local_chk_idx + 1,
+                plan.num_chunks,
+                total_embeddings
+            );
+        }
     }
 
     bar.finish_and_clear();
@@ -232,6 +318,62 @@ fn encode_chunks_inner(
         global_centroid_counts: global_counts,
         residual_norms: if collect_norms { Some(all_norms) } else { None },
     })
+}
+
+#[derive(serde::Deserialize)]
+struct StoredChunkMetadata {
+    passage_offset: usize,
+    num_passages: usize,
+    num_embeddings: usize,
+    embedding_offset: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_completed_prefix(
+    index_path: &Path,
+    start_chunk_idx: usize,
+    num_chunks: usize,
+    chunk_stats: &mut Vec<ChunkStats>,
+    passage_offset: &mut usize,
+    embedding_offset: &mut usize,
+    total_embeddings: &mut i64,
+) -> Result<usize> {
+    let mut completed = 0usize;
+    for local_idx in 0..num_chunks {
+        let chunk_idx = start_chunk_idx + local_idx;
+        let required = [
+            index_path.join(format!("{}.codes.npy", chunk_idx)),
+            index_path.join(format!("{}.residuals.npy", chunk_idx)),
+            index_path.join(format!("doclens.{}.npy", chunk_idx)),
+            index_path.join(format!("{}.passage_ids.npy", chunk_idx)),
+            index_path.join(format!("{}.metadata.json", chunk_idx)),
+        ];
+        if required.iter().any(|path| !path.is_file()) {
+            break;
+        }
+        // An unreadable metadata file means the chunk never finished; stop the
+        // completed prefix here and re-encode from this chunk on.
+        let metadata: StoredChunkMetadata =
+            match serde_json::from_reader(BufReader::new(File::open(&required[4])?)) {
+                Ok(metadata) => metadata,
+                Err(_) => break,
+            };
+        anyhow::ensure!(
+            metadata.passage_offset == *passage_offset
+                && metadata.embedding_offset == *embedding_offset,
+            "chunk {} is not a contiguous resume checkpoint",
+            chunk_idx
+        );
+        chunk_stats.push(ChunkStats {
+            embedding_offset: metadata.embedding_offset,
+            num_embeddings: metadata.num_embeddings,
+        });
+        *passage_offset += metadata.num_passages;
+        *embedding_offset += metadata.num_embeddings;
+        *total_embeddings += metadata.num_embeddings as i64;
+        completed += 1;
+    }
+    Ok(completed)
 }
 
 pub fn compress_into_codes(embs: &Tensor, centroids: &Tensor) -> Tensor {
