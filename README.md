@@ -14,7 +14,7 @@
   <a href="https://github.com/LaurentMazare/tch-rs"><img src="https://img.shields.io/badge/tch--rs-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="tch-rs"></a>
 </p>
 <div align="center">
-    The Multi-Vector Search Engine To Rule Them All
+    Decompression-free multi-vector retrieval
 </div>
 
 &nbsp;
@@ -25,7 +25,7 @@ xtr-warp-rs is a high-performance implementation of the **WARP** engine for mult
 
 Compared to the current SOTA (FastPlaid), xtr-warp-rs focuses on doing less work per query while staying close in quality: it prunes the centroid/posting-list space per token, uses an error-aware merge that keeps ranking stable with fewer examined candidates, and keeps the hot path (selection → decompression → merge) highly optimized and parallel friendly.
 
-**Speed**: Achieves **10-40x** speedup on CUDA and **4-130x** on CPU (depending on dataset and thread count) vs FastPlaid.
+**Speed**: Achieves **10-40x** speedup on CUDA and **7-130x** on CPU (depending on dataset and thread count) vs FastPlaid.
 
 **Memory**: During search WARP reduces peak CPU memory by **60%** on average vs FastPlaid, reaching **82%** on individual datasets. The sharded execution mode treats RAM+VRAM as a unified pool and cuts peak GPU memory by another **38%** on average over pure CUDA. During index creation the VRAM usage is around **10%** less, with an optional streaming mode that reduces it further by **66%** at a **20-25%** speed cost.
 
@@ -167,14 +167,14 @@ idx.compact()
 
 | Dataset (Size) | QPS fast-plaid | QPS xtr-warp-rs (Single) | QPS xtr-warp-rs (Multi) |
 |----------------|----------------|--------------------------|-------------------------|
-| arguana (8,674) | 7.84 | 159.13 (+1929.7%) | 726.00 (+9159.6%) |
-| fiqa (57,638) | 6.67 | 100.61 (+1408.4%) | 611.98 (+9075.9%) |
-| nfcorpus (3,633) | 15.34 | 134.13 (+774.4%) | 1977.71 (+12792.5%) |
-| quora (522,931) | 22.27 | 94.26 (+323.3%) | 613.87 (+2657.0%) |
-| scidocs (25,657) | 8.58 | 80.03 (+832.7%) | 469.10 (+5367.4%) |
-| scifact (5,183) | 11.27 | 233.75 (+1974.1%) | 973.79 (+8540.7%) |
-| trec-covid (171,332) | 2.73 | 21.84 (+700.0%) | 186.08 (+6716.5%) |
-| webis-touche2020 (382,545) | 3.58 | 40.59 (+1033.8%) | 303.57 (+8378.8%) |
+| arguana (8,674) | 7.84 | 277.80 (+3443.4%) | 748.12 (+9442.3%) |
+| fiqa (57,638) | 6.67 | 167.49 (+2411.1%) | 600.11 (+8897.2%) |
+| nfcorpus (3,633) | 15.34 | 503.21 (+3180.4%) | 2252.32 (+14582.7%) |
+| quora (522,931) | 22.27 | 170.44 (+665.3%) | 614.35 (+2658.6%) |
+| scidocs (25,657) | 8.58 | 140.68 (+1539.6%) | 389.29 (+4437.2%) |
+| scifact (5,183) | 11.27 | 414.32 (+3576.3%) | 1007.34 (+8838.2%) |
+| trec-covid (171,332) | 2.73 | 47.81 (+1651.3%) | 183.31 (+6614.7%) |
+| webis-touche2020 (382,545) | 3.58 | 72.95 (+1937.7%) | 258.83 (+7129.9%) |
 
 #### Search Memory
 
