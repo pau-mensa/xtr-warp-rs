@@ -1,18 +1,19 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use chrono::Utc;
-use rand::prelude::SliceRandom;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
+use serde::Deserialize;
 use serde_json::json;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
 use super::{compact, source::EmbeddingSource};
+use crate::index::encode::{compress_into_codes, encode_chunks, EncodeResult, CODE_BATCH_SIZE};
 use crate::utils::residual_codec::ResidualCodec;
 use crate::utils::types::{IndexConfig, IndexMetadata, IndexPlan};
-use crate::index::encode::{encode_chunks, compress_into_codes, EncodeResult, CHUNK_SIZE, CODE_BATCH_SIZE};
 
 /// Creates a new WARP index from a collection of document embeddings.
 /// Result containing the index metadata on success
@@ -21,38 +22,80 @@ pub fn create_index(
     embeddings_source: &mut dyn EmbeddingSource,
     centroids: Tensor,
     seed: Option<u64>,
+    resume: bool,
     show_progress: bool,
 ) -> Result<()> {
     // Create the index directory if it doesn't exist
     std::fs::create_dir_all(&config.index_path)?;
-
-    let (index_plan, sample_pids, sampled_embeddings) =
-        plan_and_sample(config, embeddings_source, seed)?;
-
-    let plan_fpath = config.index_path.join("plan.json");
-    let plan_data = json!({ "nbits": index_plan.nbits, "num_chunks": index_plan.num_chunks });
-    let mut plan_file = File::create(plan_fpath)?;
-    writeln!(plan_file, "{}", serde_json::to_string_pretty(&plan_data)?)?;
 
     let path_str = config
         .index_path
         .as_path()
         .to_str()
         .expect("index_path is not valid UTF-8");
+    let resumed = if resume {
+        load_resume_plan_and_codec(config, embeddings_source, &centroids)?
+    } else {
+        None
+    };
+    let (index_plan, codec) = if let Some(resumed) = resumed {
+        if show_progress {
+            eprintln!(
+                "Loaded residual codec and index plan from checkpoint; skipping planning sample"
+            );
+        }
+        resumed
+    } else {
+        let (index_plan, sample_pids, sampled_embeddings) =
+            plan_and_sample(config, embeddings_source, seed)?;
+        if show_progress {
+            eprintln!(
+                "Index plan: {} documents, {:.0} token embeddings estimated, {} chunks; residual-codec sample: {} tokens",
+                index_plan.n_docs,
+                index_plan.avg_doc_len * index_plan.n_docs as f64,
+                index_plan.num_chunks,
+                sampled_embeddings.size()[0]
+            );
+        }
 
-    let pids_fpath = Path::new(&path_str).join("pids.npy");
-    Tensor::from_slice(&sample_pids).write_npy(&pids_fpath)?;
+        let plan_fpath = config.index_path.join("plan.json");
+        let plan_data = json!({
+            "nbits": index_plan.nbits,
+            "num_chunks": index_plan.num_chunks,
+            "n_docs": index_plan.n_docs,
+            "avg_doc_len": index_plan.avg_doc_len,
+            "est_total_embs": index_plan.est_total_embs,
+            "embedding_dim": config.embedding_dim,
+            "indexing_chunk_size": config.indexing_chunk_size,
+            "compression_batch_size": config.compression_batch_size,
+            "codec_sample_max_tokens": config.codec_sample_max_tokens,
+        });
+        let mut plan_file = File::create(plan_fpath)?;
+        writeln!(plan_file, "{}", serde_json::to_string_pretty(&plan_data)?)?;
 
-    // Train residual codec using sampled embeddings
-    let codec = train_residual_codec(
-        &sampled_embeddings,
-        &centroids,
-        config.nbits,
-        config.embedding_dim,
-        config.device,
-        &path_str,
-    )?;
+        let pids_fpath = Path::new(&path_str).join("pids.npy");
+        Tensor::from_slice(&sample_pids).write_npy(&pids_fpath)?;
 
+        if show_progress {
+            eprintln!("Training residual codec");
+        }
+        let codec = train_residual_codec(
+            &sampled_embeddings,
+            &centroids,
+            config.nbits,
+            config.embedding_dim,
+            config.device,
+            &path_str,
+        )?;
+        (index_plan, codec)
+    };
+
+    if show_progress {
+        eprintln!(
+            "Encoding {} chunks ({} documents/chunk, {} tokens/compression batch)",
+            index_plan.num_chunks, config.indexing_chunk_size, config.compression_batch_size
+        );
+    }
     let encode_result = encode_chunks(
         &index_plan,
         embeddings_source,
@@ -63,12 +106,103 @@ pub fn create_index(
         config.embedding_dim,
         None, // auto-assign passage IDs 0..N
         0,    // start chunk index
+        config.indexing_chunk_size,
+        config.compression_batch_size,
+        resume,
         show_progress,
     )?;
 
-    finalize_and_compact(config, &index_plan, &encode_result, &centroids, show_progress)?;
+    if show_progress {
+        eprintln!("Encoding complete; compacting index with bounded disk partitions");
+    }
+    finalize_and_compact(
+        config,
+        &index_plan,
+        &encode_result,
+        &centroids,
+        show_progress,
+    )?;
+
+    if show_progress {
+        eprintln!("Index build complete");
+    }
 
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct StoredPlan {
+    nbits: u8,
+    num_chunks: usize,
+    n_docs: usize,
+    avg_doc_len: f64,
+    est_total_embs: i64,
+    embedding_dim: u32,
+    indexing_chunk_size: usize,
+    compression_batch_size: i64,
+    codec_sample_max_tokens: usize,
+}
+
+fn load_resume_plan_and_codec(
+    config: &IndexConfig,
+    source: &dyn EmbeddingSource,
+    centroids: &Tensor,
+) -> Result<Option<(IndexPlan, ResidualCodec)>> {
+    let required = [
+        config.index_path.join("plan.json"),
+        config.index_path.join("pids.npy"),
+        config.index_path.join("avg_residual.npy"),
+        config.index_path.join("bucket_cutoffs.npy"),
+        config.index_path.join("bucket_weights.npy"),
+    ];
+    if required.iter().any(|path| !path.is_file()) {
+        return Ok(None);
+    }
+
+    let stored: StoredPlan = serde_json::from_reader(BufReader::new(File::open(&required[0])?))?;
+    anyhow::ensure!(
+        stored.n_docs == source.num_docs(),
+        "resume document count changed"
+    );
+    anyhow::ensure!(stored.nbits == config.nbits, "resume nbits changed");
+    anyhow::ensure!(
+        stored.embedding_dim == config.embedding_dim,
+        "resume embedding dimension changed"
+    );
+    anyhow::ensure!(
+        stored.indexing_chunk_size == config.indexing_chunk_size,
+        "resume indexing_chunk_size changed"
+    );
+    anyhow::ensure!(
+        stored.compression_batch_size == config.compression_batch_size,
+        "resume compression_batch_size changed"
+    );
+    anyhow::ensure!(
+        stored.codec_sample_max_tokens == config.codec_sample_max_tokens,
+        "resume codec_sample_max_tokens changed"
+    );
+
+    let avg_residual = Tensor::read_npy(&required[2])?.to_device(config.device);
+    let bucket_cutoffs = Tensor::read_npy(&required[3])?.to_device(config.device);
+    let bucket_weights = Tensor::read_npy(&required[4])?.to_device(config.device);
+    let codec = ResidualCodec::load(
+        config.nbits,
+        centroids.to_kind(Kind::Half),
+        avg_residual,
+        Some(bucket_cutoffs),
+        Some(bucket_weights),
+        config.device,
+    )?;
+    Ok(Some((
+        IndexPlan {
+            n_docs: stored.n_docs,
+            num_chunks: stored.num_chunks,
+            avg_doc_len: stored.avg_doc_len,
+            est_total_embs: stored.est_total_embs,
+            nbits: stored.nbits,
+        },
+        codec,
+    )))
 }
 
 fn plan_and_sample(
@@ -80,35 +214,21 @@ fn plan_and_sample(
     if n_docs == 0 {
         bail!("No embeddings provided");
     }
-    let num_chunks =
-        (n_docs as f64 / (CHUNK_SIZE as f64).min(1.0 + n_docs as f64)).ceil() as usize;
+    let num_chunks = (n_docs as f64 / (config.indexing_chunk_size as f64).min(1.0 + n_docs as f64))
+        .ceil() as usize;
 
     let mut rng = if let Some(seed_value) = seed {
         Box::new(StdRng::seed_from_u64(seed_value)) as Box<dyn RngCore>
     } else {
         Box::new(rand::rng()) as Box<dyn RngCore>
     };
-    let (total_doc_len, sample_pids, sampled_embeddings) = if source.get_doc(0).is_some() {
-        let mut total: i64 = 0;
-        for idx in 0..n_docs {
-            let doc = source
-                .get_doc(idx)
-                .ok_or_else(|| anyhow!("Missing embedding at index {}", idx))?;
-            total += doc.size()[0];
-        }
-        let (pids, embeddings) =
-            sample_embeddings_in_memory(source, n_docs, config.embedding_dim, &mut *rng, config.device)?;
-        (total, pids, embeddings)
-    } else {
-        let (pids, embeddings, total) = sample_embeddings_streaming(
-            source,
-            n_docs,
-            config.embedding_dim,
-            &mut *rng,
-            config.device,
-        )?;
-        (total, pids, embeddings)
-    };
+    let (sample_pids, sampled_embeddings, total_doc_len) = sample_embeddings_bounded(
+        source,
+        &mut *rng,
+        config.device,
+        config.indexing_chunk_size,
+        config.codec_sample_max_tokens,
+    )?;
 
     let avg_doc_len = total_doc_len as f64 / n_docs as f64;
     let mut est_total_embs_f64 = (n_docs as f64) * avg_doc_len;
@@ -126,80 +246,64 @@ fn plan_and_sample(
     Ok((index_plan, sample_pids, sampled_embeddings))
 }
 
-fn sample_embeddings_in_memory(
+fn sample_embeddings_bounded(
     source: &mut dyn EmbeddingSource,
-    n_docs: usize,
-    embedding_dim: u32,
     rng: &mut dyn RngCore,
     device: Device,
-) -> Result<(Vec<i64>, Tensor)> {
-    let sample_k_float = 16.0 * (120.0 * n_docs as f64).sqrt();
-    let k = (1.0 + sample_k_float).min(n_docs as f64) as usize;
-    if k == 0 {
-        let empty = Tensor::zeros(&[0, embedding_dim as i64], (Kind::Half, device));
-        return Ok((Vec::new(), empty));
-    }
-
-    let mut passage_indices: Vec<i64> = (0..n_docs as i64).collect();
-    passage_indices.shuffle(rng);
-    let sample_pids: Vec<i64> = passage_indices.into_iter().take(k).collect();
-
-    let mut sample_tensors_vec: Vec<&Tensor> = Vec::with_capacity(k);
-    for &pid in &sample_pids {
-        let doc = source
-            .get_doc(pid as usize)
-            .ok_or_else(|| anyhow!("Missing embedding at index {}", pid))?;
-        sample_tensors_vec.push(doc);
-    }
-
-    let sampled_embeddings = Tensor::cat(&sample_tensors_vec, 0)
-        .to_kind(Kind::Half)
-        .to_device(device);
-    Ok((sample_pids, sampled_embeddings))
-}
-
-fn sample_embeddings_streaming(
-    source: &mut dyn EmbeddingSource,
-    n_docs: usize,
-    embedding_dim: u32,
-    rng: &mut dyn RngCore,
-    device: Device,
+    chunk_size: usize,
+    max_tokens: usize,
 ) -> Result<(Vec<i64>, Tensor, i64)> {
-    let sample_k_float = 16.0 * (120.0 * n_docs as f64).sqrt();
-    let k = (1.0 + sample_k_float).min(n_docs as f64) as usize;
-
-    let mut sample_tensors: Vec<Tensor> = Vec::with_capacity(k);
-    let mut sample_pids: Vec<i64> = Vec::with_capacity(k);
+    anyhow::ensure!(max_tokens > 0, "codec_sample_max_tokens must be positive");
+    // Keep documents with the smallest random priorities. Removing the largest
+    // priorities whenever the token budget is exceeded produces a deterministic,
+    // corpus-wide sample without ever retaining the heuristic's tens of thousands
+    // of long documents at once.
+    let mut priorities: BinaryHeap<(u64, i64)> = BinaryHeap::new();
+    let mut samples: HashMap<i64, Tensor> = HashMap::new();
+    let mut sampled_tokens = 0usize;
     let mut total_doc_len: i64 = 0;
-    let mut seen: i64 = 0;
     let mut doc_offset: i64 = 0;
 
-    let chunk_iter = source.chunk_iter(CHUNK_SIZE)?;
+    let chunk_iter = source.chunk_iter(chunk_size)?;
     for chunk in chunk_iter {
         let chunk = chunk?;
         total_doc_len += chunk.doclens.iter().sum::<i64>();
         for doc in &chunk.embeddings {
-            if (seen as usize) < k {
-                sample_tensors.push(doc.copy());
-                sample_pids.push(doc_offset);
-            } else {
-                let j = (rng.next_u64() % (seen as u64 + 1)) as usize;
-                if j < k {
-                    sample_tensors[j] = doc.copy();
-                    sample_pids[j] = doc_offset;
+            let doc_tokens = doc.size()[0] as usize;
+            if doc_tokens <= max_tokens {
+                let priority = rng.next_u64();
+                // Once the budget is full, a document that would be the first
+                // eviction candidate is dropped without copying it. The result
+                // is identical to inserting and immediately evicting it.
+                let evicted_immediately = sampled_tokens + doc_tokens > max_tokens
+                    && priorities
+                        .peek()
+                        .is_some_and(|top| (priority, doc_offset) >= *top);
+                if !evicted_immediately {
+                    priorities.push((priority, doc_offset));
+                    samples.insert(doc_offset, doc.copy());
+                    sampled_tokens += doc_tokens;
+                    while sampled_tokens > max_tokens {
+                        let (_, removed_pid) = priorities.pop().expect("sample heap is not empty");
+                        if let Some(removed) = samples.remove(&removed_pid) {
+                            sampled_tokens -= removed.size()[0] as usize;
+                        }
+                    }
                 }
             }
-            seen += 1;
             doc_offset += 1;
         }
     }
 
-    if k == 0 {
-        let empty = Tensor::zeros(&[0, embedding_dim as i64], (Kind::Half, device));
-        return Ok((Vec::new(), empty, total_doc_len));
-    }
-
-    let sample_refs: Vec<&Tensor> = sample_tensors.iter().collect();
+    anyhow::ensure!(
+        !samples.is_empty(),
+        "No document fits within codec_sample_max_tokens={}",
+        max_tokens
+    );
+    let mut sample_entries: Vec<(i64, Tensor)> = samples.into_iter().collect();
+    sample_entries.sort_unstable_by_key(|(pid, _)| *pid);
+    let sample_pids: Vec<i64> = sample_entries.iter().map(|(pid, _)| *pid).collect();
+    let sample_refs: Vec<&Tensor> = sample_entries.iter().map(|(_, tensor)| tensor).collect();
     let sampled_embeddings = Tensor::cat(&sample_refs, 0)
         .to_kind(Kind::Half)
         .to_device(device);
@@ -222,7 +326,10 @@ fn finalize_and_compact(
     let meta = IndexMetadata {
         num_chunks: plan.num_chunks,
         nbits: plan.nbits,
-        num_partitions: plan.est_total_embs,
+        // Search hyperparameter tuning reads `num_partitions`, so it must
+        // describe the codebook actually written rather than the automatic
+        // corpus-size heuristic (which may differ when K is overridden).
+        num_partitions: centroids.size()[0],
         num_embeddings: encode_result.total_embeddings,
         avg_doclen: final_avg_doclen,
         num_passages: plan.n_docs,
@@ -246,7 +353,6 @@ fn finalize_and_compact(
 
     Ok(())
 }
-
 
 /// Trains the residual codec for quantization.
 /// # Returns

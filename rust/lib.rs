@@ -74,7 +74,6 @@ fn get_device(device: &str) -> Result<Device, PyErr> {
     utils::types::parse_device(device).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-
 /// Filter tombstoned PIDs and truncate to k.
 /// Results arrive sorted by score descending from the merger, so we
 /// stop as soon as we collect k non-deleted entries.
@@ -171,6 +170,10 @@ impl EmbeddingsInput {
     embeddings,
     embedding_dim=None,
     seed=None,
+    indexing_chunk_size=256,
+    compression_batch_size=32768,
+    codec_sample_max_tokens=1000000,
+    resume=false,
     show_progress=true,
 ))]
 fn create(
@@ -183,6 +186,10 @@ fn create(
     embeddings: EmbeddingsInput,
     embedding_dim: Option<u32>,
     seed: Option<u64>,
+    indexing_chunk_size: usize,
+    compression_batch_size: i64,
+    codec_sample_max_tokens: usize,
+    resume: bool,
     show_progress: bool,
 ) -> PyResult<()> {
     call_torch(torch_path)
@@ -193,6 +200,21 @@ fn create(
         .try_into()
         .map_err(|_| PyValueError::new_err("nbits must be in 0..=255"))?;
     let centroids = centroids.to_device(device);
+    if indexing_chunk_size == 0 {
+        return Err(PyValueError::new_err(
+            "indexing_chunk_size must be positive",
+        ));
+    }
+    if compression_batch_size <= 0 {
+        return Err(PyValueError::new_err(
+            "compression_batch_size must be positive",
+        ));
+    }
+    if codec_sample_max_tokens == 0 {
+        return Err(PyValueError::new_err(
+            "codec_sample_max_tokens must be positive",
+        ));
+    }
 
     let mut source = embeddings
         .into_source()
@@ -204,10 +226,14 @@ fn create(
             device,
             nbits,
             embedding_dim: embedding_dim.unwrap_or(128),
+            indexing_chunk_size,
+            compression_batch_size,
+            codec_sample_max_tokens,
         },
         source.as_mut(),
         centroids,
         seed,
+        resume,
         show_progress,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)))

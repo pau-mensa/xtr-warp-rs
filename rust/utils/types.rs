@@ -16,7 +16,6 @@ pub type PassageId = i64;
 /// Represents a centroid ID in the clustering
 pub type CentroidId = i64;
 
-
 /// Score type for ranking
 pub type Score = f32;
 
@@ -34,6 +33,15 @@ pub struct IndexConfig {
 
     /// Embedding dimension
     pub embedding_dim: u32,
+
+    /// Maximum number of documents retained by one encoding chunk.
+    pub indexing_chunk_size: usize,
+
+    /// Maximum token embeddings processed by one compression batch.
+    pub compression_batch_size: i64,
+
+    /// Maximum token embeddings retained to train the residual codec.
+    pub codec_sample_max_tokens: usize,
 }
 
 impl Default for IndexConfig {
@@ -43,6 +51,9 @@ impl Default for IndexConfig {
             device: Device::Cpu,
             nbits: 4,
             embedding_dim: 128,
+            indexing_chunk_size: 256,
+            compression_batch_size: 32_768,
+            codec_sample_max_tokens: 1_000_000,
         }
     }
 }
@@ -439,5 +450,3 @@ impl IndexShard {
         }
     }
 }
-
-

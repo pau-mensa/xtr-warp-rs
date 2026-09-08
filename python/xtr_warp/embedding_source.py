@@ -10,6 +10,7 @@ Two backing stores:
 :func:`create_source` is the factory used by callers that don't care which
 backing store they get.
 """
+
 from __future__ import annotations
 
 import os
@@ -27,6 +28,11 @@ class EmbeddingSource(Protocol):
     """Protocol for embedding sources used during index creation."""
 
     def get_num_passages(self) -> int: ...
+    def get_doclens(self) -> list[int]: ...
+    def get_embedding_dim(self) -> int:
+        """Return the number of scalar components in one token embedding."""
+        ...
+
     def sample_embeddings(self, pids: list[int]) -> tuple[torch.Tensor, int, int]: ...
 
 
@@ -38,6 +44,16 @@ class InMemorySource:
 
     def get_num_passages(self) -> int:
         return len(self.embeddings)
+
+    def get_doclens(self) -> list[int]:
+        return [int(embedding.shape[0]) for embedding in self.embeddings]
+
+    def get_embedding_dim(self) -> int:
+        """Return the in-memory embedding dimension."""
+        if not self.embeddings:
+            error = "Cannot determine the dimension of an empty embedding source"
+            raise ValueError(error)
+        return int(self.embeddings[0].shape[-1])
 
     def sample_embeddings(self, pids: list[int]) -> tuple[torch.Tensor, int, int]:
         samples = [self.embeddings[pid] for pid in pids]
@@ -99,14 +115,30 @@ class DiskSource:
         self._load_metadata()
         return self._num_passages
 
+    def get_doclens(self) -> list[int]:
+        self._load_metadata()
+        assert self._doclens is not None
+        return self._doclens
+
+    def get_embedding_dim(self) -> int:
+        """Read the embedding dimension from the first NPY header."""
+        self._load_metadata()
+        assert self._files_and_doclens is not None
+        first = np.load(self._files_and_doclens[0][0], mmap_mode="r")
+        try:
+            if first.ndim != 2:
+                error = f"Embedding arrays must be 2D, got shape {first.shape}"
+                raise ValueError(error)
+            return int(first.shape[1])
+        finally:
+            del first
+
     def _resolve_sample_workers(self, num_files: int) -> int:
         if self.sample_workers is not None:
             return max(1, int(self.sample_workers))
         return min(num_files, os.cpu_count() or 1, 8)
 
-    def sample_embeddings(
-        self, pids: list[int]
-    ) -> tuple[torch.Tensor, int, int]:
+    def sample_embeddings(self, pids: list[int]) -> tuple[torch.Tensor, int, int]:
         """Read only files that own a sampled pid; copy per-doc slices via
         mmap; parallelise across files on a thread pool. NumPy disk reads /
         mmap page faults release the GIL, so threads parallelise this

@@ -1,7 +1,7 @@
 # /// script
 # dependencies = [
 #    "beir>=2.2.0",
-#    "fast_plaid==1.4.5.290",
+#    "fast_plaid==1.7.0.2110",
 #    "ranx",
 #    "psutil",
 #    "pyyaml",
@@ -668,6 +668,7 @@ def run_fast_plaid(
         top_k=config["top_k"],
         n_ivf_probe=config.get("n_ivf_probe", 8),
         n_full_scores=config.get("n_full_scores", 4096),
+        n_processes=config.get("n_processes", 1),
     )
     end_search = time.time()
     search_time = end_search - start_search
@@ -689,6 +690,7 @@ def run_fast_plaid(
         queries_embeddings=large_queries_embeddings,
         top_k=config["top_k"],
         n_ivf_probe=config["n_ivf_probe"],
+        n_processes=config.get("n_processes", 1),
     )
     end_search = time.time()
     heavy_search_time = end_search - start_search
@@ -709,6 +711,7 @@ def run_fast_plaid(
             top_k=config["top_k"],
             n_ivf_probe=config.get("n_ivf_probe", 8),
             n_full_scores=config.get("n_full_scores", 4096),
+            n_processes=config.get("n_processes", 1),
         )
 
     latency_stats = measure_single_query_latency(

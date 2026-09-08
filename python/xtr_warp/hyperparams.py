@@ -25,7 +25,9 @@ def optimize(
         return None
 
     num_embeddings = metadata["num_embeddings"]
-    num_partitions = metadata["num_partitions"]
+    # Centroid expansion grows the codebook after creation; num_centroids
+    # tracks the live size while num_partitions is the size at creation.
+    num_partitions = metadata.get("num_centroids", metadata["num_partitions"])
     avg_doclen = metadata["avg_doclen"]
 
     density = num_embeddings / max(1, num_partitions)

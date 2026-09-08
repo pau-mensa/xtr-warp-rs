@@ -9,7 +9,7 @@ build-backend = "maturin"
 
 [project]
 name = "xtr-warp-rs"
-version = "2.0.2"
+version = "2.1.0"
 description = "XTR-Warp"
 authors = [
   { name = "Pau Montserrat", email = "pau.mopuig@gmail.com" },
@@ -29,7 +29,6 @@ requires-python = ">=3.10"
 dependencies = [
   "duckdb >= 1.4.0",
   "pyarrow >= 14.0.0",
-  "fastkmeans >= 0.5.0",
   "joblib>=1.5.1",
   "torch >= 2.8.0",
   "maturin >= 1.8.6",
